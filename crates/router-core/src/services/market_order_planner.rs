@@ -497,7 +497,7 @@ fn hyperliquid_source_canonical(asset: &DepositAsset) -> Option<CanonicalAsset> 
 fn expected_path_start_node(asset: &DepositAsset) -> MarketOrderNode {
     if let Some(canonical) = hyperliquid_source_canonical(asset) {
         return MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical,
         };
     }
@@ -2886,7 +2886,7 @@ mod tests {
         let transition = TransitionDecl {
             id: "hyperliquid-spot-transfer".to_string(),
             kind: MarketOrderTransitionKind::HyperliquidTrade,
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             input: AssetSlot {
                 asset: hl_ubtc.clone(),
                 required_custody_role: RequiredCustodyRole::IntermediateExecution,
@@ -2896,7 +2896,7 @@ mod tests {
                 required_custody_role: RequiredCustodyRole::IntermediateExecution,
             },
             from: MarketOrderNode::Venue {
-                provider: ProviderId::Hyperliquid,
+                provider: ProviderId::HyperliquidSpot,
                 canonical: CanonicalAsset::Btc,
             },
             to: MarketOrderNode::External(hl_ubtc.clone()),
@@ -2925,7 +2925,7 @@ mod tests {
         let step = hyperliquid_trade_step(HyperliquidTradeStepSpec {
             order: &order,
             quote: &quote,
-            exchange_provider: ProviderId::Hyperliquid,
+            exchange_provider: ProviderId::HyperliquidSpot,
             hyperliquid_custody: HyperliquidCustodySpec::spot_vault(),
             leg_index: 0,
             leg_count: 1,
@@ -3083,7 +3083,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn carried_initial_hyperliquid_custody_prefunds_only_first_trade() {
         let registry = AssetRegistry::default();
@@ -3091,7 +3090,7 @@ mod tests {
         let path = registry
             .select_transition_paths_between(
                 MarketOrderNode::Venue {
-                    provider: ProviderId::Hyperliquid,
+                    provider: ProviderId::HyperliquidSpot,
                     canonical: CanonicalAsset::Eth,
                 },
                 MarketOrderNode::External(destination_asset),

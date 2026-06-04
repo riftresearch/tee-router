@@ -43,6 +43,20 @@
             "type": "string",
             "example": "100000"
           },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered provider ids for the route transitions used by this quote.",
+            "example": [
+              "velora",
+              "across",
+              "hyperliquid_bridge",
+              "hyperliquid_spot",
+              "unit"
+            ]
+          },
           "fees": {
             "type": "array",
             "items": {
@@ -88,7 +102,8 @@
           "from",
           "to",
           "expiry",
-          "estimatedOut"
+          "estimatedOut",
+          "venues"
         ]
       },
       "AmountFormat": {
@@ -224,6 +239,20 @@
             "type": "string",
             "example": "100000"
           },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered provider ids for the route transitions used by this quote.",
+            "example": [
+              "velora",
+              "across",
+              "hyperliquid_bridge",
+              "hyperliquid_spot",
+              "unit"
+            ]
+          },
           "fees": {
             "type": "array",
             "items": {
@@ -287,7 +316,8 @@
           "to",
           "status",
           "expiry",
-          "estimatedOut"
+          "estimatedOut",
+          "venues"
         ]
       },
       "RefundMode": {
@@ -402,6 +432,20 @@
             "type": "string",
             "example": "100000"
           },
+          "venues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Ordered provider ids for the route transitions used by this quote.",
+            "example": [
+              "velora",
+              "across",
+              "hyperliquid_bridge",
+              "hyperliquid_spot",
+              "unit"
+            ]
+          },
           "fees": {
             "type": "array",
             "items": {
@@ -465,7 +509,8 @@
           "to",
           "status",
           "expiry",
-          "estimatedOut"
+          "estimatedOut",
+          "venues"
         ]
       },
       "OrderCancelRequest": {
@@ -535,7 +580,7 @@
               "properties": {
                 "name": {
                   "type": "string",
-                  "example": "hyperliquid"
+                  "example": "hyperliquid_spot"
                 },
                 "status": {
                   "type": "string",

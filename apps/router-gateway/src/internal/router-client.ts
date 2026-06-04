@@ -27,7 +27,7 @@ export type InternalProviderId =
   | 'cctp'
   | 'unit'
   | 'hyperliquid_bridge'
-  | 'hyperliquid'
+  | 'hyperliquid_spot'
   | 'velora'
 
 export type InternalQuoteRouting = {

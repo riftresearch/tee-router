@@ -786,7 +786,7 @@ mod tests {
             id: id.to_string(),
             kind,
             provider: match kind {
-                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
+                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::HyperliquidSpot,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
                 MarketOrderTransitionKind::HyperliquidBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
@@ -909,7 +909,7 @@ mod tests {
                 RouteCostSnapshot {
                     transition_id: transition.id.clone(),
                     amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                    provider: "hyperliquid".to_string(),
+                    provider: "hyperliquid_spot".to_string(),
                     edge_kind: "fixed_pair_swap".to_string(),
                     source_asset: transition.input.asset.clone(),
                     destination_asset: transition.output.asset.clone(),

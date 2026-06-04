@@ -361,7 +361,7 @@ mod tests {
         ProviderOperationWatchEntry {
             operation_id: Uuid::now_v7(),
             execution_step_id: WorkflowStepId::from(Uuid::now_v7()),
-            provider: "hyperliquid".to_string(),
+            provider: provider_for_operation_type(operation_type).to_string(),
             operation_type,
             provider_ref: None,
             status: ProviderOperationStatus::WaitingExternal,
@@ -370,6 +370,19 @@ mod tests {
             observed_state,
             execution_step_request: json!({}),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn provider_for_operation_type(operation_type: ProviderOperationType) -> &'static str {
+        match operation_type {
+            ProviderOperationType::HyperliquidTrade
+            | ProviderOperationType::HyperliquidLimitOrder => "hyperliquid_spot",
+            ProviderOperationType::HyperliquidBridgeDeposit
+            | ProviderOperationType::HyperliquidBridgeWithdrawal => "hyperliquid_bridge",
+            ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => "unit",
+            ProviderOperationType::AcrossBridge => "across",
+            ProviderOperationType::CctpBridge | ProviderOperationType::CctpReceive => "cctp",
+            ProviderOperationType::UniversalRouterSwap => "velora",
         }
     }
 

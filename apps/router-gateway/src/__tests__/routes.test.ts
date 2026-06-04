@@ -124,7 +124,7 @@ describe('router gateway routes', () => {
           timestamp: '2026-04-30T16:46:58.105Z',
           providers: [
             {
-              provider: 'hyperliquid',
+              provider: 'hyperliquid_spot',
               status: 'ok',
               checked_at: '2026-04-30T16:46:58.105Z',
               latency_ms: 20,
@@ -144,7 +144,7 @@ describe('router gateway routes', () => {
     expect(body.status).toBe('ok')
     expect(body.dependencies).toHaveLength(1)
     expect(body.dependencies[0]).toMatchObject({
-      name: 'hyperliquid',
+      name: 'hyperliquid_spot',
       status: 'reachable',
       checkedAt: '2026-04-30T16:46:58.105Z'
     })
@@ -230,7 +230,7 @@ describe('router gateway routes', () => {
             refresh === 1
               ? [
                   {
-                    provider: 'hyperliquid',
+                    provider: 'hyperliquid_spot',
                     status: 'down',
                     checked_at: '2026-04-30T16:46:58.105Z'
                   },
@@ -807,7 +807,7 @@ describe('router gateway routes', () => {
         fromAmount: '5',
         amountFormat: 'readable',
         routing: {
-          providerSequence: ['velora', 'cctp']
+          providerSequence: ['velora', 'hyperliquid_spot']
         }
       })
     })
@@ -816,7 +816,7 @@ describe('router gateway routes', () => {
     expect(calls[0]?.body).toMatchObject({
       type: 'market_order',
       routing: {
-        provider_sequence: ['velora', 'cctp']
+        provider_sequence: ['velora', 'hyperliquid_spot']
       }
     })
   })
@@ -1110,6 +1110,7 @@ describe('router gateway routes', () => {
       to: 'Ethereum.USDC',
       estimatedOut: '100',
       expectedSwapTimeMs: 63000,
+      venues: ['velora', 'across', 'hyperliquid_bridge', 'hyperliquid_spot', 'unit'],
       amountFormat: 'readable'
     })
   })
@@ -1609,7 +1610,15 @@ function internalQuote() {
         provider_id: 'unit',
         amount_in: '125000000',
         estimated_amount_out: '100000000',
-        provider_quote: {},
+        provider_quote: {
+          transitions: [
+            { provider: 'velora' },
+            { provider: 'across' },
+            { provider: 'hyperliquid_bridge' },
+            { provider: 'hyperliquid_spot' },
+            { provider: 'unit' }
+          ]
+        },
         expected_swap_time_ms: 63000,
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'
@@ -1634,11 +1643,13 @@ function internalLimitQuote() {
           asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
         },
         recipient_address: TO_ADDRESS,
-        provider_id: 'hyperliquid',
+        provider_id: 'hyperliquid_spot',
         input_amount: '125000000',
         output_amount: '100000000000',
         residual_policy: 'refund',
-        provider_quote: {},
+        provider_quote: {
+          transitions: [{ provider: 'hyperliquid_spot' }]
+        },
         expected_swap_time_ms: 63000,
         expires_at: '2026-04-30T12:00:00Z',
         created_at: '2026-04-30T11:59:00Z'

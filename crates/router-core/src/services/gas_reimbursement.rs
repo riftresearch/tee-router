@@ -340,7 +340,7 @@ fn settlement_candidates(
             if asset.chain.as_str() == "hyperliquid" {
                 let provider_asset = registry
                     .provider_asset(
-                        ProviderId::Hyperliquid,
+                        ProviderId::HyperliquidSpot,
                         asset,
                         ProviderAssetCapability::ExchangeInput,
                     )

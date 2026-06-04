@@ -1913,6 +1913,10 @@ mod tests {
             normalized_provider_id("  HyperLiquid_Bridge  ").unwrap(),
             "hyperliquid_bridge"
         );
+        assert_eq!(
+            normalized_provider_id("  HyperLiquid_Spot  ").unwrap(),
+            "hyperliquid_spot"
+        );
         assert_eq!(normalized_provider_id("VELORA").unwrap(), "velora");
     }
 
@@ -1926,6 +1930,11 @@ mod tests {
         let oversized = "a".repeat(MAX_PROVIDER_POLICY_ID_LEN + 1);
         assert!(matches!(
             normalized_provider_id(&oversized),
+            Err(RouterServerError::Validation { .. })
+        ));
+
+        assert!(matches!(
+            normalized_provider_id("hyperliquid"),
             Err(RouterServerError::Validation { .. })
         ));
 

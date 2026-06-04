@@ -1713,7 +1713,7 @@ impl HyperUnitProvider {
     ) -> ProviderResult<(String, u8)> {
         let entry = self
             .asset_registry
-            .provider_asset(ProviderId::Hyperliquid, asset, capability)
+            .provider_asset(ProviderId::HyperliquidSpot, asset, capability)
             .ok_or_else(|| {
                 format!(
                     "hyperunit: asset {} on {} not registered as a hyperliquid provider asset for {capability:?}",
@@ -4031,7 +4031,7 @@ impl HyperliquidProvider {
         capability: ProviderAssetCapability,
     ) -> ProviderResult<(String, u8)> {
         self.asset_registry
-            .provider_asset(ProviderId::Hyperliquid, asset, capability)
+            .provider_asset(ProviderId::HyperliquidSpot, asset, capability)
             .map(|entry| (entry.provider_asset.clone(), entry.decimals))
             .ok_or_else(|| {
                 format!(
@@ -4923,7 +4923,7 @@ impl ExchangeProvider for VeloraProvider {
 
 impl ExchangeProvider for HyperliquidProvider {
     fn id(&self) -> &str {
-        "hyperliquid"
+        "hyperliquid_spot"
     }
 
     fn quote_trade<'a>(
@@ -7848,7 +7848,7 @@ mod hyperliquid_math_tests {
             recipient_address: "0x1111111111111111111111111111111111111111".to_string(),
         };
 
-        let quote = hyperliquid_spot_transfer_quote(&request, "hyperliquid", "UBTC");
+        let quote = hyperliquid_spot_transfer_quote(&request, "hyperliquid_spot", "UBTC");
 
         assert_eq!(quote.amount_in, "50000");
         assert_eq!(quote.amount_out, "50000");

@@ -48,8 +48,23 @@ pub enum ProviderId {
     Cctp,
     Unit,
     HyperliquidBridge,
-    Hyperliquid,
+    HyperliquidSpot,
     Velora,
+}
+
+impl ProviderId {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "across" => Some(Self::Across),
+            "cctp" => Some(Self::Cctp),
+            "unit" => Some(Self::Unit),
+            "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
+            "hyperliquid_spot" => Some(Self::HyperliquidSpot),
+            "velora" => Some(Self::Velora),
+            _ => None,
+        }
+    }
 }
 
 /// Optional route-selection constraints for `POST /quote`.
@@ -100,6 +115,8 @@ pub struct QuoteResponse {
     pub expiry: String,
     pub estimated_out: String,
     #[serde(default)]
+    pub venues: Vec<String>,
+    #[serde(default)]
     pub fees: Option<Vec<Fee>>,
     pub amount_format: AmountFormat,
 }
@@ -135,6 +152,8 @@ pub struct OrderResponse {
     pub status: String,
     pub expiry: String,
     pub estimated_out: String,
+    #[serde(default)]
+    pub venues: Vec<String>,
     #[serde(default)]
     pub fees: Option<Vec<Fee>>,
     pub amount_format: AmountFormat,

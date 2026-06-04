@@ -190,7 +190,7 @@ test('execution timeline hides cancelled legs while preserving original quoted a
     transitionDeclId: 'transition-1',
     legIndex: 0,
     legType: 'hyperliquid_trade',
-    provider: 'hyperliquid',
+    provider: 'hyperliquid_spot',
     status: 'cancelled',
     input: USDC,
     output: USDC,

@@ -430,7 +430,7 @@ mod tests {
             "recipient_address": "0x1111111111111111111111111111111111111111",
             "amount_in": "5000000",
             "routing": {
-                "provider_sequence": ["velora", "cctp"]
+                "provider_sequence": ["velora", "hyperliquid_spot"]
             }
         }))
         .expect("market order request with routing");
@@ -440,8 +440,24 @@ mod tests {
         };
         assert_eq!(
             request.routing.provider_sequence,
-            Some(vec![ProviderId::Velora, ProviderId::Cctp])
+            Some(vec![ProviderId::Velora, ProviderId::HyperliquidSpot])
         );
+    }
+
+    #[test]
+    fn create_quote_request_rejects_old_hyperliquid_provider_id() {
+        let result = serde_json::from_value::<CreateQuoteRequest>(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "hyperliquid", "asset": "UBTC"},
+            "to_asset": {"chain": "hyperliquid", "asset": "native"},
+            "recipient_address": "0x1111111111111111111111111111111111111111",
+            "amount_in": "50000",
+            "routing": {
+                "provider_sequence": ["hyperliquid"]
+            }
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

@@ -192,7 +192,7 @@ mod tests {
         let operation = ProviderOperationWatchEntry {
             operation_id: Uuid::now_v7(),
             execution_step_id: WorkflowStepId::from(Uuid::now_v7()),
-            provider: "hyperliquid".to_string(),
+            provider: "hyperliquid_spot".to_string(),
             operation_type: ProviderOperationType::HyperliquidTrade,
             provider_ref: Some("0xtx".to_string()),
             status: ProviderOperationStatus::WaitingExternal,

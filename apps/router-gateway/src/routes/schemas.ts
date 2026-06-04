@@ -76,6 +76,10 @@ export const QuoteResponseSchema = z
     estimatedOut: z.string().openapi({
       example: '100000'
     }),
+    venues: z.array(z.string()).openapi({
+      description: 'Ordered provider ids for the route transitions used by this quote.',
+      example: ['velora', 'across', 'hyperliquid_bridge', 'hyperliquid_spot', 'unit']
+    }),
     fees: z
       .array(
         z.object({
@@ -140,6 +144,10 @@ export const OrderResponseSchema = z
     }),
     estimatedOut: z.string().openapi({
       example: '100000'
+    }),
+    venues: z.array(z.string()).openapi({
+      description: 'Ordered provider ids for the route transitions used by this quote.',
+      example: ['velora', 'across', 'hyperliquid_bridge', 'hyperliquid_spot', 'unit']
     }),
     fees: z
       .array(

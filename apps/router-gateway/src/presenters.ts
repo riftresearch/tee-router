@@ -20,6 +20,7 @@ export type PublicQuoteResponse = {
   estimatedOut: string
   fees?: PublicQuoteFee[]
   expectedSwapTimeMs?: number
+  venues: string[]
   amountFormat: AmountFormat
 }
 
@@ -153,6 +154,7 @@ function presentQuote(
 ): PublicQuoteResponse {
   const source = assetIdentifierFromInternal(quote.source_asset)
   const destination = assetIdentifierFromInternal(quote.destination_asset)
+  const venues = quoteVenues(quote.provider_quote)
   if ('input_amount' in quote) {
     return {
       quoteId: quote.id,
@@ -169,6 +171,7 @@ function presentQuote(
       quote.expected_swap_time_ms === undefined
         ? {}
         : { expectedSwapTimeMs: quote.expected_swap_time_ms }),
+      venues,
       amountFormat
     }
   }
@@ -188,6 +191,7 @@ function presentQuote(
     quote.expected_swap_time_ms === undefined
       ? {}
       : { expectedSwapTimeMs: quote.expected_swap_time_ms }),
+    venues,
     ...quoteFees(quote.provider_quote, amountFormat),
     amountFormat
   }
@@ -198,6 +202,22 @@ function presentOrderStatus(status: string): string {
     return 'refund_pending'
   }
   return status
+}
+
+function quoteVenues(providerQuote: unknown): string[] {
+  const quote = isRecord(providerQuote) ? providerQuote : undefined
+  const transitions = Array.isArray(quote?.transitions)
+    ? quote.transitions
+    : []
+  const venues: string[] = []
+  for (const transition of transitions) {
+    if (!isRecord(transition)) continue
+    const provider = transition.provider
+    if (typeof provider === 'string' && provider.length > 0) {
+      venues.push(provider)
+    }
+  }
+  return venues
 }
 
 function quoteFees(

@@ -25,7 +25,7 @@ export const DependencyHealthResponseSchema = z
     dependencies: z.array(
       z.object({
         name: z.string().openapi({
-          example: "hyperliquid",
+          example: "hyperliquid_spot",
         }),
         status: z.enum(["reachable", "unreachable", "unknown"]).openapi({
           example: "reachable",

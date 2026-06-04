@@ -35,7 +35,7 @@ pub enum ProviderId {
     Unit,
     HyperliquidBridge,
 
-    Hyperliquid,
+    HyperliquidSpot,
     Velora,
 }
 
@@ -45,7 +45,7 @@ impl ProviderId {
         Self::Cctp,
         Self::Unit,
         Self::HyperliquidBridge,
-        Self::Hyperliquid,
+        Self::HyperliquidSpot,
         Self::Velora,
     ];
 
@@ -56,7 +56,7 @@ impl ProviderId {
             "unit" => Some(Self::Unit),
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
 
-            "hyperliquid" => Some(Self::Hyperliquid),
+            "hyperliquid_spot" => Some(Self::HyperliquidSpot),
             "velora" => Some(Self::Velora),
             _ => None,
         }
@@ -70,7 +70,7 @@ impl ProviderId {
             Self::Unit => "unit",
             Self::HyperliquidBridge => "hyperliquid_bridge",
 
-            Self::Hyperliquid => "hyperliquid",
+            Self::HyperliquidSpot => "hyperliquid_spot",
             Self::Velora => "velora",
         }
     }
@@ -81,7 +81,7 @@ impl ProviderId {
             Self::Across | Self::Cctp | Self::Unit | Self::HyperliquidBridge => {
                 ProviderVenueKind::CrossChain
             }
-            Self::Hyperliquid => ProviderVenueKind::MonoChain {
+            Self::HyperliquidSpot => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             },
             Self::Velora => ProviderVenueKind::MonoChain {
@@ -94,7 +94,7 @@ impl ProviderId {
     pub fn asset_support_model(self) -> AssetSupportModel {
         match self {
             Self::Across => AssetSupportModel::RuntimeEnumerated,
-            Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::Hyperliquid => {
+            Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::HyperliquidSpot => {
                 AssetSupportModel::StaticDeclared
             }
             Self::Velora => AssetSupportModel::OpenAddressQuote,
@@ -554,7 +554,7 @@ impl AssetRegistry {
             .provider_assets
             .iter()
             .filter(|entry| {
-                entry.provider == ProviderId::Hyperliquid
+                entry.provider == ProviderId::HyperliquidSpot
                     && entry.supports(ProviderAssetCapability::ExchangeInput)
                     && entry.supports(ProviderAssetCapability::ExchangeOutput)
             })
@@ -571,7 +571,7 @@ impl AssetRegistry {
                 }
                 transitions.push(MarketOrderTransition {
                     kind: MarketOrderTransitionKind::HyperliquidTrade,
-                    provider: ProviderId::Hyperliquid,
+                    provider: ProviderId::HyperliquidSpot,
                     from: hyperliquid_venue(*input),
                     to: hyperliquid_venue(*output),
                 });
@@ -582,7 +582,7 @@ impl AssetRegistry {
         }) {
             transitions.push(MarketOrderTransition {
                 kind: MarketOrderTransitionKind::HyperliquidTrade,
-                provider: ProviderId::Hyperliquid,
+                provider: ProviderId::HyperliquidSpot,
                 from: hyperliquid_venue(asset.canonical),
                 to: MarketOrderNode::External(asset.deposit_asset()),
             });
@@ -852,7 +852,7 @@ impl AssetRegistry {
         preferred_chain: Option<&ChainId>,
     ) -> Option<(CanonicalAsset, DepositAsset)> {
         let canonical = self.provider_assets.iter().find_map(|entry| {
-            (entry.provider == ProviderId::Hyperliquid
+            (entry.provider == ProviderId::HyperliquidSpot
                 && entry.provider_asset.eq_ignore_ascii_case(coin))
             .then_some(entry.canonical)
         })?;
@@ -862,7 +862,7 @@ impl AssetRegistry {
 
     fn has_hyperliquid_venue(&self, canonical: CanonicalAsset) -> bool {
         self.provider_assets.iter().any(|entry| {
-            entry.provider == ProviderId::Hyperliquid
+            entry.provider == ProviderId::HyperliquidSpot
                 && entry.canonical == canonical
                 && entry.supports(ProviderAssetCapability::ExchangeInput)
                 && entry.supports(ProviderAssetCapability::ExchangeOutput)
@@ -903,7 +903,7 @@ impl AssetRegistry {
         match node {
             MarketOrderNode::External(asset) => Some(asset.clone()),
             MarketOrderNode::Venue {
-                provider: ProviderId::Hyperliquid,
+                provider: ProviderId::HyperliquidSpot,
                 canonical,
             } => self
                 .chain_assets
@@ -949,7 +949,7 @@ fn dedupe_transition_declarations(transitions: Vec<TransitionDecl>) -> Vec<Trans
 
 fn hyperliquid_venue(canonical: CanonicalAsset) -> MarketOrderNode {
     MarketOrderNode::Venue {
-        provider: ProviderId::Hyperliquid,
+        provider: ProviderId::HyperliquidSpot,
         canonical,
     }
 }
@@ -1307,7 +1307,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             CanonicalAsset::Btc,
             "hyperliquid",
             "hypercore",
@@ -1319,7 +1319,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             CanonicalAsset::Eth,
             "hyperliquid",
             "hypercore",
@@ -1331,7 +1331,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             CanonicalAsset::Usdc,
             "hyperliquid",
             "hypercore",
@@ -1343,7 +1343,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             CanonicalAsset::Usdt,
             "hyperliquid",
             "hypercore",
@@ -1355,7 +1355,7 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             ],
         ),
         provider_asset(
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             CanonicalAsset::Hype,
             "hyperliquid",
             "hypercore",
@@ -1481,7 +1481,7 @@ mod tests {
 
         let hyperliquid_btc = registry
             .provider_asset(
-                ProviderId::Hyperliquid,
+                ProviderId::HyperliquidSpot,
                 &asset("hyperliquid", AssetId::reference("UBTC")),
                 ProviderAssetCapability::ExchangeOutput,
             )
@@ -1490,7 +1490,7 @@ mod tests {
         assert_eq!(hyperliquid_btc.provider_asset, "UBTC");
         let hyperliquid_hype = registry
             .provider_asset(
-                ProviderId::Hyperliquid,
+                ProviderId::HyperliquidSpot,
                 &asset("hyperliquid", AssetId::reference("HYPE")),
                 ProviderAssetCapability::ExchangeOutput,
             )
@@ -1517,6 +1517,21 @@ mod tests {
     }
 
     #[test]
+    fn hyperliquid_spot_provider_id_serializes_new_name_and_rejects_old_provider_id() {
+        assert_eq!(ProviderId::HyperliquidSpot.as_str(), "hyperliquid_spot");
+        assert_eq!(
+            ProviderId::parse("hyperliquid_spot"),
+            Some(ProviderId::HyperliquidSpot)
+        );
+        assert_eq!(ProviderId::parse("hyperliquid"), None);
+        assert_eq!(
+            serde_json::to_value(ProviderId::HyperliquidSpot).unwrap(),
+            serde_json::json!("hyperliquid_spot")
+        );
+        assert!(serde_json::from_value::<ProviderId>(serde_json::json!("hyperliquid")).is_err());
+    }
+
+    #[test]
     fn provider_venue_kinds_classify_current_providers() {
         assert_eq!(
             ProviderId::Across.venue_kind(),
@@ -1530,7 +1545,7 @@ mod tests {
         );
 
         assert_eq!(
-            ProviderId::Hyperliquid.venue_kind(),
+            ProviderId::HyperliquidSpot.venue_kind(),
             ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             }
@@ -1563,7 +1578,7 @@ mod tests {
         );
 
         assert_eq!(
-            ProviderId::Hyperliquid.asset_support_model(),
+            ProviderId::HyperliquidSpot.asset_support_model(),
             AssetSupportModel::StaticDeclared
         );
         assert_eq!(

@@ -564,7 +564,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
     {
         probes.push(
             ProviderHealthProbe::get(
-                ProviderId::Hyperliquid.as_str(),
+                ProviderId::HyperliquidSpot.as_str(),
                 synthetic_provider_status_url(&base_url),
             )
             .with_proxy_url(proxy_string(proxies.hyperliquid.as_ref())),
@@ -1076,7 +1076,7 @@ mod tests {
                 ("across", "https://across.example/status"),
                 ("cctp", "https://iris.example/status"),
                 ("unit", "https://unit.example/status"),
-                ("hyperliquid", "https://hyperliquid.example/status"),
+                ("hyperliquid_spot", "https://hyperliquid.example/status"),
                 ("hyperliquid_bridge", "https://hyperliquid.example/status"),
                 ("velora", "https://velora.example/status"),
             ]

@@ -1016,7 +1016,7 @@ impl OrderManager {
             .exchanges()
             .iter()
             .filter(|exchange| {
-                exchange.id() == ProviderId::Hyperliquid.as_str()
+                exchange.id() == ProviderId::HyperliquidSpot.as_str()
                     && provider_allowed_for_new_routes(
                         provider_policy_snapshot.as_ref(),
                         provider_health_snapshot.as_ref(),
@@ -1027,7 +1027,7 @@ impl OrderManager {
             .collect();
         if exchange_candidates.is_empty() {
             return Err(MarketOrderError::NoRoute {
-                reason: "hyperliquid exchange provider is not configured for limit orders"
+                reason: "hyperliquid_spot exchange provider is not configured for limit orders"
                     .to_string(),
             });
         }
@@ -3007,12 +3007,12 @@ fn limit_order_transition_index(
         }
         if transition.from
             != (MarketOrderNode::Venue {
-                provider: ProviderId::Hyperliquid,
+                provider: ProviderId::HyperliquidSpot,
                 canonical: source_canonical,
             })
             || transition.to
                 != (MarketOrderNode::Venue {
-                    provider: ProviderId::Hyperliquid,
+                    provider: ProviderId::HyperliquidSpot,
                     canonical: destination_canonical,
                 })
         {
@@ -3686,7 +3686,7 @@ mod tests {
     #[test]
     fn spot_transfer_quote_materializes_a_hyperliquid_transfer_leg() {
         let quote = ExchangeQuote {
-            provider_id: "hyperliquid".to_string(),
+            provider_id: ProviderId::HyperliquidSpot.as_str().to_string(),
             amount_in: "50000".to_string(),
             amount_out: "50000".to_string(),
             min_amount_out: Some("50000".to_string()),
@@ -3708,7 +3708,7 @@ mod tests {
         let legs = exchange_quote_transition_legs(
             "transition-1",
             MarketOrderTransitionKind::HyperliquidTrade,
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             &quote,
         )
         .expect("spot transfer quote should materialize");
@@ -3723,7 +3723,7 @@ mod tests {
     #[test]
     fn cross_token_quote_legs_require_explicit_amounts() {
         let quote = ExchangeQuote {
-            provider_id: "hyperliquid".to_string(),
+            provider_id: ProviderId::HyperliquidSpot.as_str().to_string(),
             amount_in: "100".to_string(),
             amount_out: "50".to_string(),
             min_amount_out: None,
@@ -3742,7 +3742,7 @@ mod tests {
         let error = exchange_quote_transition_legs(
             "transition-1",
             MarketOrderTransitionKind::HyperliquidTrade,
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             &quote,
         )
         .unwrap_err();
@@ -3770,7 +3770,7 @@ mod tests {
         let transition = TransitionDecl {
             id: "hl-trade".to_string(),
             kind: MarketOrderTransitionKind::HyperliquidTrade,
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             input: AssetSlot {
                 asset: input.clone(),
                 required_custody_role: RequiredCustodyRole::HyperliquidSpot,
@@ -3816,7 +3816,7 @@ mod tests {
         assert_eq!(
             keys,
             vec![SwapTimeRouteKey {
-                provider: "hyperliquid".to_string(),
+                provider: "hyperliquid_spot".to_string(),
                 leg_type: "hyperliquid_trade".to_string(),
                 transition_decl_id: "hl-trade".to_string(),
                 input_chain_id: input.chain.as_str().to_string(),

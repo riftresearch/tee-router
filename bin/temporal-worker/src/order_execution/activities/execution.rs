@@ -3098,7 +3098,7 @@ async fn authoritative_hyperliquid_output_balance(
     };
     let registry = deps.action_providers.asset_registry();
     let Some(provider_asset) = registry.provider_asset(
-        ProviderId::Hyperliquid,
+        ProviderId::HyperliquidSpot,
         output_asset,
         ProviderAssetCapability::ExchangeOutput,
     ) else {

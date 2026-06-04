@@ -371,7 +371,7 @@ impl router_core::services::action_providers::BridgeProvider for TestBridgeProvi
 
 impl ExchangeProvider for TestHyperliquidExchangeProvider {
     fn id(&self) -> &str {
-        ProviderId::Hyperliquid.as_str()
+        ProviderId::HyperliquidSpot.as_str()
     }
 
     fn quote_trade<'a>(
@@ -3752,7 +3752,7 @@ async fn completed_hyperliquid_spot_transfer_to_final_recipient_uses_sent_amount
         OrderExecutionStepStatus::Running,
     );
     step.step_type = OrderExecutionStepType::HyperliquidTrade;
-    step.provider = ProviderId::Hyperliquid.as_str().to_string();
+    step.provider = ProviderId::HyperliquidSpot.as_str().to_string();
     step.input_asset = Some(hl_usdc.clone());
     step.output_asset = Some(hl_usdc);
     step.request = json!({
@@ -3829,7 +3829,7 @@ async fn completed_hyperliquid_step_amount_out_uses_spendable_spot_balance() {
         OrderExecutionStepStatus::Running,
     );
     step.step_type = OrderExecutionStepType::HyperliquidTrade;
-    step.provider = ProviderId::Hyperliquid.as_str().to_string();
+    step.provider = ProviderId::HyperliquidSpot.as_str().to_string();
     step.output_asset = Some(hl_btc.clone());
     step.request = json!({
         "hyperliquid_custody_vault_id": vault.id,
@@ -4433,7 +4433,7 @@ fn refresh_spot_cross_token_quote_legs_parse_hyperliquid_legs() {
     let hl_usdc = test_asset("hyperliquid", "native");
     let hl_eth = test_asset("hyperliquid", "UETH");
     let quote = ExchangeQuote {
-        provider_id: "hyperliquid".to_string(),
+        provider_id: ProviderId::HyperliquidSpot.as_str().to_string(),
         amount_in: "30000".to_string(),
         amount_out: "40000000000000000".to_string(),
         min_amount_out: Some("1".to_string()),
@@ -4461,7 +4461,7 @@ fn refresh_spot_cross_token_quote_legs_parse_hyperliquid_legs() {
     let legs = refresh_spot_cross_token_quote_transition_legs(
         "hl-trade",
         MarketOrderTransitionKind::HyperliquidTrade,
-        ProviderId::Hyperliquid,
+        ProviderId::HyperliquidSpot,
         &quote,
     )
     .expect("parse spot_cross_token legs");
@@ -4502,7 +4502,7 @@ fn refund_spot_transfer_quote_legs_parse_hyperliquid_transfer_leg() {
     let expires_at = Utc::now();
     let hl_usdc = test_asset("hyperliquid", "native");
     let quote = ExchangeQuote {
-        provider_id: "hyperliquid".to_string(),
+        provider_id: ProviderId::HyperliquidSpot.as_str().to_string(),
         amount_in: "4000000".to_string(),
         amount_out: "4000000".to_string(),
         min_amount_out: Some("4000000".to_string()),
@@ -4527,7 +4527,7 @@ fn refund_spot_transfer_quote_legs_parse_hyperliquid_transfer_leg() {
     let legs = refund_exchange_quote_transition_legs(
         "hl-refund",
         MarketOrderTransitionKind::HyperliquidTrade,
-        ProviderId::Hyperliquid,
+        ProviderId::HyperliquidSpot,
         &quote,
     )
     .expect("parse refund spot_transfer legs");
@@ -4906,7 +4906,7 @@ fn hyperliquid_bridge_deposit_transition(
         },
         from: MarketOrderNode::External(input),
         to: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical: CanonicalAsset::Usdc,
         },
     }
@@ -4929,7 +4929,7 @@ fn hyperliquid_bridge_withdrawal_transition(
             required_custody_role: RequiredCustodyRole::IntermediateExecution,
         },
         from: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical: CanonicalAsset::Usdc,
         },
         to: MarketOrderNode::External(output),
@@ -4949,7 +4949,7 @@ fn hyperliquid_trade_transition(
             output_canonical.as_str()
         ),
         kind: MarketOrderTransitionKind::HyperliquidTrade,
-        provider: ProviderId::Hyperliquid,
+        provider: ProviderId::HyperliquidSpot,
         input: AssetSlot {
             asset: input,
             required_custody_role: RequiredCustodyRole::IntermediateExecution,
@@ -4959,11 +4959,11 @@ fn hyperliquid_trade_transition(
             required_custody_role: RequiredCustodyRole::IntermediateExecution,
         },
         from: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical: input_canonical,
         },
         to: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical: output_canonical,
         },
     }
@@ -4988,7 +4988,7 @@ fn unit_deposit_transition(
         },
         from: MarketOrderNode::External(input),
         to: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical,
         },
     }
@@ -5012,7 +5012,7 @@ fn unit_withdrawal_transition(
             required_custody_role: RequiredCustodyRole::IntermediateExecution,
         },
         from: MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical,
         },
         to: MarketOrderNode::External(output),

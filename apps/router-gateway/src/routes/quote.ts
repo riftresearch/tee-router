@@ -24,7 +24,7 @@ const ProviderIdSchema = z.enum([
   'cctp',
   'unit',
   'hyperliquid_bridge',
-  'hyperliquid',
+  'hyperliquid_spot',
   'velora'
 ])
 

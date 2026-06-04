@@ -1287,7 +1287,7 @@ mod tests {
     fn refreshed_spot_transfer_quote_materializes_transfer_leg() {
         let expires_at = Utc::now() + chrono::Duration::minutes(10);
         let quote = ExchangeQuote {
-            provider_id: ProviderId::Hyperliquid.as_str().to_string(),
+            provider_id: ProviderId::HyperliquidSpot.as_str().to_string(),
             amount_in: "134770".to_string(),
             amount_out: "134770".to_string(),
             min_amount_out: Some("1".to_string()),
@@ -1312,7 +1312,7 @@ mod tests {
         let legs = refresh_exchange_quote_transition_legs(
             "hyperliquid_trade:hyperliquid:hyperliquid:UBTC->hyperliquid:UBTC",
             MarketOrderTransitionKind::HyperliquidTrade,
-            ProviderId::Hyperliquid,
+            ProviderId::HyperliquidSpot,
             &quote,
         )
         .expect("spot transfer quote should materialize");
@@ -1335,7 +1335,7 @@ mod tests {
             leg.execution_step_type,
             OrderExecutionStepType::HyperliquidTrade
         );
-        assert_eq!(leg.provider, ProviderId::Hyperliquid);
+        assert_eq!(leg.provider, ProviderId::HyperliquidSpot);
         assert_eq!(leg.input_asset.chain_id.as_str(), "hyperliquid");
         assert_eq!(leg.input_asset.asset.as_str(), "UBTC");
         assert_eq!(leg.output_asset.chain_id.as_str(), "hyperliquid");

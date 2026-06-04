@@ -160,17 +160,11 @@ fn parse_provider_sequence(value: &str) -> Result<QuoteRouting> {
 }
 
 fn parse_provider_id(value: &str) -> Result<ProviderId> {
-    match value {
-        "across" => Ok(ProviderId::Across),
-        "cctp" => Ok(ProviderId::Cctp),
-        "unit" => Ok(ProviderId::Unit),
-        "hyperliquid_bridge" => Ok(ProviderId::HyperliquidBridge),
-        "hyperliquid" => Ok(ProviderId::Hyperliquid),
-        "velora" => Ok(ProviderId::Velora),
-        _ => Err(eyre!(
-            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid, velora"
-        )),
-    }
+    ProviderId::parse(value).ok_or_else(|| {
+        eyre!(
+            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid_spot, velora"
+        )
+    })
 }
 
 fn confirm(prompt: &str) -> Result<bool> {

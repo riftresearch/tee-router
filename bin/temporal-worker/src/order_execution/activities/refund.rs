@@ -1590,7 +1590,7 @@ pub(super) async fn best_hyperliquid_spot_refund_quote(
     amount: &str,
 ) -> Result<Option<RefundQuotedPath>, OrderActivityError> {
     let start = MarketOrderNode::Venue {
-        provider: ProviderId::Hyperliquid,
+        provider: ProviderId::HyperliquidSpot,
         canonical,
     };
     let goal = MarketOrderNode::External(order.source_asset.clone());
@@ -1881,7 +1881,7 @@ fn hyperliquid_clearinghouse_to_spot_refund_prep(
         leg_type: OrderExecutionStepType::HyperliquidClearinghouseToSpot
             .to_db_string()
             .to_string(),
-        provider: ProviderId::Hyperliquid.as_str().to_string(),
+        provider: ProviderId::HyperliquidSpot.as_str().to_string(),
         status: OrderExecutionStepStatus::Planned,
         input_asset: hyperliquid_usdc.clone(),
         output_asset: hyperliquid_usdc.clone(),
@@ -1909,7 +1909,7 @@ fn hyperliquid_clearinghouse_to_spot_refund_prep(
         transition_decl_id: None,
         step_index: 0,
         step_type: OrderExecutionStepType::HyperliquidClearinghouseToSpot,
-        provider: ProviderId::Hyperliquid.as_str().to_string(),
+        provider: ProviderId::HyperliquidSpot.as_str().to_string(),
         status: OrderExecutionStepStatus::Planned,
         input_asset: Some(hyperliquid_usdc.clone()),
         output_asset: Some(hyperliquid_usdc),
