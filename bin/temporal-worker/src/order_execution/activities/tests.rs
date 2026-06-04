@@ -5104,7 +5104,7 @@ fn test_market_order_quote(
         order_id: None,
         source_asset,
         destination_asset,
-        recipient_address: test_address(1),
+        recipient_address: Some(test_address(1)),
         provider_id: "path:test".to_string(),
         amount_in: "100000".to_string(),
         estimated_amount_out: "100000".to_string(),

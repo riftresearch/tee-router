@@ -70,7 +70,6 @@ export type InternalMarketOrderQuote = {
   order_id?: string | null
   source_asset: InternalDepositAsset
   destination_asset: InternalDepositAsset
-  recipient_address: string
   provider_id: string
   amount_in: string
   estimated_amount_out: string
@@ -85,7 +84,6 @@ export type InternalLimitOrderQuote = {
   order_id?: string | null
   source_asset: InternalDepositAsset
   destination_asset: InternalDepositAsset
-  recipient_address: string
   provider_id: string
   input_amount: string
   output_amount: string
@@ -101,7 +99,6 @@ export type CreateQuoteRequest =
       type: 'market_order'
       from_asset: InternalDepositAsset
       to_asset: InternalDepositAsset
-      recipient_address: string
       amount_in: string
       routing?: InternalQuoteRouting
     }
@@ -109,13 +106,13 @@ export type CreateQuoteRequest =
       type: 'limit_order'
       from_asset: InternalDepositAsset
       to_asset: InternalDepositAsset
-      recipient_address: string
       input_amount: string
       output_amount: string
     }
 
 export type CreateOrderRequest = {
   quote_id: string
+  recipient_address: string
   refund_address: string
   idempotency_key: string
   metadata?: Record<string, unknown>
@@ -299,7 +296,6 @@ function isMarketQuote(
     optionalBoundedString(value.order_id, MAX_INTERNAL_ID_LENGTH) &&
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
-    isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
     isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     amount(value.estimated_amount_out) &&
     optionalNonNegativeSafeInteger(value.expected_swap_time_ms) &&
@@ -319,7 +315,6 @@ function isLimitQuote(
     optionalBoundedString(value.order_id, MAX_INTERNAL_ID_LENGTH) &&
     isDepositAsset(value.source_asset) &&
     isDepositAsset(value.destination_asset) &&
-    isBoundedString(value.recipient_address, MAX_INTERNAL_ADDRESS_LENGTH) &&
     isBoundedString(value.provider_id, MAX_INTERNAL_PROVIDER_ID_LENGTH) &&
     amount(value.input_amount) &&
     amount(value.output_amount) &&

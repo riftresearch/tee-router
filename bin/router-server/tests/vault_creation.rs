@@ -1375,9 +1375,13 @@ async fn create_test_order_from_quote_with_refund(
     quote_id: Uuid,
     refund_address: String,
 ) -> router_core::models::RouterOrder {
+    // Quotes are recipient-agnostic; the recipient is supplied at order time and
+    // must validate against the quote's destination chain.
+    let recipient_address = recipient_for_quote_destination(order_manager, quote_id).await;
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
+            recipient_address,
             refund_address,
             idempotency_key: None,
             metadata: json!({}),
@@ -1385,6 +1389,22 @@ async fn create_test_order_from_quote_with_refund(
         .await
         .unwrap();
     order
+}
+
+/// Pick a recipient address valid for the destination chain of `quote_id`.
+async fn recipient_for_quote_destination(
+    order_manager: &OrderManager,
+    quote_id: Uuid,
+) -> String {
+    let quote = order_manager
+        .get_quote(quote_id)
+        .await
+        .expect("quote exists");
+    if quote.destination_asset().chain.evm_chain_id().is_some() {
+        valid_evm_address()
+    } else {
+        valid_regtest_btc_address()
+    }
 }
 
 async fn record_confirmed_sauron_funding_hint(
@@ -1701,7 +1721,6 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -1760,6 +1779,8 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
         .await
         .unwrap();
     assert!(stored_quote.order_id.is_none());
+    // Quotes are recipient-agnostic: no recipient is persisted at quote time.
+    assert!(stored_quote.recipient_address.is_none());
     assert_path_provider_id(
         &stored_quote.provider_id,
         &["unit_deposit:unit", "unit_withdrawal:unit"],
@@ -1773,6 +1794,67 @@ async fn quote_market_order_persists_ephemeral_quote_without_order() {
     .unwrap();
     assert!(public_quote.get("execution_steps").is_none());
     assert!(public_quote.get("custody_vaults").is_none());
+}
+
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn quote_market_order_persists_no_custody_vault() {
+    // Persistence guarantee: creating a quote must NOT derive or store any
+    // vault/key material. Custody vaults are only created at order time.
+    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let postgres = test_postgres().await;
+    let url = create_test_database(&postgres.admin_database_url).await;
+    let db = Database::connect(&url, 5, 1)
+        .await
+        .expect("test database connection failed");
+
+    let h = harness().await;
+    let dir = tempfile::tempdir().unwrap();
+    let settings = Arc::new(test_settings(dir.path()));
+    let order_manager = OrderManager::with_action_providers(
+        db,
+        settings,
+        h.chain_registry.clone(),
+        Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
+    );
+
+    let connect_options =
+        PgConnectOptions::from_str(&url).expect("parse isolated test database URL");
+    let mut conn = PgConnection::connect_with(&connect_options)
+        .await
+        .expect("connect to isolated test database");
+
+    let custody_vaults_before =
+        sqlx_core::query_scalar::query_scalar::<_, i64>("SELECT COUNT(*) FROM custody_vaults")
+            .fetch_one(&mut conn)
+            .await
+            .expect("count custody_vaults");
+    assert_eq!(custody_vaults_before, 0, "custody_vaults must start empty");
+
+    order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: DepositAsset {
+                chain: ChainId::parse("evm:1").unwrap(),
+                asset: AssetId::Native,
+            },
+            to_asset: DepositAsset {
+                chain: ChainId::parse("evm:8453").unwrap(),
+                asset: AssetId::Native,
+            },
+            amount_in: "1000".to_string(),
+        })
+        .await
+        .expect("market order quote");
+
+    let custody_vaults_after =
+        sqlx_core::query_scalar::query_scalar::<_, i64>("SELECT COUNT(*) FROM custody_vaults")
+            .fetch_one(&mut conn)
+            .await
+            .expect("count custody_vaults");
+    assert_eq!(
+        custody_vaults_after, 0,
+        "creating a quote must not insert any custody_vaults row"
+    );
 }
 
 #[tokio::test]
@@ -1795,7 +1877,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -1815,7 +1896,6 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "2000".to_string(),
         })
         .await
@@ -1828,6 +1908,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
     let first_order = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
@@ -1839,6 +1920,7 @@ async fn create_order_idempotency_keys_are_scoped_to_their_quote() {
     let second_order = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
@@ -1878,7 +1960,6 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -1889,6 +1970,7 @@ async fn concurrent_create_order_requests_resume_same_quote_idempotently() {
         .clone();
     let request = CreateOrderRequest {
         quote_id: quote.id,
+        recipient_address: valid_evm_address(),
         refund_address,
         idempotency_key: Some("concurrent-create-order-race".to_string()),
         metadata: json!({}),
@@ -1983,6 +2065,7 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
     let first_order = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: first_quote.id,
+            recipient_address: valid_regtest_btc_address(),
             refund_address: valid_evm_address(),
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
@@ -1994,6 +2077,7 @@ async fn create_limit_order_idempotency_keys_are_scoped_to_their_quote() {
     let second_order = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: second_quote.id,
+            recipient_address: valid_regtest_btc_address(),
             refund_address: valid_evm_address(),
             idempotency_key: Some(idempotency_key.to_string()),
             metadata: json!({}),
@@ -2045,6 +2129,7 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
         .clone();
     let request = CreateOrderRequest {
         quote_id: quote.id,
+        recipient_address: valid_regtest_btc_address(),
         refund_address,
         idempotency_key: Some("concurrent-create-limit-order-race".to_string()),
         metadata: json!({}),
@@ -2139,7 +2224,6 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
-            recipient_address: valid_evm_address(),
             amount_in: "1000000000000000000".to_string(),
         })
         .await
@@ -2232,7 +2316,6 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
             },
-            recipient_address: valid_evm_address(),
             amount_in: "10000000".to_string(),
         })
         .await
@@ -2286,7 +2369,6 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
                 chain: ChainId::parse("evm:1").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "60000000".to_string(),
         })
         .await
@@ -2521,7 +2603,6 @@ async fn quote_market_order_exact_out_uses_exchange_provider_quote() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -2648,7 +2729,6 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
                 "chain": "evm:8453",
                 "asset": "native"
             },
-            "recipient_address": valid_evm_address(),
             "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
         }))
         .send()
@@ -2709,6 +2789,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
 
     let create_order_request = json!({
         "quote_id": quote.quote.as_market_order().expect("market order quote").id,
+        "recipient_address": valid_evm_address(),
         "refund_address": valid_evm_address(),
         "idempotency_key": "production-component-order",
         "metadata": {
@@ -2863,47 +2944,68 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     args.chainalysis_token = Some("mock-chainalysis-token".to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();
-    let quote_request = |recipient_address: &str| {
+    // Quotes are recipient-agnostic; recipient screening happens at order time.
+    let quote_request = json!({
+        "type": "market_order",
+        "from_asset": {
+            "chain": "evm:1",
+            "asset": "native"
+        },
+        "to_asset": {
+            "chain": "evm:8453",
+            "asset": "native"
+        },
+        "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
+    });
+
+    let quote_response = client
+        .post(format!("{base_url}/api/v1/quotes"))
+        .json(&quote_request)
+        .send()
+        .await
+        .unwrap();
+    let status = quote_response.status();
+    let body = quote_response.text().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    let quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
+    let quote_id = quote
+        .quote
+        .as_market_order()
+        .expect("market order quote")
+        .id;
+
+    let order_request = |recipient_address: &str, refund_address: &str, key: &str| {
         json!({
-            "type": "market_order",
-            "from_asset": {
-                "chain": "evm:1",
-                "asset": "native"
-            },
-            "to_asset": {
-                "chain": "evm:8453",
-                "asset": "native"
-            },
+            "quote_id": quote_id,
             "recipient_address": recipient_address,
-            "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
+            "refund_address": refund_address,
+            "idempotency_key": key,
         })
     };
 
-    let allowed_quote_response = client
-        .post(format!("{base_url}/api/v1/quotes"))
-        .json(&quote_request(allowed_recipient))
+    // Recipient screening runs on the ORDER request now.
+    let blocked_recipient_response = client
+        .post(format!("{base_url}/api/v1/orders"))
+        .json(&order_request(
+            blocked_recipient,
+            allowed_recipient,
+            "blocked-recipient-order",
+        ))
         .send()
         .await
         .unwrap();
-    let status = allowed_quote_response.status();
-    let body = allowed_quote_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
-    let allowed_quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
-
-    let blocked_quote_response = client
-        .post(format!("{base_url}/api/v1/quotes"))
-        .json(&quote_request(blocked_recipient))
-        .send()
-        .await
-        .unwrap();
-    let status = blocked_quote_response.status();
-    let body = blocked_quote_response.text().await.unwrap();
+    let status = blocked_recipient_response.status();
+    let body = blocked_recipient_response.text().await.unwrap();
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{body}");
     assert!(body.contains("Forbidden"), "{body}");
 
     let provider_error_response = client
-        .post(format!("{base_url}/api/v1/quotes"))
-        .json(&quote_request(provider_error_recipient))
+        .post(format!("{base_url}/api/v1/orders"))
+        .json(&order_request(
+            provider_error_recipient,
+            allowed_recipient,
+            "provider-error-recipient-order",
+        ))
         .send()
         .await
         .unwrap();
@@ -2914,15 +3016,11 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
 
     let refund_block_response = client
         .post(format!("{base_url}/api/v1/orders"))
-        .json(&json!({
-            "quote_id": allowed_quote
-                .quote
-                .as_market_order()
-                .expect("market order quote")
-                .id,
-            "refund_address": blocked_refund,
-            "idempotency_key": "blocked-refund-order",
-        }))
+        .json(&order_request(
+            allowed_recipient,
+            blocked_refund,
+            "blocked-refund-order",
+        ))
         .send()
         .await
         .unwrap();
@@ -2990,7 +3088,6 @@ async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
                 "chain": "evm:8453",
                 "asset": MOCK_ERC20_ADDRESS
             },
-            "recipient_address": "0x1111111111111111111111111111111111111111",
             "amount_in": "100"
         }))
         .send()
@@ -3005,6 +3102,7 @@ async fn router_public_gateway_routes_require_bearer_api_key_when_configured() {
         .post(format!("{base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
+            "recipient_address": valid_evm_address(),
             "refund_address": "0x1111111111111111111111111111111111111111",
             "idempotency_key": "gateway-auth-test-key"
         }))
@@ -3179,7 +3277,6 @@ async fn router_admin_refund_only_mode_endpoint_requires_bearer_api_key_and_bloc
                 "chain": "evm:1",
                 "asset": "native"
             },
-            "recipient_address": valid_evm_address(),
             "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
         }))
         .send()
@@ -3192,6 +3289,7 @@ async fn router_admin_refund_only_mode_endpoint_requires_bearer_api_key_and_bloc
         .bearer_auth(TEST_GATEWAY_API_KEY)
         .json(&json!({
             "quote_id": Uuid::now_v7(),
+            "recipient_address": valid_evm_address(),
             "refund_address": valid_evm_address(),
             "idempotency_key": "refund-only-blocks-order-intake"
         }))
@@ -3348,7 +3446,6 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
             "chain": "evm:1",
             "asset": "native"
         },
-        "recipient_address": valid_evm_address(),
         "amount_in": TEST_NATIVE_ORDER_AMOUNT_WEI
     });
 
@@ -3444,7 +3541,6 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -4698,7 +4794,6 @@ async fn quote_market_order_rejects_zero_amounts() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "0".to_string(),
         })
         .await
@@ -4727,7 +4822,6 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -5256,7 +5350,6 @@ async fn provider_operations_store_protocol_addresses_outside_custody_vaults() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -5693,7 +5786,6 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -5827,7 +5919,6 @@ async fn execution_leg_rollup_ignores_cancelled_failed_retry_actions() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6030,7 +6121,6 @@ async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_de
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6176,7 +6266,6 @@ async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6597,7 +6686,6 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6726,7 +6814,6 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6739,6 +6826,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let (order, linked_quote) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({}),
@@ -6748,6 +6836,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let (resumed_order, resumed_quote) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({}),
@@ -6773,6 +6862,7 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let (retry_order, retry_quote) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({}),
@@ -6813,7 +6903,6 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -6825,6 +6914,7 @@ async fn create_order_from_quote_resumes_after_funding_vault_attached() {
         .id;
     let request = CreateOrderRequest {
         quote_id,
+        recipient_address: valid_evm_address(),
         refund_address,
         idempotency_key: Some("retry-after-vault-attach".to_string()),
         metadata: json!({}),
@@ -6974,7 +7064,7 @@ fn test_market_order_quote(
         order_id: None,
         source_asset,
         destination_asset,
-        recipient_address: valid_evm_address(),
+        recipient_address: None,
         provider_id: "test_provider".to_string(),
         amount_in: "1000".to_string(),
         estimated_amount_out: "1000".to_string(),
@@ -7006,7 +7096,6 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
                 chain: ChainId::parse("evm:1").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -7150,7 +7239,6 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
                 chain: ChainId::parse("evm:1").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000000".to_string(),
         })
         .await
@@ -7272,7 +7360,6 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
                 chain: ChainId::parse("bitcoin").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_regtest_btc_address(),
             amount_in: "6000000".to_string(),
         })
         .await
@@ -8292,7 +8379,6 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await
@@ -8348,7 +8434,6 @@ async fn quote_envelope_never_exposes_deposit_address() {
                 chain: ChainId::parse("evm:8453").unwrap(),
                 asset: AssetId::Native,
             },
-            recipient_address: valid_evm_address(),
             amount_in: "1000".to_string(),
         })
         .await

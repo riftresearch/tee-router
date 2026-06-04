@@ -47,7 +47,6 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             from: source.identifier.to_string(),
             to: args.to.clone(),
             amount_format: Some(AmountFormat::Readable),
-            to_address: args.to_address.clone(),
             from_amount: args.from_amount.clone(),
             routing,
         })

@@ -216,7 +216,10 @@ pub struct MarketOrderQuote {
     pub order_id: Option<Uuid>,
     pub source_asset: DepositAsset,
     pub destination_asset: DepositAsset,
-    pub recipient_address: String,
+    /// Vestigial: quotes are recipient-agnostic. The real recipient is supplied
+    /// at order time on `RouterOrder.recipient_address`. Always `None` for new
+    /// quotes; nullable in the DB for historical rows.
+    pub recipient_address: Option<String>,
     pub provider_id: String,
     pub amount_in: String,
     pub estimated_amount_out: String,
@@ -234,7 +237,10 @@ pub struct LimitOrderQuote {
     pub order_id: Option<Uuid>,
     pub source_asset: DepositAsset,
     pub destination_asset: DepositAsset,
-    pub recipient_address: String,
+    /// Vestigial: quotes are recipient-agnostic. The real recipient is supplied
+    /// at order time on `RouterOrder.recipient_address`. Always `None` for new
+    /// quotes; nullable in the DB for historical rows.
+    pub recipient_address: Option<String>,
     pub provider_id: String,
     pub input_amount: String,
     pub output_amount: String,
@@ -279,11 +285,14 @@ impl RouterOrderQuote {
         }
     }
 
+    /// Vestigial recipient column. Quotes are recipient-agnostic; the real
+    /// recipient lives on the order, not the quote. Returns `None` for all
+    /// quotes created after the recipient-on-order refactor.
     #[must_use]
-    pub fn recipient_address(&self) -> &str {
+    pub fn recipient_address(&self) -> Option<&str> {
         match self {
-            Self::MarketOrder(quote) => &quote.recipient_address,
-            Self::LimitOrder(quote) => &quote.recipient_address,
+            Self::MarketOrder(quote) => quote.recipient_address.as_deref(),
+            Self::LimitOrder(quote) => quote.recipient_address.as_deref(),
         }
     }
 

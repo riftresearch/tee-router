@@ -163,13 +163,6 @@
           "amountFormat": {
             "$ref": "#/components/schemas/AmountFormat"
           },
-          "toAddress": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "description": "Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.",
-            "example": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-          },
           "orderType": {
             "type": "string",
             "enum": [
@@ -188,8 +181,7 @@
         },
         "required": [
           "from",
-          "to",
-          "toAddress"
+          "to"
         ],
         "additionalProperties": false
       },

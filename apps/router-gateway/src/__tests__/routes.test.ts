@@ -42,7 +42,6 @@ describe('router gateway routes', () => {
       'from',
       'to',
       'amountFormat',
-      'toAddress',
       'orderType',
       'fromAmount',
       'routing'
@@ -340,7 +339,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         amountFormat: 'readable'
       })
     })
@@ -376,7 +374,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -407,7 +404,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -438,7 +434,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -470,7 +465,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -495,7 +489,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         toAmount: '1000',
         orderType: 'limit',
@@ -523,7 +516,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -549,8 +541,7 @@ describe('router gateway routes', () => {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
-        toAddress: 'b'.repeat(129),
+        to: 'Ethereum.' + 'b'.repeat(129),
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -648,20 +639,26 @@ describe('router gateway routes', () => {
     expect(calls).toHaveLength(0)
   })
 
-  test('rejects invalid EVM quote recipient addresses before routing upstream', async () => {
+  test('rejects invalid EVM order recipient addresses before creating orders', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
+      fetch: mockFetch(calls, async (path) => {
+        if (path === `/api/v1/quotes/${QUOTE_ID}`) {
+          return Response.json(internalQuote())
+        }
+
+        return Response.json({ message: 'unexpected' }, { status: 500 })
+      })
     })
 
-    const response = await app.request('/quote', {
+    const response = await app.request('/order/market', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        from: 'Bitcoin.BTC',
-        to: 'Ethereum.USDC',
+        quoteId: QUOTE_ID,
+        idempotencyKey: IDEMPOTENCY_KEY,
+        fromAddress: FROM_ADDRESS,
         toAddress: 'not-an-evm-address',
-        fromAmount: '1',
         amountFormat: 'readable'
       })
     })
@@ -669,50 +666,32 @@ describe('router gateway routes', () => {
 
     expect(response.status).toBe(400)
     expect(body.error.message).toBe('toAddress must be a valid EVM address')
-    expect(calls).toHaveLength(0)
+    expect(calls.map((call) => call.path)).toEqual([`/api/v1/quotes/${QUOTE_ID}`])
   })
 
-  test('rejects invalid Bitcoin quote recipient addresses before routing upstream', async () => {
-    const calls: RecordedCall[] = []
-    const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
-    })
-
-    const response = await app.request('/quote', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        from: 'Base.USDC',
-        to: 'Bitcoin.BTC',
-        toAddress: TO_ADDRESS,
-        fromAmount: '100000000',
-        amountFormat: 'raw'
-      })
-    })
-    const body = await response.json()
-
-    expect(response.status).toBe(400)
-    expect(body.error.message).toBe('toAddress must be a valid Bitcoin address')
-    expect(calls).toHaveLength(0)
-  })
-
-  test('rejects Bitcoin quote recipients from disabled address networks', async () => {
+  test('rejects Bitcoin order recipients from disabled address networks', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(
       { ...testConfig(), bitcoinAddressNetworks: ['mainnet'] },
       {
-        fetch: mockFetch(calls, async () => Response.json({ message: 'unexpected' }))
+        fetch: mockFetch(calls, async (path) => {
+          if (path === `/api/v1/quotes/${QUOTE_ID}`) {
+            return Response.json(internalBaseToBitcoinQuote())
+          }
+
+          return Response.json({ message: 'unexpected' }, { status: 500 })
+        })
       }
     )
 
-    const response = await app.request('/quote', {
+    const response = await app.request('/order/market', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        from: 'Base.USDC',
-        to: 'Bitcoin.BTC',
+        quoteId: QUOTE_ID,
+        idempotencyKey: IDEMPOTENCY_KEY,
+        fromAddress: '0x2222222222222222222222222222222222222222',
         toAddress: BTC_ADDRESS,
-        fromAmount: '100000000',
         amountFormat: 'raw'
       })
     })
@@ -720,7 +699,7 @@ describe('router gateway routes', () => {
 
     expect(response.status).toBe(400)
     expect(body.error.message).toBe('toAddress must be a valid Bitcoin address')
-    expect(calls).toHaveLength(0)
+    expect(calls.map((call) => call.path)).toEqual([`/api/v1/quotes/${QUOTE_ID}`])
   })
 
   test('creates exact-in market quotes', async () => {
@@ -738,7 +717,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -777,7 +755,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Base.0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '52',
         amountFormat: 'readable'
       })
@@ -803,7 +780,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Arbitrum.USDT',
         to: 'Base.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '5',
         amountFormat: 'readable',
         routing: {
@@ -944,7 +920,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -976,7 +951,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -1006,7 +980,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -1050,7 +1023,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1',
         amountFormat: 'readable'
       })
@@ -1080,7 +1052,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1.25',
         amountFormat: 'readable'
       })
@@ -1099,7 +1070,6 @@ describe('router gateway routes', () => {
         chain: 'evm:1',
         asset: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
       },
-      recipient_address: TO_ADDRESS,
       amount_in: '125000000',
     })
 
@@ -1138,7 +1108,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Hyperliquid.UBTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '0.0005',
         amountFormat: 'readable'
       })
@@ -1184,7 +1153,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Base.USDC',
         to: 'Hyperliquid.HYPE',
-        toAddress: TO_ADDRESS,
         fromAmount: '40',
         amountFormat: 'readable'
       })
@@ -1202,7 +1170,6 @@ describe('router gateway routes', () => {
         chain: 'hyperliquid',
         asset: 'HYPE'
       },
-      recipient_address: TO_ADDRESS,
       amount_in: '40000000'
     })
     expect(body.to).toBe('Hyperliquid.HYPE')
@@ -1244,7 +1211,6 @@ describe('router gateway routes', () => {
       body: JSON.stringify({
         from: 'Bitcoin.BTC',
         to: 'Ethereum.USDC',
-        toAddress: TO_ADDRESS,
         fromAmount: '1.25',
         amountFormat: 'readable'
       })
@@ -1289,7 +1255,6 @@ describe('router gateway routes', () => {
         orderType: 'limit_order',
         from: 'Base.USDC',
         to: 'Bitcoin.BTC',
-        toAddress: BTC_ADDRESS,
         fromAmount: '100000000',
         toAmount: '100000',
         amountFormat: 'raw'
@@ -1333,6 +1298,7 @@ describe('router gateway routes', () => {
     expect(calls[1]?.path).toBe('/api/v1/orders')
     expect(calls[1]?.body).toEqual({
       quote_id: QUOTE_ID,
+      recipient_address: TO_ADDRESS,
       refund_address: FROM_ADDRESS,
       idempotency_key: IDEMPOTENCY_KEY,
       metadata: {

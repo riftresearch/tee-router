@@ -1,7 +1,6 @@
 import { createRoute, z } from '@hono/zod-openapi'
 
 import {
-  assertAddressMatchesChain,
   parseAmount,
   resolveAssetIdentifier,
   type AmountFormat
@@ -48,11 +47,6 @@ export const QuoteRequestSchema = z
       example: 'Ethereum.USDC'
     }),
     amountFormat: AmountFormatSchema.optional(),
-    toAddress: AddressSchema.openapi({
-      description:
-        'Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.',
-      example: '0x1111111111111111111111111111111111111111'
-    }),
     orderType: z
       .enum([
         'market_order',
@@ -141,19 +135,12 @@ export function createQuoteHandler(
         await decimalsResolver.ensure(destination)
       }
       const orderType = normalizeOrderType(request.orderType)
-      assertAddressMatchesChain(
-        destination.internal.chain,
-        request.toAddress,
-        'toAddress',
-        { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
-      )
 
       if (orderType === 'limit_order') {
         const envelope = await routerClientFor(config, deps).createQuote({
           type: 'limit_order',
           from_asset: source.internal,
           to_asset: destination.internal,
-          recipient_address: request.toAddress,
           input_amount: parseAmount(
             request.fromAmount as string,
             source,
@@ -182,7 +169,6 @@ export function createQuoteHandler(
         type: 'market_order',
         from_asset: source.internal,
         to_asset: destination.internal,
-        recipient_address: request.toAddress,
         amount_in: parseAmount(
           request.fromAmount as string,
           source,

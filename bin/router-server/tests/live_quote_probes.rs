@@ -37,7 +37,6 @@ const HYPERLIQUID_API_URL_ENV: &str = "HYPERLIQUID_API_URL";
 const ETHEREUM_USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const ARBITRUM_USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
-const DEFAULT_BTC_RECIPIENT: &str = "bc1qk4m6mpxulnlufegdh3w40kayhx9m722am38apn";
 const DEFAULT_EVM_RECIPIENT: &str = "0x0000000000000000000000000000000000000001";
 const DEFAULT_BTC_AMOUNT_IN_SATS: &str = "1000000";
 const DEFAULT_ETH_AMOUNT_IN_WEI: &str = "50000000000000000";
@@ -110,18 +109,12 @@ async fn live_router_quote_probe_base_usdc_to_bitcoin() -> TestResult<()> {
     let destination_asset = deposit_asset("bitcoin", AssetId::Native);
     let amount_in = env_var_any(&["ROUTER_LIVE_BASE_USDC_TO_BTC_AMOUNT"])
         .unwrap_or_else(|| DEFAULT_USDC_AMOUNT_IN_RAW.to_string());
-    let recipient_address = env_var_any(&[
-        "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS",
-        "ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS",
-    ])
-    .unwrap_or_else(|| DEFAULT_BTC_RECIPIENT.to_string());
 
     let response = ctx
         .order_manager
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
-            recipient_address,
             amount_in: amount_in.clone(),
         })
         .await
@@ -179,7 +172,6 @@ async fn live_router_quote_probe_base_usdc_to_hyperliquid_ubtc_paths() -> TestRe
                 .quote_market_order(MarketOrderQuoteRequest {
                     from_asset: source_asset.clone(),
                     to_asset: destination_asset.clone(),
-                    recipient_address: recipient_address.clone(),
                     amount_in: amount_in.clone(),
                 })
                 .await;
@@ -301,15 +293,11 @@ async fn live_router_quote_probe_bitcoin_to_base_eth() -> TestResult<()> {
     let destination_asset = deposit_asset("evm:8453", AssetId::Native);
     let amount_in = env_var_any(&["ROUTER_LIVE_BTC_AMOUNT_IN_SATS"])
         .unwrap_or_else(|| DEFAULT_BTC_AMOUNT_IN_SATS.to_string());
-    let recipient_address = env_var_any(&["ROUTER_LIVE_EVM_RECIPIENT_ADDRESS"])
-        .unwrap_or_else(|| DEFAULT_EVM_RECIPIENT.to_string());
-
     let response = ctx
         .order_manager
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
-            recipient_address,
             amount_in: amount_in.clone(),
         })
         .await
@@ -353,18 +341,12 @@ async fn live_router_quote_probe_ethereum_eth_to_bitcoin() -> TestResult<()> {
     let destination_asset = deposit_asset("bitcoin", AssetId::Native);
     let amount_in = env_var_any(&["ROUTER_LIVE_ETH_AMOUNT_IN_WEI"])
         .unwrap_or_else(|| DEFAULT_ETH_AMOUNT_IN_WEI.to_string());
-    let recipient_address = env_var_any(&[
-        "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS",
-        "ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS",
-    ])
-    .unwrap_or_else(|| DEFAULT_BTC_RECIPIENT.to_string());
 
     let response = ctx
         .order_manager
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
-            recipient_address,
             amount_in: amount_in.clone(),
         })
         .await
@@ -408,18 +390,12 @@ async fn live_router_quote_probe_arbitrum_usdc_to_bitcoin() -> TestResult<()> {
     let destination_asset = deposit_asset("bitcoin", AssetId::Native);
     let amount_in = env_var_any(&["ROUTER_LIVE_ARBITRUM_USDC_TO_BTC_AMOUNT"])
         .unwrap_or_else(|| DEFAULT_USDC_AMOUNT_IN_RAW.to_string());
-    let recipient_address = env_var_any(&[
-        "ROUTER_LIVE_BTC_RECIPIENT_ADDRESS",
-        "ROUTER_LIVE_WITHDRAW_RECIPIENT_ADDRESS",
-    ])
-    .unwrap_or_else(|| DEFAULT_BTC_RECIPIENT.to_string());
 
     let response = ctx
         .order_manager
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset.clone(),
-            recipient_address,
             amount_in: amount_in.clone(),
         })
         .await

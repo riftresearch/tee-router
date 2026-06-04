@@ -236,25 +236,9 @@ export function createOrderMarketHandler(
         { bitcoinAddressNetworks: config.bitcoinAddressNetworks }
       )
 
-      if (
-        !addressesMatch(
-          quote.destination_asset.chain,
-          quote.recipient_address,
-          request.toAddress
-        )
-      ) {
-        throw new GatewayValidationError(
-          'toAddress must match the recipient address used when the quote was created',
-          {
-            quoteId: request.quoteId,
-            quoteRecipientAddress: quote.recipient_address,
-            toAddress: request.toAddress
-          }
-        )
-      }
-
       const envelope = await routerClient.createOrder({
         quote_id: request.quoteId,
+        recipient_address: request.toAddress,
         refund_address: request.refundAddress ?? request.fromAddress,
         idempotency_key: request.idempotencyKey,
         metadata: {
@@ -322,7 +306,6 @@ export function createOrderLimitHandler(
         type: 'limit_order',
         from_asset: fromAsset.internal,
         to_asset: toAsset.internal,
-        recipient_address: request.toAddress,
         input_amount: inputAmount,
         output_amount: outputAmount
       })
@@ -330,6 +313,7 @@ export function createOrderLimitHandler(
       const quoteId = limitQuoteFromEnvelope(quoteEnvelope).id
       const envelope = await routerClient.createOrder({
         quote_id: quoteId,
+        recipient_address: request.toAddress,
         refund_address: request.refundAddress ?? request.fromAddress,
         idempotency_key: request.idempotencyKey,
         metadata: {
@@ -550,14 +534,6 @@ function assertPositive(value: bigint, field: string) {
       field
     })
   }
-}
-
-function addressesMatch(chainId: string, left: string, right: string): boolean {
-  if (chainId.startsWith('evm:')) {
-    return left.toLowerCase() === right.toLowerCase()
-  }
-
-  return left === right
 }
 
 function malformedOrderPresentationError(error: unknown) {

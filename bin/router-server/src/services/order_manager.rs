@@ -342,7 +342,9 @@ impl OrderManager {
             order_id: None,
             source_asset: normalized_request.source_asset,
             destination_asset: normalized_request.destination_asset,
-            recipient_address: normalized_request.recipient_address,
+            // Quotes are recipient-agnostic; the real recipient is supplied at
+            // order time. This vestigial column is left NULL.
+            recipient_address: None,
             provider_id: provider_quote.provider_id,
             amount_in: provider_quote.amount_in,
             estimated_amount_out: provider_quote.estimated_amount_out,
@@ -393,7 +395,9 @@ impl OrderManager {
             order_id: None,
             source_asset: normalized_request.source_asset,
             destination_asset: normalized_request.destination_asset,
-            recipient_address: normalized_request.recipient_address,
+            // Quotes are recipient-agnostic; the real recipient is supplied at
+            // order time. This vestigial column is left NULL.
+            recipient_address: None,
             provider_id: provider_quote.provider_id,
             input_amount: provider_quote.input_amount,
             output_amount: provider_quote.output_amount,
@@ -602,6 +606,12 @@ impl OrderManager {
             &quote.source_asset.chain,
             &request.refund_address,
         )?;
+        // Funds-safety invariant: the real recipient comes from the ORDER
+        // request, never the (recipient-agnostic) quote.
+        let recipient_address = self.validate_and_normalize_recipient_address(
+            &quote.destination_asset.chain,
+            &request.recipient_address,
+        )?;
         let order = RouterOrder {
             id: order_id,
             order_type: RouterOrderType::MarketOrder,
@@ -609,7 +619,7 @@ impl OrderManager {
             funding_vault_id: None,
             source_asset: quote.source_asset.clone(),
             destination_asset: quote.destination_asset.clone(),
-            recipient_address: quote.recipient_address.clone(),
+            recipient_address,
             refund_address,
             action: RouterOrderAction::MarketOrder(MarketOrderAction {
                 amount_in: quote.amount_in.clone(),
@@ -655,6 +665,12 @@ impl OrderManager {
             &quote.source_asset.chain,
             &request.refund_address,
         )?;
+        // Funds-safety invariant: the real recipient comes from the ORDER
+        // request, never the (recipient-agnostic) quote.
+        let recipient_address = self.validate_and_normalize_recipient_address(
+            &quote.destination_asset.chain,
+            &request.recipient_address,
+        )?;
         let order = RouterOrder {
             id: order_id,
             order_type: RouterOrderType::LimitOrder,
@@ -662,7 +678,7 @@ impl OrderManager {
             funding_vault_id: None,
             source_asset: quote.source_asset.clone(),
             destination_asset: quote.destination_asset.clone(),
-            recipient_address: quote.recipient_address.clone(),
+            recipient_address,
             refund_address,
             action: RouterOrderAction::LimitOrder(LimitOrderAction {
                 input_amount: quote.input_amount.clone(),
@@ -1172,7 +1188,6 @@ impl OrderManager {
             let suffix_request = NormalizedMarketOrderQuoteRequest {
                 source_asset: limit_transition.output.asset.clone(),
                 destination_asset: request.destination_asset.clone(),
-                recipient_address: request.recipient_address.clone(),
                 amount_in: String::new(),
                 routing: NormalizedMarketOrderRouting::default(),
             };
@@ -1226,8 +1241,6 @@ impl OrderManager {
             let prefix_request = NormalizedMarketOrderQuoteRequest {
                 source_asset: request.source_asset.clone(),
                 destination_asset: limit_transition.input.asset.clone(),
-                recipient_address: self
-                    .quote_address_for_chain(quote_id, &limit_transition.input.asset.chain)?,
                 amount_in: String::new(),
                 routing: NormalizedMarketOrderRouting::default(),
             };
@@ -1490,9 +1503,8 @@ impl OrderManager {
                                         amount_in: provider_amount_in.clone(),
                                         min_amount_out: Some("1".to_string()),
                                     },
-                                    recipient_address: self.bridge_quote_recipient_address(
-                                        request, quote_id, path, index, transition,
-                                    )?,
+                                    recipient_address: self
+                                        .bridge_quote_recipient_address(quote_id, transition)?,
                                     depositor_address: self.bridge_quote_depositor_address(
                                         request,
                                         quote_id,
@@ -1578,7 +1590,8 @@ impl OrderManager {
                                         ),
                                     },
                                     sender_address: None,
-                                    recipient_address: request.recipient_address.clone(),
+                                    recipient_address: self
+                                        .exchange_quote_recipient_address(quote_id, transition)?,
                                 },
                             )
                             .await?;
@@ -1630,9 +1643,8 @@ impl OrderManager {
                                         source_depositor_address,
                                         transition,
                                     )?),
-                                    recipient_address: self.exchange_quote_recipient_address(
-                                        request, quote_id, path, index, transition,
-                                    )?,
+                                    recipient_address: self
+                                        .exchange_quote_recipient_address(quote_id, transition)?,
                                 },
                             )
                             .await?;
@@ -1652,9 +1664,8 @@ impl OrderManager {
                             unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_withdrawal".to_string(),
                             })?;
-                            let recipient_address = self.unit_withdrawal_recipient_address(
-                                request, quote_id, path, index, transition,
-                            )?;
+                            let recipient_address =
+                                self.unit_withdrawal_recipient_address(quote_id, transition)?;
                             legs_per_transition[index].push(transition_leg(QuoteLegSpec {
                                 transition_decl_id: &transition.id,
                                 transition_kind: transition.kind,
@@ -1701,9 +1712,8 @@ impl OrderManager {
                             unit.ok_or_else(|| MarketOrderError::NoRoute {
                                 reason: "unit provider is required for unit_withdrawal".to_string(),
                             })?;
-                            let recipient_address = self.unit_withdrawal_recipient_address(
-                                request, quote_id, path, index, transition,
-                            )?;
+                            let recipient_address =
+                                self.unit_withdrawal_recipient_address(quote_id, transition)?;
                             legs_per_transition[index].push(transition_leg(QuoteLegSpec {
                                 transition_decl_id: &transition.id,
                                 transition_kind: transition.kind,
@@ -1742,7 +1752,8 @@ impl OrderManager {
                                         max_amount_in: max_in_cap,
                                     },
                                     sender_address: None,
-                                    recipient_address: request.recipient_address.clone(),
+                                    recipient_address: self
+                                        .exchange_quote_recipient_address(quote_id, transition)?,
                                 },
                             )
                             .await?;
@@ -1805,9 +1816,8 @@ impl OrderManager {
                                         source_depositor_address,
                                         transition,
                                     )?),
-                                    recipient_address: self.exchange_quote_recipient_address(
-                                        request, quote_id, path, index, transition,
-                                    )?,
+                                    recipient_address: self
+                                        .exchange_quote_recipient_address(quote_id, transition)?,
                                 },
                             )
                             .await?;
@@ -1857,9 +1867,8 @@ impl OrderManager {
                                         amount_out: required_output.clone(),
                                         max_amount_in: max_input,
                                     },
-                                    recipient_address: self.bridge_quote_recipient_address(
-                                        request, quote_id, path, index, transition,
-                                    )?,
+                                    recipient_address: self
+                                        .bridge_quote_recipient_address(quote_id, transition)?,
                                     depositor_address: self.bridge_quote_depositor_address(
                                         request,
                                         quote_id,
@@ -1975,38 +1984,23 @@ impl OrderManager {
 
     fn bridge_quote_recipient_address(
         &self,
-        request: &NormalizedMarketOrderQuoteRequest,
         quote_id: Uuid,
-        path: &TransitionPath,
-        index: usize,
         transition: &TransitionDecl,
     ) -> MarketOrderResult<String> {
-        if matches!(
-            transition.kind,
-            MarketOrderTransitionKind::AcrossBridge
-                | MarketOrderTransitionKind::CctpBridge
-                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
-        ) && index + 1 == path.transitions.len()
-        {
-            Ok(request.recipient_address.clone())
-        } else {
-            self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
-        }
+        // Quotes are recipient-agnostic: even the final leg targets an
+        // ephemeral per-quote address. The real recipient is applied at order
+        // time via `order.recipient_address`, not the quote.
+        self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
     }
 
     fn unit_withdrawal_recipient_address(
         &self,
-        request: &NormalizedMarketOrderQuoteRequest,
         quote_id: Uuid,
-        path: &TransitionPath,
-        index: usize,
         transition: &TransitionDecl,
     ) -> MarketOrderResult<String> {
-        if index + 1 == path.transitions.len() {
-            Ok(request.recipient_address.clone())
-        } else {
-            self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
-        }
+        // See `bridge_quote_recipient_address`: always an ephemeral per-quote
+        // address, including the final leg.
+        self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
     }
 
     fn exchange_quote_sender_address(
@@ -2027,17 +2021,12 @@ impl OrderManager {
 
     fn exchange_quote_recipient_address(
         &self,
-        request: &NormalizedMarketOrderQuoteRequest,
         quote_id: Uuid,
-        path: &TransitionPath,
-        index: usize,
         transition: &TransitionDecl,
     ) -> MarketOrderResult<String> {
-        if index + 1 == path.transitions.len() {
-            Ok(request.recipient_address.clone())
-        } else {
-            self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
-        }
+        // See `bridge_quote_recipient_address`: always an ephemeral per-quote
+        // address, including the final leg.
+        self.quote_address_for_chain(quote_id, &transition.output.asset.chain)
     }
 
     async fn exchange_asset_decimals(&self, asset: &DepositAsset) -> MarketOrderResult<Option<u8>> {
@@ -2101,15 +2090,12 @@ impl OrderManager {
         validate_positive_amount("amount_in", &request.amount_in)?;
         let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
         let destination_asset = self.validate_and_normalize_destination_asset(&request.to_asset)?;
-        let recipient_address = self.validate_and_normalize_recipient_address(
-            &destination_asset.chain,
-            &request.recipient_address,
-        )?;
+        // Quotes are recipient-agnostic: the recipient is validated/normalized
+        // on the order path, not here.
         let routing = validate_and_normalize_quote_routing(routing)?;
         Ok(NormalizedMarketOrderQuoteRequest {
             source_asset,
             destination_asset,
-            recipient_address,
             amount_in: request.amount_in,
             routing,
         })
@@ -2144,14 +2130,11 @@ impl OrderManager {
                 ),
             });
         }
-        let recipient_address = self.validate_and_normalize_recipient_address(
-            &destination_asset.chain,
-            &request.recipient_address,
-        )?;
+        // Quotes are recipient-agnostic: the recipient is validated/normalized
+        // on the order path, not here.
         Ok(NormalizedLimitOrderQuoteRequest {
             source_asset,
             destination_asset,
-            recipient_address,
             input_amount: request.input_amount,
             output_amount: request.output_amount,
         })
@@ -3279,7 +3262,6 @@ struct NormalizedMarketOrderRouting {
 struct NormalizedMarketOrderQuoteRequest {
     source_asset: DepositAsset,
     destination_asset: DepositAsset,
-    recipient_address: String,
     amount_in: String,
     routing: NormalizedMarketOrderRouting,
 }
@@ -3288,7 +3270,6 @@ struct NormalizedMarketOrderQuoteRequest {
 struct NormalizedLimitOrderQuoteRequest {
     source_asset: DepositAsset,
     destination_asset: DepositAsset,
-    recipient_address: String,
     input_amount: String,
     output_amount: String,
 }

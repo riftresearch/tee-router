@@ -45,6 +45,9 @@ pub enum CreateQuoteRequest {
 #[serde(deny_unknown_fields)]
 pub struct CreateOrderRequest {
     pub quote_id: Uuid,
+    /// Recipient address on the destination chain. Supplied at order time
+    /// (quotes are recipient-agnostic); this becomes `order.recipient_address`.
+    pub recipient_address: String,
     pub refund_address: String,
     #[serde(default)]
     pub idempotency_key: Option<String>,
@@ -57,7 +60,6 @@ pub struct CreateOrderRequest {
 pub struct ApiMarketOrderQuoteRequest {
     pub from_asset: DepositAsset,
     pub to_asset: DepositAsset,
-    pub recipient_address: String,
     pub amount_in: String,
     #[serde(default)]
     pub routing: QuoteRoutingRequest,
@@ -70,7 +72,6 @@ impl ApiMarketOrderQuoteRequest {
             MarketOrderQuoteRequest {
                 from_asset: self.from_asset,
                 to_asset: self.to_asset,
-                recipient_address: self.recipient_address,
                 amount_in: self.amount_in,
             },
             self.routing,
@@ -83,7 +84,6 @@ impl ApiMarketOrderQuoteRequest {
 pub struct MarketOrderQuoteRequest {
     pub from_asset: DepositAsset,
     pub to_asset: DepositAsset,
-    pub recipient_address: String,
     pub amount_in: String,
 }
 
@@ -407,7 +407,6 @@ mod tests {
             "type": "market_order",
             "from_asset": {"chain": "evm:8453", "asset": "native"},
             "to_asset": {"chain": "bitcoin", "asset": "native"},
-            "recipient_address": "bc1qrecipient0000000000000000000000000000000",
             "amount_in": "1000"
         }))
         .expect("market order request");
@@ -427,7 +426,6 @@ mod tests {
             "type": "market_order",
             "from_asset": {"chain": "evm:42161", "asset": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"},
             "to_asset": {"chain": "evm:8453", "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
-            "recipient_address": "0x1111111111111111111111111111111111111111",
             "amount_in": "5000000",
             "routing": {
                 "provider_sequence": ["velora", "hyperliquid_spot"]
@@ -450,7 +448,6 @@ mod tests {
             "type": "market_order",
             "from_asset": {"chain": "hyperliquid", "asset": "UBTC"},
             "to_asset": {"chain": "hyperliquid", "asset": "native"},
-            "recipient_address": "0x1111111111111111111111111111111111111111",
             "amount_in": "50000",
             "routing": {
                 "provider_sequence": ["hyperliquid"]

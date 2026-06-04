@@ -3806,7 +3806,6 @@ async fn seed_funded_single_step_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: valid_evm_address(),
             amount_in,
         })
         .await
@@ -3826,6 +3825,7 @@ async fn seed_funded_single_step_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow" }),
@@ -3903,7 +3903,6 @@ async fn seed_funded_across_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: valid_evm_address(),
             amount_in: ORDER_AMOUNT_IN_WEI.to_string(),
         })
         .await
@@ -3924,6 +3923,7 @@ async fn seed_funded_across_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow_across" }),
@@ -4001,7 +4001,6 @@ async fn seed_funded_cctp_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: valid_evm_address(),
             amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
@@ -4022,6 +4021,7 @@ async fn seed_funded_cctp_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow_cctp" }),
@@ -4100,7 +4100,6 @@ async fn seed_funded_cctp_hyperliquid_unit_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: devnet.bitcoin.miner_address.to_string(),
             amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
@@ -4125,6 +4124,7 @@ async fn seed_funded_cctp_hyperliquid_unit_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: devnet.bitcoin.miner_address.to_string(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow_cctp_hyperliquid_unit" }),
@@ -4203,7 +4203,6 @@ async fn seed_funded_arbitrum_hyperliquid_unit_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: devnet.bitcoin.miner_address.to_string(),
             amount_in: ORDER_USDC_AMOUNT_RAW.to_string(),
         })
         .await
@@ -4228,6 +4227,7 @@ async fn seed_funded_arbitrum_hyperliquid_unit_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: devnet.bitcoin.miner_address.to_string(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow_arbitrum_hyperliquid_unit" }),
@@ -4308,7 +4308,6 @@ async fn seed_funded_unit_order(
         .quote_market_order(MarketOrderQuoteRequest {
             from_asset: source_asset.clone(),
             to_asset: destination_asset,
-            recipient_address: valid_evm_address(),
             amount_in: ORDER_BTC_AMOUNT_SATS.to_string(),
         })
         .await
@@ -4330,6 +4329,7 @@ async fn seed_funded_unit_order(
     let (order, _) = order_manager
         .create_order_from_quote(CreateOrderRequest {
             quote_id: market_quote.id,
+            recipient_address: valid_evm_address(),
             refund_address: devnet.bitcoin.miner_address.to_string(),
             idempotency_key: None,
             metadata: json!({ "test": "temporal_order_workflow_unit" }),

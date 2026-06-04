@@ -85,8 +85,6 @@ pub struct QuoteRequest {
     pub to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount_format: Option<AmountFormat>,
-    /// Recipient address on the destination chain.
-    pub to_address: String,
     /// Source amount, interpreted per `amount_format`.
     pub from_amount: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,16 +255,13 @@ mod tests {
             from: "Ethereum.USDC".to_string(),
             to: "Base.USDC".to_string(),
             amount_format: Some(AmountFormat::Readable),
-            to_address: "0x1111111111111111111111111111111111111111".to_string(),
             from_amount: "100".to_string(),
             routing: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(json["from"], "Ethereum.USDC");
-        assert_eq!(
-            json["toAddress"],
-            "0x1111111111111111111111111111111111111111"
-        );
+        // Quotes are recipient-agnostic: no recipient is sent on the quote.
+        assert!(json.get("toAddress").is_none());
         assert_eq!(json["amountFormat"], "readable");
         assert_eq!(json["fromAmount"], "100");
         assert!(json.get("routing").is_none());
@@ -278,7 +273,6 @@ mod tests {
             from: "Arbitrum.USDT".to_string(),
             to: "Base.USDC".to_string(),
             amount_format: Some(AmountFormat::Readable),
-            to_address: "0x1111111111111111111111111111111111111111".to_string(),
             from_amount: "5".to_string(),
             routing: Some(QuoteRouting {
                 provider_sequence: Some(vec![ProviderId::Velora, ProviderId::Cctp]),

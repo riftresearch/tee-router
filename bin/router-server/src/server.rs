@@ -445,7 +445,7 @@ async fn create_order(
         &state,
         AddressScreeningPurpose::Recipient,
         &quote_for_screening.destination_asset().chain,
-        quote_for_screening.recipient_address(),
+        &request.recipient_address,
     )
     .await?;
     screen_user_address(
@@ -1710,6 +1710,7 @@ mod tests {
     fn create_order_requires_idempotency_key() {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
+            recipient_address: "recipient-address".to_string(),
             refund_address: "refund-address".to_string(),
             idempotency_key: None,
             metadata: serde_json::json!({}),
@@ -1766,6 +1767,7 @@ mod tests {
     fn create_order_rejects_weak_idempotency_keys() {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
+            recipient_address: "recipient-address".to_string(),
             refund_address: "refund-address".to_string(),
             idempotency_key: Some("short-key".to_string()),
             metadata: serde_json::json!({}),
@@ -1782,6 +1784,7 @@ mod tests {
     fn create_order_rejects_malformed_idempotency_keys() {
         let request = CreateOrderRequest {
             quote_id: Uuid::now_v7(),
+            recipient_address: "recipient-address".to_string(),
             refund_address: "refund-address".to_string(),
             idempotency_key: Some("market-order key/with/slashes".to_string()),
             metadata: serde_json::json!({}),

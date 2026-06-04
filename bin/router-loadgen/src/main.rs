@@ -572,7 +572,6 @@ struct QuoteRequest<'a> {
     order_type: &'static str,
     from: &'a str,
     to: &'a str,
-    to_address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     from_amount: Option<&'a str>,
     amount_format: &'static str,
@@ -841,7 +840,6 @@ async fn create_quote(
         order_type: input.order_type.as_gateway_str(),
         from: &input.from,
         to: &input.to,
-        to_address: &input.to_address,
         from_amount: input.from_amount.as_deref(),
         amount_format: input.amount_format.as_gateway_str(),
     };
