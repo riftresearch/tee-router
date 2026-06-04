@@ -746,7 +746,7 @@ services:
       - router-network
 
   router-api:
-    image: ghcr.io/riftresearch/tee-router:0.2.30
+    image: ghcr.io/riftresearch/tee-router:0.2.31
     container_name: router-api
     restart: unless-stopped
     environment: *router-environment
@@ -777,7 +777,7 @@ services:
       - router-network
 
   router-worker:
-    image: ghcr.io/riftresearch/tee-router:0.2.30
+    image: ghcr.io/riftresearch/tee-router:0.2.31
     container_name: router-worker
     restart: unless-stopped
     environment: *router-environment
@@ -806,7 +806,7 @@ services:
       - router-network
 
   temporal-worker:
-    image: ghcr.io/riftresearch/tee-router-temporal-worker:0.2.30
+    image: ghcr.io/riftresearch/tee-router-temporal-worker:0.2.31
     container_name: temporal-worker
     restart: unless-stopped
     environment: *router-environment
@@ -863,7 +863,7 @@ services:
 
   # Temporal Web UI — internal only; reached through the basic-auth proxy.
   temporal-ui:
-    image: ghcr.io/riftresearch/tee-router-temporal-ui:0.2.30
+    image: ghcr.io/riftresearch/tee-router-temporal-ui:0.2.31
     container_name: temporal-ui
     restart: unless-stopped
     depends_on:
