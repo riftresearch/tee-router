@@ -168,7 +168,7 @@
             "minLength": 1,
             "maxLength": 128,
             "description": "Current Rust router quote bridge field. The upstream router requires a recipient address at quote time.",
-            "example": "0x1111111111111111111111111111111111111111"
+            "example": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
           },
           "orderType": {
             "type": "string",
@@ -183,7 +183,7 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 96,
-            "example": "10"
+            "example": "1"
           }
         },
         "required": [
@@ -202,7 +202,7 @@
           },
           "orderAddress": {
             "type": "string",
-            "example": "bc1qorderaddress0000000000000000000000000"
+            "example": "bc1q2p8ms86h3namagp4y486udsv4syydhvqztg886"
           },
           "amountToSend": {
             "type": "string",
@@ -299,7 +299,7 @@
               "string",
               "null"
             ],
-            "example": "0x2222222222222222222222222222222222222222"
+            "example": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
           },
           "refundToken": {
             "type": "string",
@@ -395,7 +395,7 @@
           },
           "orderAddress": {
             "type": "string",
-            "example": "bc1qorderaddress0000000000000000000000000"
+            "example": "bc1q2p8ms86h3namagp4y486udsv4syydhvqztg886"
           },
           "amountToSend": {
             "type": "string",
@@ -492,7 +492,7 @@
               "string",
               "null"
             ],
-            "example": "0x2222222222222222222222222222222222222222"
+            "example": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
           },
           "refundToken": {
             "type": "string",
