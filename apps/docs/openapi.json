@@ -7,7 +7,7 @@
   },
   "servers": [
     {
-      "url": "https://router-gateway-production.up.railway.app",
+      "url": "https://router-gateway-v3-production.up.railway.app",
       "description": "Production"
     }
   ],
