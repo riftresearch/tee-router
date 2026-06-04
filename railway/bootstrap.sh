@@ -463,6 +463,7 @@ REPO_SERVICES=(
   "evm-token-indexer-base-v3|evm-token-indexer/Dockerfile.index|[\"evm-token-indexer/**\"]"
   "evm-token-indexer-arbitrum-v3|evm-token-indexer/Dockerfile.index|[\"evm-token-indexer/**\"]"
   "router-gateway-v3|railway/router-gateway/Dockerfile|[\"apps/router-gateway/**\",\"railway/router-gateway/**\"]"
+  "router-gateway-docs|railway/docs/Dockerfile|[\"apps/docs/**\",\"railway/docs/**\"]"
   "admin-dashboard-v3|railway/admin-dashboard/Dockerfile|[\"apps/admin-dashboard/**\",\"railway/admin-dashboard/**\"]"
   "explorer-v3|railway/explorer/Dockerfile|[\"railway/explorer/**\"]"
   "alloy-v3|railway/alloy/Dockerfile|[\"etc/alloy.railway.alloy\",\"railway/alloy/**\"]"
@@ -509,6 +510,7 @@ apply_service_cfg victoriametrics-v3 \
 #   grafana-v3: EXPOSE 3000 but Railway sometimes mis-detects on Grafana image
 set_var alloy-v3 "PORT=4318"
 set_var grafana-v3 "PORT=3000"
+set_var router-gateway-docs "PORT=8080"
 
 # --- SOCKS5 proxies -----------------------------------------------------------
 # General fallback egress proxy for router upstreams. Image: serjs/go-socks5-proxy,
@@ -659,6 +661,7 @@ done
 # plane over the public domain. The data ports (40031/2/3/4) stay private.
 PUBLIC_DOMAINS=(
   "router-gateway-v3|4000"
+  "router-gateway-docs|8080"
   "admin-dashboard-v3|3000"
   "explorer-v3|3000"
   "grafana-v3|3000"
