@@ -64,7 +64,7 @@ export const orderMarketRoute = createRoute({
     }
   },
   responses: {
-    201: {
+    200: {
       description: 'Order created by the internal router API.',
       content: {
         'application/json': {
@@ -150,7 +150,7 @@ export const orderLimitRoute = createRoute({
     }
   },
   responses: {
-    201: {
+    200: {
       description: 'Limit order created by the internal router API.',
       content: {
         'application/json': {
@@ -256,7 +256,7 @@ export function createOrderMarketHandler(
         throw malformedOrderPresentationError(presentationError)
       }
 
-      return c.json(response, 201)
+      return c.json(response, 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)
@@ -332,7 +332,7 @@ export function createOrderLimitHandler(
         throw malformedOrderPresentationError(presentationError)
       }
 
-      return c.json(response, 201)
+      return c.json(response, 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)

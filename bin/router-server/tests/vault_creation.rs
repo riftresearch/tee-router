@@ -2736,7 +2736,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         .unwrap();
     let status = quote_response.status();
     let body = quote_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
     assert_path_provider_id(
         &quote
@@ -2804,7 +2804,7 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
         .unwrap();
     let status = order_response.status();
     let body = order_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let order: RouterOrderEnvelope = serde_json::from_str(&body).unwrap();
     assert_eq!(
         order
@@ -2966,7 +2966,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
         .unwrap();
     let status = quote_response.status();
     let body = quote_response.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
     let quote_id = quote
         .quote
@@ -3457,7 +3457,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
         .unwrap();
     let status = initial_quote.status();
     let body = initial_quote.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     let quote: RouterOrderQuoteEnvelope = serde_json::from_str(&body).unwrap();
     assert_path_provider_id(
         &quote.quote.as_market_order().unwrap().provider_id,
@@ -3516,7 +3516,7 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
         .unwrap();
     let status = restored_quote.status();
     let body = restored_quote.text().await.unwrap();
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
 
     api_task.abort();
 }

@@ -1627,7 +1627,7 @@ async fn submit_exact_in_quote(
         .expect("quote request");
     let status = response.status();
     let body = response.text().await.expect("quote body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     serde_json::from_str(&body).expect("quote response")
 }
 
@@ -1652,7 +1652,7 @@ async fn submit_order(
         .expect("order request");
     let status = response.status();
     let body = response.text().await.expect("order body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     serde_json::from_str(&body).expect("order response")
 }
 

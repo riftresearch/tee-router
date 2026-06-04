@@ -471,7 +471,7 @@ describe('router gateway routes', () => {
     })
     const body = await response.json()
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(body.quoteId).toBe(QUOTE_ID)
   })
 
@@ -707,7 +707,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () => {
         const quote = internalQuote()
-        return Response.json(quote, { status: 201 })
+        return Response.json(quote, { status: 200 })
       })
     })
 
@@ -723,7 +723,7 @@ describe('router gateway routes', () => {
     })
     const body = await response.json()
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[0]?.body).toMatchObject({
       type: 'market_order',
       amount_in: '100000000'
@@ -735,7 +735,7 @@ describe('router gateway routes', () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async () =>
-        Response.json(internalQuote(), { status: 201 })
+        Response.json(internalQuote(), { status: 200 })
       ),
       decimalsResolver: {
         ensure: async (asset) => {
@@ -760,7 +760,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     // 52 readable * 10^18 (resolver-provided decimals) -> raw amount to the router
     expect(calls[0]?.body).toMatchObject({
       type: 'market_order',
@@ -771,7 +771,7 @@ describe('router gateway routes', () => {
   test('forwards market quote provider sequence constraints', async () => {
     const calls: RecordedCall[] = []
     const app = createApp(testConfig(), {
-      fetch: mockFetch(calls, async () => Response.json(internalQuote(), { status: 201 }))
+      fetch: mockFetch(calls, async () => Response.json(internalQuote(), { status: 200 }))
     })
 
     const response = await app.request('/quote', {
@@ -788,7 +788,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[0]?.body).toMatchObject({
       type: 'market_order',
       routing: {
@@ -1039,7 +1039,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === '/api/v1/quotes') {
-          return Response.json(internalQuote(), { status: 201 })
+          return Response.json(internalQuote(), { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1057,7 +1057,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[0]?.method).toBe('POST')
     expect(calls[0]?.path).toBe('/api/v1/quotes')
     expect(calls[0]?.body).toEqual({
@@ -1095,7 +1095,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === '/api/v1/quotes') {
-          return Response.json(quote, { status: 201 })
+          return Response.json(quote, { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1114,7 +1114,7 @@ describe('router gateway routes', () => {
     })
     const body = await response.json()
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[0]?.body).toMatchObject({
       from_asset: {
         chain: 'hyperliquid',
@@ -1140,7 +1140,7 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === '/api/v1/quotes') {
-          return Response.json(quote, { status: 201 })
+          return Response.json(quote, { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1159,7 +1159,7 @@ describe('router gateway routes', () => {
     })
     const body = await response.json()
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[0]?.body).toEqual({
       type: 'market_order',
       from_asset: {
@@ -1186,7 +1186,7 @@ describe('router gateway routes', () => {
         )
 
         if (path === '/api/v1/quotes') {
-          return Response.json(internalQuote(), { status: 201 })
+          return Response.json(internalQuote(), { status: 200 })
         }
 
         if (path === `/api/v1/quotes/${QUOTE_ID}`) {
@@ -1194,7 +1194,7 @@ describe('router gateway routes', () => {
         }
 
         if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
+          return Response.json(internalOrder(), { status: 200 })
         }
 
         if (path === `/api/v1/orders/${ORDER_ID}`) {
@@ -1274,7 +1274,7 @@ describe('router gateway routes', () => {
         }
 
         if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
+          return Response.json(internalOrder(), { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1293,7 +1293,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[1]?.method).toBe('POST')
     expect(calls[1]?.path).toBe('/api/v1/orders')
     expect(calls[1]?.body).toEqual({
@@ -1327,7 +1327,7 @@ describe('router gateway routes', () => {
         }
 
         if (path === '/api/v1/orders') {
-          return Response.json(internalOrder(), { status: 201 })
+          return Response.json(internalOrder(), { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1346,7 +1346,7 @@ describe('router gateway routes', () => {
       })
     })
 
-    expect(response.status).toBe(201)
+    expect(response.status).toBe(200)
     expect(calls[1]?.body).toMatchObject({
       refund_address: BTC_ADDRESS
     })
@@ -1363,7 +1363,7 @@ describe('router gateway routes', () => {
         if (path === '/api/v1/orders') {
           const order = internalOrder()
           order.quote.payload.amount_in = 'not-a-raw-amount'
-          return Response.json(order, { status: 201 })
+          return Response.json(order, { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1449,7 +1449,7 @@ describe('router gateway routes', () => {
         }
 
         if (path === '/api/v1/orders') {
-          return Response.json(internalLimitOrder(), { status: 201 })
+          return Response.json(internalLimitOrder(), { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })
@@ -1482,11 +1482,11 @@ describe('router gateway routes', () => {
     const app = createApp(testConfig(), {
       fetch: mockFetch(calls, async (path) => {
         if (path === '/api/v1/quotes') {
-          return Response.json(internalLimitQuote(), { status: 201 })
+          return Response.json(internalLimitQuote(), { status: 200 })
         }
 
         if (path === '/api/v1/orders') {
-          return Response.json(internalLimitOrder(), { status: 201 })
+          return Response.json(internalLimitOrder(), { status: 200 })
         }
 
         return Response.json({ message: 'not found' }, { status: 404 })

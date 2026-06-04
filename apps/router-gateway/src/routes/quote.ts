@@ -104,7 +104,7 @@ export const quoteRoute = createRoute({
     }
   },
   responses: {
-    201: {
+    200: {
       description: 'Market quote created by the internal router API.',
       content: {
         'application/json': {
@@ -155,7 +155,7 @@ export function createQuoteHandler(
           )
         })
 
-        return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
+        return c.json(presentQuoteEnvelope(envelope, amountFormat), 200)
       }
 
       const routing =
@@ -178,7 +178,7 @@ export function createQuoteHandler(
         ...(routing === undefined ? {} : { routing })
       })
 
-      return c.json(presentQuoteEnvelope(envelope, amountFormat), 201)
+      return c.json(presentQuoteEnvelope(envelope, amountFormat), 200)
     } catch (error) {
       const normalized = normalizeError(error)
       return c.json(normalized.body, normalized.status)

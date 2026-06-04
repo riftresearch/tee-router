@@ -623,7 +623,7 @@
           }
         },
         "responses": {
-          "201": {
+          "200": {
             "description": "Market quote created by the internal router API.",
             "content": {
               "application/json": {
@@ -733,7 +733,7 @@
           }
         },
         "responses": {
-          "201": {
+          "200": {
             "description": "Order created by the internal router API.",
             "content": {
               "application/json": {

@@ -416,7 +416,7 @@ async fn create_quote(
             return Err(limit_orders_disabled_error());
         }
     };
-    Ok((StatusCode::CREATED, Json(envelope)))
+    Ok((StatusCode::OK, Json(envelope)))
 }
 
 async fn get_quote(
@@ -497,7 +497,7 @@ async fn create_order(
     let order = state.order_manager.get_order(order.id).await?;
     crate::telemetry::record_order_workflow_event(&order, "order.funding_vault_created");
     let response = order_response(state.clone(), order, Some(vault)).await?;
-    Ok((StatusCode::CREATED, Json(response)))
+    Ok((StatusCode::OK, Json(response)))
 }
 
 async fn get_order(
