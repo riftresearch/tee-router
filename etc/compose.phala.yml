@@ -476,6 +476,68 @@ services:
     networks:
       - router-network
 
+  # ╔═══════════════════════════════════════════════════════════════════════════╗
+  # ║ ⚠️⚠️⚠️  DANGER — DANGER — DANGER  ⚠️⚠️⚠️                                     ║
+  # ║ ███████████████████████████████████████████████████████████████████████   ║
+  # ║ THIS SIDECAR EXPORTS THE ROUTER MASTER KEY *OUT OF THE ENCLAVE*.           ║
+  # ║ IT EXISTS ONLY FOR LOCAL / TESTING FUND RECOVERY.                          ║
+  # ║                                                                            ║
+  # ║   *** NOT FOR PRODUCTION.  NOT FOR PRODUCTION.  NOT FOR PRODUCTION. ***     ║
+  # ║                                                                            ║
+  # ║ ANYONE WHO CAN DECRYPT THIS EXPORT CONTROLS *EVERY* CUSTODY VAULT THE      ║
+  # ║ ROUTER DERIVES FROM THE MASTER KEY. THIS DELIBERATELY DEFEATS THE ENTIRE   ║
+  # ║ TEE SECURITY GUARANTEE. ITS PRESENCE IN A REAL DEPLOYMENT IS A CRITICAL    ║
+  # ║ VULNERABILITY.                                                             ║
+  # ║                                                                            ║
+  # ║ >>>>>  DELETE THIS ENTIRE SERVICE BLOCK BEFORE ANY TRUE PRODUCTION  <<<<<  ║
+  # ║ >>>>>  DELETE THIS ENTIRE SERVICE BLOCK BEFORE ANY TRUE PRODUCTION  <<<<<  ║
+  # ║ >>>>>  DELETE THIS ENTIRE SERVICE BLOCK BEFORE ANY TRUE PRODUCTION  <<<<<  ║
+  # ║                                                                            ║
+  # ║ How it works: RSA-OAEP(SHA-256/MGF1-SHA-256)-encrypts the master key to a  ║
+  # ║ PUBLIC key whose PRIVATE half lives ONLY in the operator's local           ║
+  # ║ .secrets/router-master-key-export-private.pem. The ciphertext printed to   ║
+  # ║ the Phala logs is therefore useless to anyone WITHOUT that private key.    ║
+  # ║ Export + decrypt:                                                          ║
+  # ║   phala cvms logs <cvm> --public-logs | grep ROUTER_MASTER_KEY_CIPHERTEXT  ║
+  # ║   echo "<b64>" | openssl base64 -d -A \                                    ║
+  # ║     | openssl pkeyutl -decrypt -inkey \                                    ║
+  # ║         .secrets/router-master-key-export-private.pem \                    ║
+  # ║         -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \       ║
+  # ║         -pkeyopt rsa_mgf1_md:sha256                                        ║
+  # ║ ███████████████████████████████████████████████████████████████████████   ║
+  # ║ ⚠️⚠️⚠️  REMOVE BEFORE PRODUCTION — SEE BANNER ABOVE  ⚠️⚠️⚠️                  ║
+  # ╚═══════════════════════════════════════════════════════════════════════════╝
+  router-master-key-export:
+    image: alpine:3.22.1
+    container_name: router-master-key-export
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        # !!! NOT FOR PRODUCTION !!! EXPORTS THE ENCLAVE MASTER KEY !!! REMOVE BEFORE PROD !!!
+        apk add --no-cache openssl >/dev/null
+        key=/run/router-secrets/router-master-key.hex
+        if [ ! -f "$$key" ]; then echo "ROUTER MASTER KEY NOT PRESENT — nothing to export" >&2; exit 1; fi
+        # Public half of the operator-only export keypair (private half stays in .secrets/).
+        echo "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQ0lqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FnOEFNSUlDQ2dLQ0FnRUFwUjJRZUNwamw3VlFSQ3hyR0RlQgpHbkt1clV4eTI4R2J6MTRYTGRkVklBOGR5QWR1VlZLaDJzaVdFMkhWMXZFdW9HWjVNZUVXS2ZNbG5hU1VQdUlGCjdESVRWdUxmYXdXYWp3OEdueGJMdzhGRkdjbGpqQjZiQTlwOUttMkZFb1pBOWdqWFlNYTJYK2RoU2h4Ym0vQWIKU0UybVU4c2cvbXJsbXJ5ek9ENTlRL3NLaG5xbGdoNnBsZ0JhcXllWCtGTHV5bldUM2tRT1hYVlNLY2VTSTdlYgpIbVFFaVVSVDBvTU5vOUV6Nnp3dnVSeC9WVW50S3dBNUdqWEIwZUp1a09sNHNhZFR2UGNCMjJxQVNMM3V3OGJCClJYdGtPQzh1UVdpdUZIUzhWYm1NeDBzNklacXBmOFFGTi9oQm1BQW9HZzlpN3EvOXVJZnVqbzRHbTFJcUk5bGUKU3RKR2EzVDJmdUQvK3Q1cktjUUV5OWxNQnh4TXpIaWNFQkkza2FDaXRhYmhqQ3VUbWVicW1tNFBLNjlQV3YxKwplVnc1R3RPbUExc2ZmZGl4dW50endzYVE3OUhpWG1CTmV0ek8rd0VaUkpMSnVUYXFkUUNoMkFlUlFMRXFwNVNjCjlad2prVUZYaEFwZVFJeDdsWkt0U2wxTkkwOEZNdWcwaC9MdGlBcUlHeDNJWnhRNC9kRWlFRDRDQ0ZHcWpVK3EKaVdKY2s5MFFKTUtta2JtaHozcllNYjRIWkdqYTl0dDl5elR5NHVodjBUa1ljUlRQeU15eC9KQ0V0a3EyenFBNwpUc2dFdmF2QWNBays4TUFzMHpVRlFTSmhwTmc0OEZKQ0JyMnVLeXZ4U0VSTUxDRHhXOVlwOHVlR2gvNDdVa0hIClZXY0JnWHpwdmNNdVNNS0I2Q0kvRUpVQ0F3RUFBUT09Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=" \
+          | openssl base64 -d -A > /tmp/export-pub.pem
+        ct="$$(openssl pkeyutl -encrypt -pubin -inkey /tmp/export-pub.pem \
+              -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 \
+              -in "$$key" | openssl base64 -A)"
+        echo "ROUTER_MASTER_KEY_CIPHERTEXT_B64=$$ct"
+        echo "(NOT-FOR-PRODUCTION master key export emitted above; decrypt locally with the .secrets private key)"
+    volumes:
+      - router_master_key:/run/router-secrets:ro
+    restart: "no"
+    networks:
+      - router-network
+    depends_on:
+      router-master-key-init:
+        condition: service_completed_successfully
+  # ╔═══════════════════════════════════════════════════════════════════════════╗
+  # ║ ⚠️  END router-master-key-export — DELETE THIS WHOLE BLOCK BEFORE PROD  ⚠️   ║
+  # ╚═══════════════════════════════════════════════════════════════════════════╝
+
   postgres:
     image: postgres:18-alpine
     container_name: router-postgres-primary
