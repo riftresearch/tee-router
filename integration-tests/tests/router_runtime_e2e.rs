@@ -1619,7 +1619,6 @@ async fn submit_exact_in_quote(
             "type": "market_order",
             "from_asset": route_case.from.to_json(),
             "to_asset": route_case.to.to_json(),
-            "recipient_address": recipient_address_for(route_case.to),
             "amount_in": route_case.amount_in
         }))
         .send()
@@ -1642,6 +1641,7 @@ async fn submit_order(
         .json(&json!({
             "quote_id": quote_id,
             "idempotency_key": format!("router-runtime-e2e:{}:{quote_id}", route_case.name),
+            "recipient_address": recipient_address_for(route_case.to),
             "refund_address": refund_address_for(route_case.from),
             "metadata": {
                 "test": route_case.name
