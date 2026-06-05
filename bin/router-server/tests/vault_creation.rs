@@ -2187,7 +2187,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         None,
         None,
         None,
-        Some(VeloraHttpProviderConfig::new(mocks.base_url())),
+        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
     )
     .expect("velora-only action providers");
@@ -2285,17 +2285,16 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
     let db = test_db().await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
-    let base_url = mocks.base_url().to_string();
     let action_providers = ActionProviderRegistry::http(
         Some(AcrossHttpProviderConfig::new(
-            base_url.clone(),
+            mocks.across_url(),
             "router-test-across",
         )),
-        Some(CctpHttpProviderConfig::mock(base_url.clone())),
-        Some(base_url.clone()),
+        Some(CctpHttpProviderConfig::mock(mocks.cctp_url())),
+        Some(mocks.hyperunit_url()),
         None,
-        Some(base_url.clone()),
-        Some(VeloraHttpProviderConfig::new(base_url)),
+        Some(mocks.hyperliquid_url()),
+        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
@@ -2338,17 +2337,16 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
     let db = test_db().await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
-    let base_url = mocks.base_url().to_string();
     let action_providers = ActionProviderRegistry::http(
         Some(AcrossHttpProviderConfig::new(
-            base_url.clone(),
+            mocks.across_url(),
             "router-test-across",
         )),
-        Some(CctpHttpProviderConfig::mock(base_url.clone())),
-        Some(base_url.clone()),
+        Some(CctpHttpProviderConfig::mock(mocks.cctp_url())),
+        Some(mocks.hyperunit_url()),
         None,
-        Some(base_url.clone()),
-        Some(VeloraHttpProviderConfig::new(base_url)),
+        Some(mocks.hyperliquid_url()),
+        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
@@ -2438,7 +2436,7 @@ async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
         .expect("valid output token");
     anvil_clone_base_mock_erc20_code(h, output_token).await;
 
-    let velora = VeloraProvider::new(mocks.base_url(), None).unwrap();
+    let velora = VeloraProvider::new(mocks.velora_url(), None).unwrap();
     let input_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").unwrap(),
         asset: AssetId::Reference(MOCK_ERC20_ADDRESS.to_lowercase()),
@@ -2708,11 +2706,11 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let mocks = MockIntegratorServer::spawn().await.unwrap();
     let mut args = test_router_args(h, dir.path(), database_url);
-    args.across_api_url = Some(mocks.base_url().to_string());
+    args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
-    args.hyperunit_api_url = Some(mocks.base_url().to_string());
-    args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
+    args.hyperunit_api_url = Some(mocks.hyperunit_url());
+    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();
@@ -2935,12 +2933,12 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     .await
     .unwrap();
     let mut args = test_router_args(h, dir.path(), database_url);
-    args.across_api_url = Some(mocks.base_url().to_string());
+    args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
-    args.hyperunit_api_url = Some(mocks.base_url().to_string());
-    args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
-    args.chainalysis_host = Some(mocks.base_url().to_string());
+    args.hyperunit_api_url = Some(mocks.hyperunit_url());
+    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
+    args.chainalysis_host = Some(mocks.chainalysis_url());
     args.chainalysis_token = Some("mock-chainalysis-token".to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();
@@ -3428,11 +3426,11 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let mocks = spawn_harness_mocks(h, "evm:8453").await;
     let mut args = test_router_args(h, dir.path(), database_url);
-    args.across_api_url = Some(mocks.base_url().to_string());
+    args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
-    args.hyperunit_api_url = Some(mocks.base_url().to_string());
-    args.hyperliquid_api_url = Some(mocks.base_url().to_string());
-    args.coinbase_price_api_base_url = Some(mocks.base_url().to_string());
+    args.hyperunit_api_url = Some(mocks.hyperunit_url());
+    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
     let client = reqwest::Client::new();

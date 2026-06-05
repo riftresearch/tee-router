@@ -722,12 +722,17 @@ fn sanitize_unparsed_url_for_error(raw: &str) -> String {
 }
 
 fn join_url(base: &Url, path: &str) -> MarketPricingResult<Url> {
-    base.join(path)
-        .map_err(|source| MarketPricingError::UrlJoin {
-            base_url: sanitized_parsed_url_for_error(base),
-            path: path.to_string(),
-            source,
-        })
+    // `path` is always absolute (e.g. "/v2/prices/.../spot", "/info"). `Url::join`
+    // with an absolute path discards any path PREFIX already on `base` (e.g. a
+    // "/coinbase" mount on the mock integrator, or a path-prefixed gateway), so
+    // append onto the base's existing path instead. Identical to `join` when
+    // `base` has no path of its own (the production case).
+    let combined = format!("{}{}", base.as_str().trim_end_matches('/'), path);
+    Url::parse(&combined).map_err(|source| MarketPricingError::UrlJoin {
+        base_url: sanitized_parsed_url_for_error(base),
+        path: path.to_string(),
+        source,
+    })
 }
 
 fn parse_hex_u64(raw: &str) -> Result<u64, String> {

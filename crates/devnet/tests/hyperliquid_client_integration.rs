@@ -45,7 +45,7 @@ async fn fixture(balances: &[(&str, f64)]) -> (MockIntegratorServer, Hyperliquid
             .credit_hyperliquid_balance(address, coin, *amount)
             .await;
     }
-    let mut client = HyperliquidClient::new(server.base_url(), wallet, None, Network::Testnet)
+    let mut client = HyperliquidClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
         .expect("client construction");
     client.refresh_spot_meta().await.expect("refresh spot meta");
     (server, client, address)
@@ -120,7 +120,7 @@ async fn bridge_fixture_with_config(
     let wallet = format!("0x{}", hex::encode(private_key))
         .parse::<PrivateKeySigner>()
         .expect("client wallet");
-    let client = HyperliquidClient::new(server.base_url(), wallet, None, Network::Testnet)
+    let client = HyperliquidClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
         .expect("client construction");
 
     (anvil, server, client, user, token, bridge_address)
@@ -171,9 +171,9 @@ async fn split_info_and_exchange_clients_work_against_mock() {
         .await;
     server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
 
-    let mut info = HyperliquidInfoClient::new(server.base_url()).expect("info client");
+    let mut info = HyperliquidInfoClient::new(&server.hyperliquid_url()).expect("info client");
     let exchange =
-        HyperliquidExchangeClient::new(server.base_url(), wallet, None, Network::Testnet)
+        HyperliquidExchangeClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
             .expect("exchange client");
     let meta = info.refresh_spot_meta().await.expect("refresh spot meta");
     assert!(meta.base_token_for(UBTC_USDC).is_some());
@@ -247,7 +247,7 @@ async fn info_client_decodes_indexer_info_endpoints_against_mock() {
         )
         .await;
 
-    let info = HyperliquidInfoClient::new(server.base_url()).expect("info client");
+    let info = HyperliquidInfoClient::new(&server.hyperliquid_url()).expect("info client");
     let meta = info.fetch_perp_meta().await.expect("perp meta");
     assert!(meta.universe.iter().any(|asset| asset.name == "BTC"));
 

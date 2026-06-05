@@ -1433,7 +1433,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     if hyperliquid_enabled {
         custody_executor =
             custody_executor.with_hyperliquid_runtime(Some(HyperliquidRuntimeConfig::new(
-                mocks.base_url().to_string(),
+                mocks.hyperliquid_url(),
                 HyperliquidCallNetwork::Testnet,
             )));
     }
@@ -2030,12 +2030,12 @@ fn test_action_providers(
 ) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
         across: across_enabled.then(|| {
-            AcrossHttpProviderConfig::new(mocks.base_url().to_string(), "temporal-worker-across")
+            AcrossHttpProviderConfig::new(mocks.across_url(), "temporal-worker-across")
         }),
-        cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.base_url().to_string())),
-        hyperunit_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
+        cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.cctp_url())),
+        hyperunit_base_url: hyperliquid_enabled.then(|| mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.base_url().to_string()),
+        hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.hyperliquid_url()),
         hyperliquid_proxy_url: None,
         velora: matches!(
             route,
@@ -2044,7 +2044,7 @@ fn test_action_providers(
                 | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
         .then(|| VeloraHttpProviderConfig {
-            base_url: mocks.base_url().to_string(),
+            base_url: mocks.velora_url(),
             partner: Some("temporal-worker-e2e".to_string()),
             proxy_url: None,
         }),

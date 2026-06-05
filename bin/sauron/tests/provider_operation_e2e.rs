@@ -1037,11 +1037,11 @@ fn router_args(
         chainalysis_token: None,
         chainalysis_proxy_url: None,
         loki_url: None,
-        across_api_url: Some(mocks.base_url().to_string()),
+        across_api_url: Some(mocks.across_url()),
         across_api_key: Some("mock-across-api-key".to_string()),
         across_proxy_url: None,
         across_integrator_id: None,
-        cctp_api_url: Some(mocks.base_url().to_string()),
+        cctp_api_url: Some(mocks.cctp_url()),
         cctp_proxy_url: None,
         cctp_token_messenger_v2_address: Some(
             devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
@@ -1050,9 +1050,9 @@ fn router_args(
             devnet::evm_devnet::MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
         ),
         cctp_transfer_mode: None,
-        hyperunit_api_url: Some(mocks.base_url().to_string()),
+        hyperunit_api_url: Some(mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_api_url: Some(mocks.base_url().to_string()),
+        hyperliquid_api_url: Some(mocks.hyperliquid_url()),
         hyperliquid_proxy_url: None,
         velora_api_url: None,
         velora_proxy_url: None,
@@ -1078,7 +1078,7 @@ fn router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-        coinbase_price_api_base_url: Some(mocks.base_url().to_string()),
+        coinbase_price_api_base_url: Some(mocks.coinbase_url()),
         coinbase_proxy_url: None,
     }
 }
@@ -2789,7 +2789,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
     let (hl_shim_base_url, _hl_shim_task) =
-        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+        spawn_hl_shim_indexer(&hl_shim_database_url, &mocks.hyperliquid_url()).await;
     let (bitcoin_observer_urls, _bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
     let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
     let order_workflow_client = std::sync::Arc::new(
@@ -2828,8 +2828,8 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
         },
         Some(hl_shim_base_url),
         Some(bitcoin_observer_urls),
-        Some(mocks.base_url().to_string()),
-        mocks.base_url().to_string(),
+        Some(mocks.hyperunit_url()),
+        mocks.cctp_url(),
     )
     .await;
     let client = reqwest::Client::new();

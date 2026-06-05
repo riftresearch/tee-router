@@ -767,16 +767,18 @@ impl ActionProviderRegistry {
         reason = "mock_http is an integration-test fixture constructor; invalid mock URLs should fail the test immediately"
     )]
     pub fn mock_http(base_url: impl Into<String>) -> Self {
+        // The mock integrator server mounts each venue under its own path prefix,
+        // so fan the single base URL out to per-venue URLs here.
         let base_url = base_url.into();
         Self::http_with_options(
             Some(AcrossHttpProviderConfig::new(
-                base_url.clone(),
+                format!("{base_url}/across"),
                 MOCK_ACROSS_API_KEY,
             )),
-            Some(CctpHttpProviderConfig::mock(base_url.clone())),
-            Some(base_url.clone()),
+            Some(CctpHttpProviderConfig::mock(format!("{base_url}/cctp"))),
+            Some(format!("{base_url}/hyperunit")),
             None,
-            Some(base_url),
+            Some(format!("{base_url}/hyperliquid")),
             None,
             HyperliquidCallNetwork::Mainnet,
         )

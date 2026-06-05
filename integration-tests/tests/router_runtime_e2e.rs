@@ -152,6 +152,11 @@ struct RouteCase {
     from: RouteAsset,
     to: RouteAsset,
     amount_in: &'static str,
+    /// Exact provider sequence (one provider per transition) pinned via
+    /// `routing.provider_sequence` on the quote, so venue coverage is deterministic
+    /// and decoupled from the cost model. `expected_provider_fragments` then
+    /// double-checks the per-leg `step_type:provider` shape of the pinned route.
+    provider_sequence: &'static [&'static str],
     expected_provider_fragments: &'static [&'static str],
 }
 
@@ -175,27 +180,44 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::native("evm:1"),
         to: RouteAsset::native("bitcoin"),
         amount_in: "60000000000000000",
-        expected_provider_fragments: &["unit_deposit:unit", "unit_withdrawal:unit"],
+        provider_sequence: &["unit", "hyperliquid_spot", "hyperliquid_spot", "unit"],
+        expected_provider_fragments: &[
+            "unit_deposit:unit",
+            "hyperliquid_trade:hyperliquid_spot",
+            "unit_withdrawal:unit",
+        ],
     },
     RouteCase {
         name: "bitcoin_to_eth",
         from: RouteAsset::native("bitcoin"),
         to: RouteAsset::native("evm:1"),
         amount_in: "10000000",
-        expected_provider_fragments: &["unit_deposit:unit", "unit_withdrawal:unit"],
+        provider_sequence: &["unit", "hyperliquid_spot", "hyperliquid_spot", "unit"],
+        expected_provider_fragments: &[
+            "unit_deposit:unit",
+            "hyperliquid_trade:hyperliquid_spot",
+            "unit_withdrawal:unit",
+        ],
     },
     RouteCase {
         name: "bitcoin_to_usdc",
         from: RouteAsset::native("bitcoin"),
         to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         amount_in: "10000000",
-        expected_provider_fragments: &["unit_deposit:unit", "universal_router_swap:velora"],
+        provider_sequence: &["unit", "hyperliquid_spot", "hyperliquid_bridge", "cctp"],
+        expected_provider_fragments: &[
+            "unit_deposit:unit",
+            "hyperliquid_trade:hyperliquid_spot",
+            "hyperliquid_bridge_withdrawal:hyperliquid_bridge",
+            "cctp_bridge:cctp",
+        ],
     },
     RouteCase {
         name: "eth_to_usdc_single_chain",
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         amount_in: "60000000000000000",
+        provider_sequence: &["velora"],
         expected_provider_fragments: &["universal_router_swap:velora"],
     },
     RouteCase {
@@ -203,6 +225,7 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         to: RouteAsset::native("evm:8453"),
         amount_in: "60000000",
+        provider_sequence: &["velora"],
         expected_provider_fragments: &["universal_router_swap:velora"],
     },
     RouteCase {
@@ -210,17 +233,25 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:1", ETHEREUM_USDC_ADDRESS),
         amount_in: "60000000000000000",
-        expected_provider_fragments: &["across_bridge:across", "universal_router_swap:velora"],
+        provider_sequence: &["across", "unit", "hyperliquid_spot", "hyperliquid_bridge", "cctp"],
+        expected_provider_fragments: &[
+            "across_bridge:across",
+            "unit_deposit:unit",
+            "hyperliquid_trade:hyperliquid_spot",
+            "hyperliquid_bridge_withdrawal:hyperliquid_bridge",
+            "cctp_bridge:cctp",
+        ],
     },
     RouteCase {
         name: "usdc_to_eth_cross_chain",
         from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         to: RouteAsset::native("evm:1"),
         amount_in: "60000000",
+        provider_sequence: &["cctp", "hyperliquid_bridge", "hyperliquid_spot", "unit"],
         expected_provider_fragments: &[
             "cctp_bridge:cctp",
             "hyperliquid_bridge_deposit:hyperliquid_bridge",
-            "hyperliquid_trade:hyperliquid",
+            "hyperliquid_trade:hyperliquid_spot",
             "unit_withdrawal:unit",
         ],
     },
@@ -563,7 +594,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
 
     let _t = std::time::Instant::now();
     let (hl_shim_base_url, _hl_shim_task) =
-        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.base_url()).await;
+        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.hyperliquid_url().as_str()).await;
     timing_log!("spawn_hl_shim_indexer", _t);
 
     let _t = std::time::Instant::now();
@@ -644,7 +675,8 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
             arbitrum: arbitrum_receipt_watcher_url,
         },
         bitcoin_observer_urls,
-        mocks.base_url().to_string(),
+        mocks.hyperunit_url(), // hyperunit_api_url
+        mocks.cctp_url(), // cctp_api_url (one mock server hosts the Iris path too)
     )
     .await;
     timing_log!("spawn_sauron", _t);
@@ -1148,6 +1180,7 @@ async fn spawn_sauron(
     receipt_watcher_urls: EvmReceiptWatcherUrls,
     bitcoin_observer_urls: BitcoinObserverUrls,
     hyperunit_api_url: String,
+    cctp_api_url: String,
 ) -> RuntimeTask {
     let token_indexer_api_key = [
         devnet.ethereum.token_indexer.as_ref(),
@@ -1172,7 +1205,10 @@ async fn spawn_sauron(
         sauron_cdc_idle_wakeup_interval_ms: 10_000,
         router_internal_base_url: router_base_url.to_string(),
         router_detector_api_key: ROUTER_DETECTOR_API_KEY.to_string(),
-        cctp_api_url: sauron::cctp_iris::CCTP_IRIS_DEFAULT_BASE_URL.to_string(),
+        // Sauron must poll the mock integrator's CCTP Iris API (not real Circle
+        // Iris) to observe devnet burn attestations, or CCTP legs hang forever in
+        // `waiting_external`.
+        cctp_api_url,
         bitcoin_indexer_url: Some(bitcoin_observer_urls.indexer),
         bitcoin_receipt_watcher_url: Some(bitcoin_observer_urls.receipt_watcher),
         ethereum_mainnet_rpc_url: devnet.ethereum.anvil.endpoint_url().to_string(),
@@ -1269,11 +1305,11 @@ fn router_args(
         chainalysis_token: None,
         chainalysis_proxy_url: None,
         loki_url: None,
-        across_api_url: Some(mocks.base_url().to_string()),
+        across_api_url: Some(mocks.across_url()),
         across_api_key: Some(ACROSS_API_KEY.to_string()),
         across_proxy_url: None,
         across_integrator_id: Some(ACROSS_INTEGRATOR_ID.to_string()),
-        cctp_api_url: Some(mocks.base_url().to_string()),
+        cctp_api_url: Some(mocks.cctp_url()),
         cctp_proxy_url: None,
         cctp_token_messenger_v2_address: Some(
             devnet::evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS.to_string(),
@@ -1282,11 +1318,11 @@ fn router_args(
             devnet::evm_devnet::MOCK_CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS.to_string(),
         ),
         cctp_transfer_mode: None,
-        hyperunit_api_url: Some(mocks.base_url().to_string()),
+        hyperunit_api_url: Some(mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_api_url: Some(mocks.base_url().to_string()),
+        hyperliquid_api_url: Some(mocks.hyperliquid_url()),
         hyperliquid_proxy_url: None,
-        velora_api_url: Some(mocks.base_url().to_string()),
+        velora_api_url: Some(mocks.velora_url()),
         velora_proxy_url: None,
         velora_partner: Some("router-e2e".to_string()),
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
@@ -1309,7 +1345,7 @@ fn router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-        coinbase_price_api_base_url: Some(mocks.base_url().to_string()),
+        coinbase_price_api_base_url: Some(mocks.coinbase_url()),
         coinbase_proxy_url: None,
     }
 }
@@ -1619,7 +1655,8 @@ async fn submit_exact_in_quote(
             "type": "market_order",
             "from_asset": route_case.from.to_json(),
             "to_asset": route_case.to.to_json(),
-            "amount_in": route_case.amount_in
+            "amount_in": route_case.amount_in,
+            "routing": { "provider_sequence": route_case.provider_sequence }
         }))
         .send()
         .await
