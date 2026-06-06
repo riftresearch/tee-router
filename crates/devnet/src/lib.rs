@@ -3,6 +3,7 @@
 pub mod bitcoin_devnet;
 pub mod evm_devnet;
 pub mod hyperliquid_core;
+pub mod hyperliquid_devnet;
 pub mod manifest;
 pub mod mock_integrators;
 pub mod token_indexerd;
@@ -10,6 +11,7 @@ pub mod token_indexerd;
 pub use bitcoin_devnet::BitcoinDevnet;
 use blockchain_utils::P2WPKHBitcoinWallet;
 pub use evm_devnet::EthDevnet;
+pub use hyperliquid_devnet::{HyperliquidNode, HyperliquidNodeConfig};
 pub use manifest::{
     deterministic_loadgen_evm_accounts, DevnetEvmAccount, DevnetManifest, DEVNET_ARBITRUM_RPC_PORT,
     DEVNET_ARBITRUM_TOKEN_INDEXER_PORT, DEVNET_BASE_RPC_PORT, DEVNET_BASE_TOKEN_INDEXER_PORT,
@@ -642,6 +644,12 @@ pub struct RiftDevnet {
     pub ethereum: Arc<EthDevnet>,
     pub base: Arc<EthDevnet>,
     pub arbitrum: Arc<EthDevnet>,
+    /// The standalone, RiftDevnet-owned Hyperliquid node (its own
+    /// `HyperliquidCore` + dedicated `/info`+`/exchange` server). Present
+    /// whenever the venue mocks are (`using_mock_integrators`). This is the
+    /// additive, dual peer of the venue mock's `/hyperliquid` nest; the live
+    /// path does not consume it this phase.
+    pub hyperliquid: Option<HyperliquidNode>,
     pub loadgen_evm_accounts: Vec<DevnetEvmAccount>,
     pub mock_integrators: Option<mock_integrators::MockIntegratorServer>,
     pub join_set: JoinSet<Result<()>>,
@@ -1124,6 +1132,25 @@ impl RiftDevnetBuilder {
             None
         };
 
+        // Spawn the standalone Hyperliquid node alongside the venue mocks. It is
+        // additive and dual: an independent, RiftDevnet-owned service with its
+        // own `HyperliquidCore`, not wired into the live settlement path this
+        // phase. Reuse the same gate as the venue mocks.
+        let hyperliquid = if self.using_mock_integrators {
+            Some(
+                HyperliquidNode::spawn_with_config(HyperliquidNodeConfig {
+                    port: None,
+                    mainnet: false,
+                })
+                .await
+                .map_err(|error| {
+                    eyre::eyre!("[devnet builder] Failed to start Hyperliquid node: {error}")
+                })?,
+            )
+        } else {
+            None
+        };
+
         let ethereum_devnet = Arc::new(ethereum_devnet);
         let base_devnet = Arc::new(base_devnet);
         let arbitrum_devnet = Arc::new(arbitrum_devnet);
@@ -1140,6 +1167,7 @@ impl RiftDevnetBuilder {
             ethereum: ethereum_devnet,
             base: base_devnet,
             arbitrum: arbitrum_devnet,
+            hyperliquid,
             loadgen_evm_accounts,
             mock_integrators,
             join_set,
