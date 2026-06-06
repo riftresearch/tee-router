@@ -8,6 +8,13 @@ use serde_json::json;
 
 use crate::mock_integrators::error_response;
 
+/// Per-venue state for the Coinbase spot-price mock. The mock currently serves
+/// only static prices, so there is no venue-specific state yet; this unit
+/// struct exists for uniformity with the other venue states and gives a home
+/// for future Coinbase tunables.
+#[derive(Default)]
+pub(crate) struct CoinbaseMockState;
+
 pub(crate) async fn mock_coinbase_spot_price(
     Path(currency_pair): Path<String>,
 ) -> impl IntoResponse {

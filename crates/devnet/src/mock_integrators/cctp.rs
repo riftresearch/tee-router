@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::cctp_mock::MockCctpTokenMessengerV2::DepositForBurn;
 use crate::mock_integrators::{
@@ -72,6 +72,14 @@ pub struct MockCctpBurnRecord {
     pub indexed_at: DateTime<Utc>,
 }
 
+/// Per-venue state for the CCTP mock: the recorded burns and the attestation
+/// timing/delay tunables.
+pub(crate) struct CctpMockState {
+    pub(crate) burns: Mutex<BTreeMap<String, MockCctpBurnRecord>>,
+    pub(crate) attestation_latency: Duration,
+    pub(crate) attestation_delay_reason: Option<MockCctpDelayReason>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MockCctpMessagesQuery {
     #[serde(rename = "transactionHash")]
@@ -84,7 +92,7 @@ pub(crate) async fn mock_cctp_messages(
     Path(source_domain): Path<u32>,
     Query(query): Query<MockCctpMessagesQuery>,
 ) -> impl IntoResponse {
-    let burns = state.cctp_burns.lock().await;
+    let burns = state.cctp.burns.lock().await;
     let record = if let Some(tx_hash) = query.transaction_hash.as_deref() {
         burns.get(tx_hash).cloned()
     } else if let Some(nonce) = query.nonce.as_deref() {
@@ -119,7 +127,7 @@ pub(crate) async fn mock_cctp_messages(
             "messageSender": format!("{:#x}", record.depositor)
         }
     });
-    if let Some(reason) = state.cctp_attestation_delay_reason {
+    if let Some(reason) = state.cctp.attestation_delay_reason {
         // Real Iris V2 leaves the status as `pending_confirmations` and signals
         // failure via `delayReason`. The only terminal reason is
         // `amount_above_max`; the others mean Iris is still waiting on fee
@@ -140,11 +148,11 @@ pub(crate) async fn mock_cctp_messages(
         )
             .into_response();
     }
-    let attestation_ready = state.cctp_attestation_latency.is_zero()
+    let attestation_ready = state.cctp.attestation_latency.is_zero()
         || Utc::now()
             .signed_duration_since(record.indexed_at)
             .to_std()
-            .is_ok_and(|age| age >= state.cctp_attestation_latency);
+            .is_ok_and(|age| age >= state.cctp.attestation_latency);
     if !attestation_ready {
         return (
             StatusCode::OK,
@@ -364,7 +372,7 @@ async fn run_cctp_burn_indexer(
                 block_number,
                 indexed_at: Utc::now(),
             };
-            state.cctp_burns.lock().await.insert(burn_tx_hash, record);
+            state.cctp.burns.lock().await.insert(burn_tx_hash, record);
         }
         last_scanned = head;
     }
@@ -392,7 +400,7 @@ mod tests {
             &MockIntegratorConfig::default().with_cctp_attestation_latency(Duration::from_secs(60)),
         ));
         state
-            .cctp_burns
+            .cctp.burns
             .lock()
             .await
             .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
@@ -401,7 +409,7 @@ mod tests {
         assert_eq!(pending["messages"][0]["status"], "pending_confirmations");
         assert!(pending["messages"][0]["attestation"].is_null());
 
-        state.cctp_burns.lock().await.insert(
+        state.cctp.burns.lock().await.insert(
             "0xburn".to_string(),
             mock_cctp_burn_record(Utc::now() - ChronoDuration::seconds(61)),
         );
@@ -419,7 +427,7 @@ mod tests {
                 .with_cctp_attestation_delay_reason(MockCctpDelayReason::AmountAboveMax),
         ));
         state
-            .cctp_burns
+            .cctp.burns
             .lock()
             .await
             .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));

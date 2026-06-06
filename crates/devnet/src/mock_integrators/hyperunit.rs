@@ -22,11 +22,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 use eip7702_paymaster::Execution;
 
@@ -100,6 +101,27 @@ impl fmt::Debug for MockUnitProtocolKey {
             .field("private_key", &"redacted")
             .finish()
     }
+}
+
+/// Per-venue state for the HyperUnit mock: the `/gen` request log, the tracked
+/// operation lifecycle (keyed by `protocol_address`), the protocol private
+/// keys, the per-chain EVM RPC URLs and Bitcoin RPC connection used by the
+/// deposit indexers, plus the withdrawal-release timeout and injectable
+/// error hooks.
+pub(crate) struct UnitMockState {
+    pub(crate) generate_address_requests: Mutex<Vec<MockUnitGenerateAddressRequest>>,
+    /// Tracked by `protocol_address` — the fresh mock address returned from
+    /// `/gen` that acts as either the deposit source or the withdrawal spotSend
+    /// target. Destination-address queries can still return operation history
+    /// across many generated protocol addresses.
+    pub(crate) operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
+    pub(crate) protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
+    pub(crate) evm_rpc_urls: BTreeMap<String, String>,
+    pub(crate) withdrawal_release_timeout: Duration,
+    pub(crate) bitcoin_rpc_url: Option<String>,
+    pub(crate) bitcoin_cookie_path: Option<PathBuf>,
+    pub(crate) next_generate_address_error: Mutex<Option<String>>,
+    pub(crate) next_withdrawal_completion_error: Mutex<Option<String>>,
 }
 
 pub(crate) async fn maybe_spawn_unit_deposit_indexers(
@@ -362,7 +384,7 @@ async fn active_unit_deposit_watches(
     state: &Arc<MockIntegratorState>,
     src_chain: UnitChain,
 ) -> Vec<UnitDepositWatch> {
-    let operations = state.unit_operations.lock().await;
+    let operations = state.unit.operations.lock().await;
     operations
         .values()
         .flat_map(|entries| entries.iter())
@@ -408,7 +430,7 @@ pub(crate) async fn mock_unit_gen(
     State(state): State<Arc<MockIntegratorState>>,
     Path((src_chain, dst_chain, asset, dst_addr)): Path<(String, String, String, String)>,
 ) -> impl IntoResponse {
-    if let Some(error) = state.next_unit_generate_address_error.lock().await.take() {
+    if let Some(error) = state.unit.next_generate_address_error.lock().await.take() {
         return (
             StatusCode::BAD_GATEWAY,
             Json(MockIntegratorErrorResponse { error }),
@@ -441,7 +463,7 @@ pub(crate) async fn mock_unit_gen(
         dst_addr: dst_addr.clone(),
     };
     state
-        .unit_generate_address_requests
+        .unit.generate_address_requests
         .lock()
         .await
         .push(request);
@@ -462,7 +484,7 @@ pub(crate) async fn mock_unit_gen(
 
     let protocol_address = loop {
         let protocol_wallet = fresh_mock_protocol_wallet(src, dst);
-        let mut private_keys = state.unit_protocol_private_keys.lock().await;
+        let mut private_keys = state.unit.protocol_private_keys.lock().await;
         if private_keys.contains_key(&protocol_wallet.address) {
             continue;
         }
@@ -471,7 +493,7 @@ pub(crate) async fn mock_unit_gen(
         break protocol_address;
     };
     {
-        let mut operations = state.unit_operations.lock().await;
+        let mut operations = state.unit.operations.lock().await;
         operations
             .entry(protocol_address.clone())
             .or_default()
@@ -523,7 +545,7 @@ pub(crate) async fn mock_unit_operations(
     State(state): State<Arc<MockIntegratorState>>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let operations = state.unit_operations.lock().await;
+    let operations = state.unit.operations.lock().await;
     let matched: Vec<_> = operations
         .values()
         .flat_map(|entries| entries.iter())
@@ -623,7 +645,7 @@ pub(crate) async fn complete_unit_withdrawal_after_hyperliquid_transfer(
 ) -> Result<(), axum::response::Response> {
     let mut unit_withdrawal_to_complete = None;
     {
-        let mut operations = state.unit_operations.lock().await;
+        let mut operations = state.unit.operations.lock().await;
         if let Some(entry) = operations
             .get_mut(destination)
             .and_then(|entries| latest_active_unit_operation_mut(entries))
@@ -671,7 +693,7 @@ fn spawn_mock_unit_withdrawal_completion(
 ) {
     tokio::spawn(async move {
         let completion_result = if let Some(error) = state
-            .next_unit_withdrawal_completion_error
+            .unit.next_withdrawal_completion_error
             .lock()
             .await
             .take()
@@ -749,7 +771,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             %protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit_operations.lock().await;
+        let mut operations = state.unit.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             %protocol_address,
@@ -922,7 +944,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
-        let timeout = state.unit_withdrawal_release_timeout;
+        let timeout = state.unit.withdrawal_release_timeout;
         let tx_hash = match tokio::time::timeout(
             timeout,
             send_mock_unit_evm_withdrawal_release(state, &release),
@@ -953,7 +975,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             protocol_address = %release.protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit_operations.lock().await;
+        let mut operations = state.unit.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             protocol_address = %release.protocol_address,
@@ -973,7 +995,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
         );
     }
     if let Some(release) = maybe_bitcoin_withdrawal_release {
-        let timeout = state.unit_withdrawal_release_timeout;
+        let timeout = state.unit.withdrawal_release_timeout;
         let tx_hash = match tokio::time::timeout(
             timeout,
             send_mock_unit_bitcoin_withdrawal_release(state, &release),
@@ -1004,7 +1026,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             protocol_address = %release.protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit_operations.lock().await;
+        let mut operations = state.unit.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             protocol_address = %release.protocol_address,
@@ -1036,7 +1058,7 @@ fn format_duration_for_log(duration: Duration) -> String {
 }
 
 async fn mark_mock_unit_operation_failed(state: &Arc<MockIntegratorState>, protocol_address: &str) {
-    let mut operations = state.unit_operations.lock().await;
+    let mut operations = state.unit.operations.lock().await;
     if let Some(entry) = operations
         .get_mut(protocol_address)
         .and_then(|entries| entries.last_mut())
@@ -1062,7 +1084,7 @@ async fn send_mock_unit_evm_withdrawal_release(
         "submitting mock Unit EVM withdrawal release"
     );
     let Some(rpc_url) = state
-        .unit_evm_rpc_urls
+        .unit.evm_rpc_urls
         .get(release.dst_chain.as_wire_str())
         .cloned()
     else {
@@ -1112,7 +1134,7 @@ async fn send_mock_unit_evm_withdrawal_release(
         "calling paymaster.submit"
     );
     let submit_result = tokio::time::timeout(
-        state.unit_withdrawal_release_timeout,
+        state.unit.withdrawal_release_timeout,
         handle.submit(execution),
     )
     .await;
@@ -1139,12 +1161,12 @@ async fn send_mock_unit_evm_withdrawal_release(
             tracing::info!(
                 target: "mock_hu",
                 protocol_address = %release.protocol_address,
-                timeout = %format_duration_for_log(state.unit_withdrawal_release_timeout),
+                timeout = %format_duration_for_log(state.unit.withdrawal_release_timeout),
                 "paymaster.submit returned: err"
             );
             return Err(format!(
                 "mock Unit withdrawal release paymaster.submit timed out after {}",
-                format_duration_for_log(state.unit_withdrawal_release_timeout)
+                format_duration_for_log(state.unit.withdrawal_release_timeout)
             ));
         }
     };
@@ -1172,8 +1194,8 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
         "submitting mock Unit Bitcoin withdrawal release"
     );
     let (Some(rpc_url), Some(cookie_path)) = (
-        state.unit_bitcoin_rpc_url.clone(),
-        state.unit_bitcoin_cookie_path.clone(),
+        state.unit.bitcoin_rpc_url.clone(),
+        state.unit.bitcoin_cookie_path.clone(),
     ) else {
         return Err(
             "mock Unit Bitcoin withdrawal release has no Bitcoin RPC configuration".to_string(),
@@ -1539,7 +1561,7 @@ pub(crate) async fn fail_mock_unit_operation(
     protocol_address: &str,
     error: String,
 ) -> Result<(), String> {
-    let mut operations = state.unit_operations.lock().await;
+    let mut operations = state.unit.operations.lock().await;
     let entries = operations
         .get_mut(protocol_address)
         .ok_or_else(|| format!("mock unit operation {protocol_address} was not found"))?;
@@ -2124,7 +2146,7 @@ mod tests {
         let protocol_address = protocol_wallet.address;
         let destination = "0x33f65788aca48d733c2c2444ac9f79b18206aa92".to_string();
         {
-            let mut operations = state.unit_operations.lock().await;
+            let mut operations = state.unit.operations.lock().await;
             operations.insert(
                 protocol_address.clone(),
                 vec![MockUnitOperationEntry {
@@ -2174,7 +2196,7 @@ mod tests {
         process_unit_bitcoin_transaction_outputs(&state, &watches, "1234", vec![(2usize, tx_out)])
             .await;
 
-        let operations = state.unit_operations.lock().await;
+        let operations = state.unit.operations.lock().await;
         let entry = operations
             .get(&protocol_address)
             .and_then(|entries| entries.first())

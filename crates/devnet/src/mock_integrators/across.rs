@@ -15,8 +15,13 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, str::FromStr, sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::across_spoke_pool_mock::MockSpokePool::{depositCall, FundsDeposited};
@@ -55,6 +60,24 @@ pub struct MockAcrossDepositRecord {
     pub deposit_tx_hash: String,
     pub block_number: u64,
     pub indexed_at: DateTime<Utc>,
+}
+
+/// Per-venue state for the Across mock. Holds the Across config/tunables plus
+/// the in-flight deposit indexer records. Constructed once in
+/// [`MockIntegratorState::new`] and shared by `Arc`.
+pub(crate) struct AcrossMockState {
+    pub(crate) spoke_pool_address: Option<String>,
+    pub(crate) evm_rpc_url: Option<String>,
+    pub(crate) chains: BTreeMap<u64, MockAcrossChainConfig>,
+    pub(crate) deposits: Mutex<BTreeMap<AcrossDepositKey, MockAcrossDepositRecord>>,
+    pub(crate) destination_credit_tx_hashes: Mutex<BTreeMap<AcrossDepositKey, String>>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) integrator_id: Option<String>,
+    pub(crate) quote_fee_bps: u16,
+    pub(crate) quote_jitter_bps: u16,
+    pub(crate) status_latency: Duration,
+    pub(crate) refund_probability_bps: u16,
+    pub(crate) next_swap_approval_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,7 +161,7 @@ pub(crate) async fn mock_across_real_swap_approval(
     {
         return *response;
     }
-    if let Some(error) = state.next_across_swap_approval_error.lock().await.take() {
+    if let Some(error) = state.across.next_swap_approval_error.lock().await.take() {
         return mock_across_error_response(
             StatusCode::BAD_GATEWAY,
             "bad_gateway",
@@ -790,7 +813,7 @@ fn mock_across_quote_fee_bps(
     state: &MockIntegratorState,
     query: &MockAcrossRealSwapApprovalQuery,
 ) -> u16 {
-    let base = state.across_quote_fee_bps;
+    let base = state.across.quote_fee_bps;
     let jitter = deterministic_bps(
         &format!(
             "across-quote:{}:{}:{}:{}:{}:{}",
@@ -801,7 +824,7 @@ fn mock_across_quote_fee_bps(
             query.output_token,
             query.amount
         ),
-        state.across_quote_jitter_bps,
+        state.across.quote_jitter_bps,
     );
     base.saturating_add(jitter).min(9_999)
 }
@@ -837,7 +860,7 @@ fn mock_across_should_refund(
             record.origin_chain_id, record.deposit_id, record.deposit_tx_hash
         ),
         9_999,
-    ) < state.across_refund_probability_bps
+    ) < state.across.refund_probability_bps
 }
 
 fn mock_across_destination_chain_id(destination_chain_id: U256) -> Result<u64, String> {
@@ -889,7 +912,7 @@ pub(crate) async fn mock_across_deposit_status(
         return *response;
     }
     let record = {
-        let deposits = state.across_deposits.lock().await;
+        let deposits = state.across.deposits.lock().await;
         if let (Some(origin_chain_id), Some(deposit_id)) =
             (query.origin_chain_id, query.deposit_id.as_deref())
         {
@@ -951,7 +974,7 @@ pub(crate) async fn mock_across_deposit_status(
         .signed_duration_since(record.indexed_at)
         .to_std()
         .unwrap_or_default()
-        < state.across_status_latency
+        < state.across.status_latency
     {
         return Json(MockAcrossDepositStatusResponse {
             status: "pending".to_string(),
@@ -1012,7 +1035,7 @@ async fn ensure_mock_across_destination_credit(
     const PENDING_CREDIT: &str = "__pending__";
 
     {
-        let mut credits = state.across_destination_credit_tx_hashes.lock().await;
+        let mut credits = state.across.destination_credit_tx_hashes.lock().await;
         match credits.get(&key).map(String::as_str) {
             Some(PENDING_CREDIT) => {
                 return Err("destination credit is still being applied".to_string());
@@ -1025,7 +1048,7 @@ async fn ensure_mock_across_destination_credit(
     }
 
     let credit_result = mock_across_credit_destination(state, record).await;
-    let mut credits = state.across_destination_credit_tx_hashes.lock().await;
+    let mut credits = state.across.destination_credit_tx_hashes.lock().await;
     match credit_result {
         Ok(tx_hash) => {
             credits.insert(key, tx_hash.clone());
@@ -1212,7 +1235,7 @@ async fn run_across_deposit_indexer(
                 indexed_at: Utc::now(),
             };
             let key = (chain_id, record.deposit_id.to_string());
-            state.across_deposits.lock().await.insert(key, record);
+            state.across.deposits.lock().await.insert(key, record);
         }
         last_scanned = head;
     }
@@ -1236,7 +1259,7 @@ fn validate_across_request(
     integrator_id: Option<&str>,
     require_integrator_id: bool,
 ) -> Result<(), Box<axum::response::Response>> {
-    if let Some(expected_api_key) = state.across_api_key.as_deref() {
+    if let Some(expected_api_key) = state.across.api_key.as_deref() {
         let expected = format!("Bearer {expected_api_key}");
         let actual = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -1253,7 +1276,7 @@ fn validate_across_request(
     }
 
     if require_integrator_id {
-        if let Some(expected_integrator_id) = state.across_integrator_id.as_deref() {
+        if let Some(expected_integrator_id) = state.across.integrator_id.as_deref() {
             if integrator_id != Some(expected_integrator_id) {
                 return Err(Box::new(mock_across_error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -2020,7 +2043,7 @@ mod tests {
         };
         server
             .state
-            .across_deposits
+            .across.deposits
             .lock()
             .await
             .insert((1, "7".to_string()), record);
@@ -2079,7 +2102,7 @@ mod tests {
         };
         server
             .state
-            .across_deposits
+            .across.deposits
             .lock()
             .await
             .insert((origin_chain_id, "9".to_string()), record);
@@ -2203,7 +2226,7 @@ mod tests {
         };
         server
             .state
-            .across_deposits
+            .across.deposits
             .lock()
             .await
             .insert((1, deposit_id.to_string()), record);

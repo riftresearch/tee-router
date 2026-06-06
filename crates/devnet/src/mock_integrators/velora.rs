@@ -12,9 +12,20 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, str::FromStr, sync::Arc};
+use tokio::sync::Mutex;
 
 use crate::mock_integrators::{parse_amount, MockIntegratorState};
 use crate::velora_mock::MockVeloraSwap;
+
+/// Per-venue state for the Velora mock: the simulated USD price book, the
+/// per-network swap-contract addresses, and the two injectable
+/// transaction-failure counters.
+pub(crate) struct VeloraMockState {
+    pub(crate) usd_prices: Mutex<BTreeMap<String, u128>>,
+    pub(crate) swap_contract_addresses: BTreeMap<u64, String>,
+    pub(crate) transaction_failures_remaining: Mutex<usize>,
+    pub(crate) transaction_stale_quote_failures_remaining: Mutex<usize>,
+}
 
 const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const USD_MICRO: u128 = 1_000_000;
@@ -95,7 +106,7 @@ pub(crate) async fn mock_velora_prices(
                 .into_response();
         }
     };
-    let Some(swap_contract) = state.velora_swap_contract_addresses.get(&query.network) else {
+    let Some(swap_contract) = state.velora.swap_contract_addresses.get(&query.network) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
@@ -134,7 +145,7 @@ async fn mock_velora_quote_amounts(
 ) -> Result<(u128, u128), String> {
     let src_symbol = mock_velora_token_symbol(&query.src_token);
     let dest_symbol = mock_velora_token_symbol(&query.dest_token);
-    let prices = state.velora_usd_prices.lock().await;
+    let prices = state.velora.usd_prices.lock().await;
     let src_price = *prices
         .get(src_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {src_symbol}"))?;
@@ -269,7 +280,7 @@ pub(crate) async fn mock_velora_transaction(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut stale_quote_failures_remaining = state
-        .velora_transaction_stale_quote_failures_remaining
+        .velora.transaction_stale_quote_failures_remaining
         .lock()
         .await;
     if *stale_quote_failures_remaining > 0 {
@@ -285,7 +296,7 @@ pub(crate) async fn mock_velora_transaction(
     }
     drop(stale_quote_failures_remaining);
 
-    let mut failures_remaining = state.velora_transaction_failures_remaining.lock().await;
+    let mut failures_remaining = state.velora.transaction_failures_remaining.lock().await;
     if *failures_remaining > 0 {
         *failures_remaining -= 1;
         return (
@@ -368,7 +379,7 @@ pub(crate) async fn mock_velora_transaction(
                 .into_response();
         }
     };
-    let Some(swap_contract) = state.velora_swap_contract_addresses.get(&network) else {
+    let Some(swap_contract) = state.velora.swap_contract_addresses.get(&network) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({

@@ -19,7 +19,7 @@ use hyperliquid_client::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{str::FromStr, sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 use eip7702_paymaster::Execution;
 
@@ -30,6 +30,27 @@ use crate::mock_integrators::{
     mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, MockIntegratorConfig,
     MockIntegratorErrorResponse, MockIntegratorState, MockService, IERC20,
 };
+
+/// Per-venue config/state for the Hyperliquid mock that is **not** the core
+/// account ledger ([`crate::hyperliquid_core::HyperliquidCore`], which is owned
+/// separately as `MockIntegratorState::hyperliquid_core`). Holds the Bridge2
+/// deposit wiring/tunables, the recorded `/exchange` submissions, the
+/// withdrawal latency, the injectable exchange error, and the mainnet-signing
+/// flag.
+///
+/// NOTE: the eventual spot/bridge venue split will further decompose this; for
+/// now it is intentionally one struct.
+pub(crate) struct HyperliquidVenueState {
+    pub(crate) bridge_address: Option<String>,
+    pub(crate) evm_rpc_url: Option<String>,
+    pub(crate) usdc_token_address: Option<String>,
+    pub(crate) bridge_deposit_latency: Duration,
+    pub(crate) bridge_deposit_failure_probability_bps: u16,
+    pub(crate) exchange_submissions: Mutex<Vec<Value>>,
+    pub(crate) withdrawal_latency: Duration,
+    pub(crate) next_exchange_error: Mutex<Option<String>>,
+    pub(crate) mainnet: bool,
+}
 
 pub(crate) async fn maybe_spawn_hyperliquid_bridge_indexer(
     config: &MockIntegratorConfig,
@@ -152,7 +173,7 @@ async fn run_hyperliquid_bridge_indexer(
                 );
                 continue;
             }
-            if state.hyperliquid_bridge_deposit_latency > Duration::ZERO {
+            if state.hyperliquid.bridge_deposit_latency > Duration::ZERO {
                 schedule_mock_hyperliquid_bridge_deposit_credit(
                     &state, event.from, amount, tx_hash,
                 );
@@ -170,7 +191,7 @@ fn mock_hyperliquid_bridge_deposit_should_fail(
     amount_raw: U256,
     tx_hash: &str,
 ) -> bool {
-    let probability_bps = state.hyperliquid_bridge_deposit_failure_probability_bps;
+    let probability_bps = state.hyperliquid.bridge_deposit_failure_probability_bps;
     deterministic_bps(
         &format!("hyperliquid-bridge-deposit:{user}:{tx_hash}:{amount_raw}"),
         9_999,
@@ -184,7 +205,7 @@ fn schedule_mock_hyperliquid_bridge_deposit_credit(
     tx_hash: String,
 ) {
     let state = Arc::clone(state);
-    let latency = state.hyperliquid_bridge_deposit_latency;
+    let latency = state.hyperliquid.bridge_deposit_latency;
     tokio::spawn(async move {
         tokio::time::sleep(latency).await;
         credit_mock_hyperliquid_bridge_deposit(&state, user, amount, &tx_hash).await;
@@ -409,7 +430,7 @@ pub(crate) async fn mock_hyperliquid_exchange(
     State(state): State<Arc<MockIntegratorState>>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    if let Some(error) = state.next_hyperliquid_exchange_error.lock().await.take() {
+    if let Some(error) = state.hyperliquid.next_exchange_error.lock().await.take() {
         return (
             StatusCode::BAD_GATEWAY,
             Json(MockIntegratorErrorResponse { error }),
@@ -418,7 +439,7 @@ pub(crate) async fn mock_hyperliquid_exchange(
     }
 
     state
-        .hyperliquid_exchange_submissions
+        .hyperliquid.exchange_submissions
         .lock()
         .await
         .push(request.clone());
@@ -491,7 +512,7 @@ async fn handle_l1_action(
             );
         }
     };
-    let signer = match recover_l1_signer(connection_id, state.mainnet_hyperliquid, &signature) {
+    let signer = match recover_l1_signer(connection_id, state.hyperliquid.mainnet, &signature) {
         Ok(addr) => addr,
         Err(err) => {
             return error_response(
@@ -795,12 +816,12 @@ async fn handle_usd_class_transfer(
         Err(msg) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
     };
     let payload = UsdClassTransfer {
-        signature_chain_id: if state.mainnet_hyperliquid {
+        signature_chain_id: if state.hyperliquid.mainnet {
             42_161
         } else {
             421_614
         },
-        hyperliquid_chain: if state.mainnet_hyperliquid {
+        hyperliquid_chain: if state.hyperliquid.mainnet {
             "Mainnet".to_string()
         } else {
             "Testnet".to_string()
@@ -1019,16 +1040,16 @@ fn schedule_mock_hyperliquid_withdrawal_release(
     destination: Address,
     payout_raw: u64,
 ) {
-    let Some(rpc_url) = state.hyperliquid_evm_rpc_url.clone() else {
+    let Some(rpc_url) = state.hyperliquid.evm_rpc_url.clone() else {
         return;
     };
-    let Some(bridge_address) = state.hyperliquid_bridge_address.clone() else {
+    let Some(bridge_address) = state.hyperliquid.bridge_address.clone() else {
         return;
     };
-    let Some(usdc_token_address) = state.hyperliquid_usdc_token_address.clone() else {
+    let Some(usdc_token_address) = state.hyperliquid.usdc_token_address.clone() else {
         return;
     };
-    let latency = state.hyperliquid_withdrawal_latency;
+    let latency = state.hyperliquid.withdrawal_latency;
     let state = state.clone();
     tokio::spawn(async move {
         if latency > Duration::ZERO {

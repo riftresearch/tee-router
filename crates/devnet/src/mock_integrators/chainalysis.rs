@@ -5,9 +5,15 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::mock_integrators::MockIntegratorState;
+
+/// Per-venue state for the Chainalysis address-screening mock: the per-address
+/// screening rules tests inject to control risk responses.
+pub(crate) struct ChainalysisMockState {
+    pub(crate) address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockAddressRiskLevel {
@@ -47,7 +53,7 @@ pub(crate) async fn mock_chainalysis_address_risk(
     Path(address): Path<String>,
 ) -> axum::response::Response {
     let normalized = normalize_mock_screening_address(&address);
-    match state.address_screening_rules.get(&normalized) {
+    match state.chainalysis.address_screening_rules.get(&normalized) {
         Some(MockAddressScreeningRule::HttpError { status, body }) => {
             let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, body.clone()).into_response()
