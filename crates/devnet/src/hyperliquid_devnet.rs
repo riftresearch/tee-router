@@ -292,6 +292,13 @@ impl HyperliquidNode {
         self.guardian_address
     }
 
+    /// The guardian HL account's raw secp256k1 key. The Unit mock signs the
+    /// deposit `spotSend(guardian -> user)` with this when pointed at the node.
+    #[must_use]
+    pub fn guardian_key(&self) -> [u8; 32] {
+        HYPERLIQUID_GUARDIAN_PRIVATE_KEY
+    }
+
     /// Access the node's own [`HyperliquidCore`] ledger (tests / seeding).
     #[must_use]
     #[allow(dead_code)]
@@ -778,6 +785,20 @@ async fn handle_spot_send(
     hl.debit_spot_total(signer, &token_symbol, amount);
     if let Ok(dst) = Address::from_str(&payload.destination) {
         hl.credit_spot(dst, &token_symbol, amount);
+        // Record the spotSend as a `SpotTransfer` ledger update on both the
+        // sender and the recipient — exactly what real Hyperliquid does. The
+        // hl-shim indexes these and downstream observers (e.g. sauron's Unit
+        // deposit credit detector, which watches the recipient for an incoming
+        // transfer) rely on them. Without this, a node spotSend moves the
+        // balance silently and the credit is invisible to the indexer.
+        record_node_spot_transfer(
+            &mut hl,
+            signer,
+            dst,
+            &token_symbol,
+            &payload.amount,
+            payload.time,
+        );
     }
 
     Json(json!({ "status": "ok", "response": { "type": "default" } })).into_response()
@@ -859,9 +880,69 @@ async fn handle_send_asset(
     hl.debit_spot_total(source_user, &token_symbol, amount);
     if let Ok(dst) = Address::from_str(&payload.destination) {
         hl.credit_spot(dst, &token_symbol, amount);
+        // Faithful to real Hyperliquid: a spot->spot sendAsset records a
+        // `SpotTransfer` ledger update on both parties (see `handle_spot_send`).
+        record_node_spot_transfer(
+            &mut hl,
+            source_user,
+            dst,
+            &token_symbol,
+            &payload.amount,
+            payload.nonce,
+        );
     }
 
     Json(json!({ "status": "ok", "response": { "type": "default" } })).into_response()
+}
+
+/// Record a `SpotTransfer` ledger update on both the sender and the recipient
+/// of a node spot transfer (`spotSend` / spot->spot `sendAsset`), mirroring
+/// Hyperliquid's real behavior. The hl-shim indexes each side's update; the
+/// recipient's positive-delta entry is what the Unit deposit-credit observer
+/// watches for. `nonce` is the action's time/nonce (the transfer's identity).
+fn record_node_spot_transfer(
+    hl: &mut crate::hyperliquid_core::HyperliquidCoreState,
+    sender: Address,
+    recipient: Address,
+    token_symbol: &str,
+    amount: &str,
+    nonce: u64,
+) {
+    let time_ms = Utc::now().timestamp_millis().max(0) as u64;
+    let hash = format!(
+        "0x{}",
+        hex::encode(Sha256::digest(format!(
+            "node-spot-transfer:{sender}:{recipient}:{token_symbol}:{amount}:{nonce}"
+        )))
+    );
+    let delta = UserNonFundingLedgerDelta::SpotTransfer {
+        token: token_symbol.to_string(),
+        amount: amount.to_string(),
+        usdc_value: "0".to_string(),
+        user: format!("{sender:#x}"),
+        destination: format!("{recipient:#x}"),
+        fee: "0".to_string(),
+        native_token_fee: "0".to_string(),
+        nonce,
+    };
+    // Both ledgers carry the same SpotTransfer delta; the hl-shim signs the
+    // amount per-owner (negative for the sender, positive for the recipient).
+    hl.record_ledger_update(
+        sender,
+        UserNonFundingLedgerUpdate {
+            time: time_ms,
+            hash: hash.clone(),
+            delta: delta.clone(),
+        },
+    );
+    hl.record_ledger_update(
+        recipient,
+        UserNonFundingLedgerUpdate {
+            time: time_ms,
+            hash,
+            delta,
+        },
+    );
 }
 
 async fn handle_usd_class_transfer(

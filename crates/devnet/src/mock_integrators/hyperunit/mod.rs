@@ -13,7 +13,10 @@ use axum::{
 };
 use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, RpcApi};
 use chrono::Utc;
-use hyperliquid_client::{UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate};
+use hyperliquid_client::{
+    client::Network as HyperliquidClientNetwork, HyperliquidExchangeClient, HyperliquidInfoClient,
+    UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate,
+};
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
 };
@@ -118,6 +121,17 @@ pub(crate) struct UnitMockState {
     pub(crate) operations: Mutex<BTreeMap<String, Vec<MockUnitOperationEntry>>>,
     pub(crate) protocol_private_keys: Mutex<BTreeMap<String, MockUnitProtocolKey>>,
     pub(crate) evm_rpc_urls: BTreeMap<String, String>,
+    /// When `Some`, the Unit mock acts as a real HL guardian client against the
+    /// standalone Hyperliquid node at this base URL: deposits credit the user's
+    /// spot ON THE NODE via a guardian `spotSend` instead of crediting the
+    /// in-process [`core`](Self::core), and the withdrawal poller watches the
+    /// node for the router's incoming spotSends. `None` keeps the in-process
+    /// path (standalone venue tests rely on it).
+    pub(crate) node_api_url: Option<String>,
+    /// The node's HL guardian key (`HYPERLIQUID_GUARDIAN_PRIVATE_KEY`). Used to
+    /// sign the deposit `spotSend` when [`node_api_url`](Self::node_api_url) is
+    /// set. The guardian is seeded `u32::MAX` UBTC/UETH at node genesis.
+    pub(crate) node_guardian_key: Option<[u8; 32]>,
     pub(crate) withdrawal_release_timeout: Duration,
     pub(crate) bitcoin_rpc_url: Option<String>,
     pub(crate) bitcoin_cookie_path: Option<PathBuf>,
@@ -177,12 +191,159 @@ pub(crate) async fn maybe_spawn_unit_deposit_indexers(
                 eyre::eyre!("mock Unit bitcoin indexer: RPC client init failed: {err}")
             })?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(run_unit_bitcoin_deposit_indexer(client, state, shutdown_rx));
+        let handle =
+            tokio::spawn(run_unit_bitcoin_deposit_indexer(client, state.clone(), shutdown_rx));
+        shutdowns.push(shutdown_tx);
+        handles.push(handle);
+    }
+
+    // When pointed at the node, the node's `spotSend`/`sendAsset` is Unit-unaware
+    // (it only moves the spot balance, no Unit-withdrawal trigger). Spawn a
+    // poller that watches the node for the router's incoming withdrawal
+    // transfers and settles the matching Unit withdrawal via the native-release
+    // logic. In-process mode (None) keeps the trigger inline in the spot mock.
+    if let Some(node_api_url) = config.unit_node_api_url.clone() {
+        let info = HyperliquidInfoClient::new(&node_api_url).map_err(|err| {
+            eyre::eyre!("mock Unit node withdrawal poller: info client init failed: {err}")
+        })?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(run_unit_node_withdrawal_poller(info, state, shutdown_rx));
         shutdowns.push(shutdown_tx);
         handles.push(handle);
     }
 
     Ok((shutdowns, handles))
+}
+
+/// A pending Unit withdrawal whose on-HL source transfer has not yet been
+/// observed on the node. The poller watches `protocol_address`'s spot `coin`
+/// balance and, once it reaches the router's transferred amount, settles the
+/// withdrawal. The match key is the destination (protocol) address + the
+/// credited amount.
+#[derive(Debug, Clone)]
+struct UnitNodeWithdrawalWatch {
+    protocol_address: String,
+    coin: &'static str,
+}
+
+/// Polls the node for incoming spotSends that settle pending Unit withdrawals.
+/// The node's `spotSend`/`sendAsset` credits the withdrawal protocol address's
+/// spot balance but knows nothing about Unit, so this poller is the
+/// node-equivalent of the in-process spot mock's inline
+/// [`complete_unit_withdrawal_after_hyperliquid_transfer`] trigger: for each
+/// pending withdrawal it reads the protocol address's `userNonFundingLedger`
+/// updates and, once an incoming `SpotTransfer` of the matching coin appears,
+/// runs the existing native-release logic.
+///
+/// Crucially it threads the transfer's `user` (the HL account that signed the
+/// router's `sendAsset` — the Hyperliquid custody vault) through as the
+/// operation's `source_address`. The real HyperUnit `/operations` surfaces that
+/// HL source, and the router's withdrawal observer matches the operation on it
+/// (`expected_source == hyperliquid_custody_vault_address`). The in-process spot
+/// mock learns the same address directly from the `sendAsset` signer; on the
+/// node path the ledger update is the only place it survives. Using the
+/// `spotClearinghouseState` balance instead would leave `source_address` unknown
+/// (or wrong), so the observer would never match and the step would stall.
+async fn run_unit_node_withdrawal_poller(
+    info: HyperliquidInfoClient,
+    state: Arc<UnitMockState>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let poll = Duration::from_millis(250);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+
+        for watch in active_unit_node_withdrawal_watches(&state).await {
+            let Ok(protocol_address) = Address::from_str(&watch.protocol_address) else {
+                continue;
+            };
+            let updates = match info
+                .user_non_funding_ledger_updates(protocol_address, 0, None)
+                .await
+            {
+                Ok(updates) => updates,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        protocol_address = %watch.protocol_address,
+                        "mock Unit node withdrawal poller: userNonFundingLedgerUpdates failed"
+                    );
+                    continue;
+                }
+            };
+            // Find the router's incoming `sendAsset`/`spotSend` of the watched
+            // coin INTO the protocol address. `user` is the HL source (custody
+            // vault) that signed it; `amount` is exactly what the router sent.
+            let Some((source_address, source_amount, nonce)) =
+                updates.iter().rev().find_map(|update| match &update.delta {
+                    UserNonFundingLedgerDelta::SpotTransfer {
+                        token,
+                        amount,
+                        user,
+                        destination,
+                        nonce,
+                        ..
+                    } if token.eq_ignore_ascii_case(watch.coin)
+                        && addresses_match(destination, &watch.protocol_address)
+                        && amount.parse::<f64>().map(|v| v > 0.0).unwrap_or(false) =>
+                    {
+                        Some((user.clone(), amount.clone(), *nonce))
+                    }
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            // Settle through the same native-release path the in-process spot
+            // mock uses inline, threading the real HL source so the router's
+            // withdrawal observer matches `expected_source`.
+            if let Err(response) = complete_unit_withdrawal_after_hyperliquid_transfer(
+                &state,
+                &watch.protocol_address,
+                source_address,
+                &source_amount,
+                format!("node-spotsend:{}:{nonce}", watch.protocol_address),
+            )
+            .await
+            {
+                tracing::warn!(
+                    protocol_address = %watch.protocol_address,
+                    status = %response.status(),
+                    "mock Unit node withdrawal poller: settling withdrawal failed"
+                );
+            }
+        }
+    }
+}
+
+/// Collects pending Unit withdrawals whose on-HL source transfer has not yet
+/// been observed on the node — i.e. withdrawal operations that are not terminal
+/// and have no `source_amount` recorded. (Once observed,
+/// [`complete_unit_withdrawal_after_hyperliquid_transfer`] sets `source_amount`
+/// and advances the state, so they drop out of this set.)
+async fn active_unit_node_withdrawal_watches(
+    state: &Arc<UnitMockState>,
+) -> Vec<UnitNodeWithdrawalWatch> {
+    let operations = state.operations.lock().await;
+    operations
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| {
+            entry.kind == MockUnitOperationKind::Withdrawal
+                && entry.src_chain == UnitChain::Hyperliquid
+                && entry.operation.source_amount.is_none()
+                && !matches!(entry.operation.state.as_deref(), Some("done" | "failure"))
+        })
+        .filter_map(|entry| {
+            Some(UnitNodeWithdrawalWatch {
+                protocol_address: entry.operation.protocol_address.clone()?,
+                coin: hyperliquid_coin_for_unit_asset(entry.asset),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +925,12 @@ struct MockHyperunitDepositCredit {
     spot_amount: f64,
     ledger_amount: String,
     tx_hash: String,
+    /// The nonce stamped on the node-path guardian `spotSend`. Set to the trailing
+    /// `:<n>` of the operation's `destination_tx_hash` so the resulting node
+    /// `SpotTransfer` ledger update carries the SAME nonce the Unit deposit
+    /// observer derives from `destination_tx_hash` — letting the observer match
+    /// the credit. Unused on the in-process path.
+    nonce: u64,
 }
 
 struct MockUnitEvmWithdrawalRelease {
@@ -893,12 +1060,25 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
                     entry.operation.destination_fee_amount.as_deref(),
                     entry.operation.sweep_fee_amount.as_deref(),
                 )?;
+                // Derive the spotSend nonce from the operation's
+                // `destination_tx_hash` (`"{user}:{nonce}"`), which is exactly
+                // what sauron's Unit deposit observer parses as the expected
+                // destination nonce. Aligning them lets the observer match the
+                // node `SpotTransfer` this credit produces.
+                let nonce = entry
+                    .operation
+                    .destination_tx_hash
+                    .as_deref()
+                    .and_then(|hash| hash.rsplit_once(':'))
+                    .and_then(|(_, nonce)| nonce.parse::<u64>().ok())
+                    .unwrap_or_else(|| Utc::now().timestamp_millis().max(0) as u64);
                 Some(MockHyperunitDepositCredit {
                     user,
                     coin,
                     spot_amount: net_amount.spot_amount,
                     ledger_amount: net_amount.ledger_amount,
                     tx_hash: entry.operation.source_tx_hash.clone().unwrap_or_default(),
+                    nonce,
                 })
             }
             _ => None,
@@ -948,18 +1128,27 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
 
     if let Some(credit) = maybe_deposit_credit {
         if credit.spot_amount > 0.0 {
-            let mut hl = state.core.lock().await;
-            hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
-            hl.record_ledger_update(
-                credit.user,
-                UserNonFundingLedgerUpdate {
-                    time: Utc::now().timestamp_millis().max(0) as u64,
-                    hash: credit.tx_hash,
-                    delta: UserNonFundingLedgerDelta::Deposit {
-                        usdc: credit.ledger_amount,
+            // When pointed at the node, the deposit credit MUST land on the
+            // node's core (the consumers read the node now), so the guardian —
+            // seeded `u32::MAX` UBTC/UETH at node genesis — signs a real
+            // `spotSend(guardian -> user)` against the node's `/exchange`.
+            // Otherwise credit the in-process core (standalone venue tests).
+            if let Some(node_api_url) = state.node_api_url.as_deref() {
+                credit_deposit_via_node_guardian(state, node_api_url, &credit).await?;
+            } else {
+                let mut hl = state.core.lock().await;
+                hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
+                hl.record_ledger_update(
+                    credit.user,
+                    UserNonFundingLedgerUpdate {
+                        time: Utc::now().timestamp_millis().max(0) as u64,
+                        hash: credit.tx_hash,
+                        delta: UserNonFundingLedgerDelta::Deposit {
+                            usdc: credit.ledger_amount,
+                        },
                     },
-                },
-            );
+                );
+            }
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
@@ -1074,6 +1263,53 @@ fn format_duration_for_log(duration: Duration) -> String {
     } else {
         format!("{duration:?}")
     }
+}
+
+/// Credit a Unit deposit on the node by having the guardian sign a real
+/// `spotSend(guardian -> user, coin, spot_amount)` against the node's
+/// `/exchange`. This is the node-path replacement for the in-process
+/// `hl.credit_spot`: the consumers now read the node's core, so the deposited
+/// balance must land there. The guardian is seeded `u32::MAX` UBTC/UETH at node
+/// genesis, so it never drains.
+async fn credit_deposit_via_node_guardian(
+    state: &Arc<UnitMockState>,
+    node_api_url: &str,
+    credit: &MockHyperunitDepositCredit,
+) -> Result<(), String> {
+    let guardian_key = state.node_guardian_key.ok_or_else(|| {
+        "mock Unit deposit: node_api_url is set but the guardian key is missing".to_string()
+    })?;
+    let guardian = PrivateKeySigner::from_bytes(&guardian_key.into())
+        .map_err(|err| format!("mock Unit deposit: invalid guardian key: {err}"))?;
+    let exchange = HyperliquidExchangeClient::new(
+        node_api_url,
+        guardian,
+        None,
+        HyperliquidClientNetwork::Testnet,
+    )
+    .map_err(|err| format!("mock Unit deposit: node exchange client init failed: {err}"))?;
+    // The node splits the token wire form on ':' and keys balances by the plain
+    // symbol, so the token-id suffix is cosmetic; use the guardian-seeded coin.
+    let token_wire = format!("{}:0x0000000000000000000000000000000000000000", credit.coin);
+    let amount = hyperliquid_client::float_to_wire(credit.spot_amount);
+    // Use the operation's destination nonce as the spotSend nonce so the node's
+    // resulting `SpotTransfer` ledger update matches what the Unit deposit
+    // observer expects (see `MockHyperunitDepositCredit::nonce`).
+    let response = exchange
+        .spot_send(
+            format!("{:#x}", credit.user),
+            token_wire,
+            amount,
+            credit.nonce,
+        )
+        .await
+        .map_err(|err| format!("mock Unit deposit: node guardian spotSend failed: {err}"))?;
+    if response.get("status").and_then(|status| status.as_str()) != Some("ok") {
+        return Err(format!(
+            "mock Unit deposit: node guardian spotSend rejected: {response}"
+        ));
+    }
+    Ok(())
 }
 
 async fn mark_mock_unit_operation_failed(state: &Arc<UnitMockState>, protocol_address: &str) {

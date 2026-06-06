@@ -560,6 +560,11 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
         .using_token_indexer(database_url.clone())
+        // PHASE 3 CUTOVER: stand up the Hyperliquid NODE so the router / sauron
+        // / hl-shim / Unit mock all interact with it (the node's core holds the
+        // HL state they read). The venue mock's `/hyperliquid` stays present
+        // (dual) but is no longer the consumers' target.
+        .using_hyperliquid_node(true)
         .build()
         .await
         .expect("devnet setup failed");
@@ -588,13 +593,21 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
     .await;
     timing_log!("install_mock_usdc_x3", _t);
 
+    // The Hyperliquid node's `/info`+`/exchange` base URL — the consumers'
+    // target now. The venue mock's `/hyperliquid` still exists but is not used.
+    let hyperliquid_node_url = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("hyperliquid node present with using_hyperliquid_node(true)")
+        .url();
+
     let _t = std::time::Instant::now();
     let mocks = spawn_runtime_mocks(&devnet).await;
     timing_log!("spawn_runtime_mocks", _t);
 
     let _t = std::time::Instant::now();
     let (hl_shim_base_url, _hl_shim_task) =
-        spawn_hl_shim_indexer(&hl_shim_database_url, mocks.hyperliquid_url().as_str()).await;
+        spawn_hl_shim_indexer(&hl_shim_database_url, hyperliquid_node_url.as_str()).await;
     timing_log!("spawn_hl_shim_indexer", _t);
 
     let _t = std::time::Instant::now();
@@ -1320,7 +1333,15 @@ fn router_args(
         cctp_transfer_mode: None,
         hyperunit_api_url: Some(mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_api_url: Some(mocks.hyperliquid_url()),
+        // PHASE 3 CUTOVER: the router reads/writes HL state on the NODE, not the
+        // venue mock's `/hyperliquid` (which stays present but unused here).
+        hyperliquid_api_url: Some(
+            devnet
+                .hyperliquid
+                .as_ref()
+                .expect("hyperliquid node present with using_hyperliquid_node(true)")
+                .url(),
+        ),
         hyperliquid_proxy_url: None,
         velora_api_url: Some(mocks.velora_url()),
         velora_proxy_url: None,
@@ -1351,6 +1372,14 @@ fn router_args(
 }
 
 async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
+    // PHASE 3 CUTOVER: the Unit mock acts as a real HL guardian client against
+    // the node — deposits credit the user's spot on the node via a guardian
+    // `spotSend`, and the withdrawal poller settles Unit withdrawals by watching
+    // the node for the router's incoming spotSends.
+    let hyperliquid_node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("hyperliquid node present with using_hyperliquid_node(true)");
     let ethereum_spoke_pool = format!(
         "{:#x}",
         devnet.ethereum.mock_across_spoke_pool_contract.address()
@@ -1424,6 +1453,7 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
             hyperunit_client::UnitChain::Base,
             devnet.base.anvil.endpoint_url().to_string(),
         )
+        .with_unit_node(hyperliquid_node.url(), hyperliquid_node.guardian_key())
         .with_velora_swap_contract_address(
             devnet.ethereum.anvil.chain_id(),
             format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
@@ -1832,7 +1862,10 @@ async fn drive_order_to_status(
     let mut across_fund_ms: u128 = 0;
     let mut unit_deposit_ms: u128 = 0;
     let bitcoin_mine_ms: u128 = 0;
-    let mut unit_withdrawal_ms: u128 = 0;
+    // The node-withdrawal poller settles Unit withdrawals (see the
+    // UnitWithdrawal match arm below), so the drive loop no longer spends time
+    // completing them; kept in the summary for parity with the other legs.
+    let unit_withdrawal_ms: u128 = 0;
     macro_rules! emit_summary {
         () => {
             eprintln!(
@@ -1913,19 +1946,17 @@ async fn drive_order_to_status(
                     completed_manual_operations.insert(operation.id);
                 }
                 ProviderOperationType::UnitWithdrawal if operation.provider_ref.is_some() => {
-                    let _m = Instant::now();
-                    mocks
-                        .complete_unit_operation_with_source_amount(
-                            operation
-                                .provider_ref
-                                .as_deref()
-                                .expect("unit withdrawal provider ref"),
-                            unit_operation_amount(operation).to_string(),
-                        )
-                        .await
-                        .expect("complete mock Unit withdrawal operation");
-                    unit_withdrawal_ms += _m.elapsed().as_millis();
-                    completed_manual_operations.insert(operation.id);
+                    // Node path: do NOT manually settle the Unit withdrawal. The
+                    // router's `sendAsset` credits the protocol address's spot ON
+                    // the node, and the Unit mock's node-withdrawal poller observes
+                    // that incoming transfer and settles the withdrawal — threading
+                    // the HL sender (the custody vault) as the operation's
+                    // `source_address`, which the router's withdrawal observer
+                    // matches on. Driving it manually here would mark the op `done`
+                    // WITHOUT a `source_address`, so the observer would never match
+                    // and the step would stall. The poller is the authority,
+                    // mirroring the in-process spot mock's inline trigger and real
+                    // HyperUnit guardian observation.
                 }
                 _ => {}
             }

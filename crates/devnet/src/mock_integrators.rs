@@ -319,6 +319,19 @@ pub struct MockIntegratorConfig {
     /// EVM RPC URLs used to detect native Unit deposits into generated
     /// protocol addresses.
     pub unit_evm_rpc_urls: BTreeMap<String, String>,
+    /// When `Some`, the Unit mock treats the standalone Hyperliquid node at
+    /// this base URL as the real HL guardian client target: deposits credit
+    /// the user's spot ON THE NODE via a guardian `spotSend`, and a background
+    /// poller watches the node for incoming spotSends that settle Unit
+    /// withdrawals. When `None`, the Unit mock keeps crediting/reading its own
+    /// in-process [`HyperliquidCore`] (the standalone venue-test path).
+    pub unit_node_api_url: Option<String>,
+    /// Raw secp256k1 scalar of the node's HL guardian account
+    /// (`HYPERLIQUID_GUARDIAN_PRIVATE_KEY`). Required alongside
+    /// [`unit_node_api_url`](Self::unit_node_api_url): the guardian (seeded
+    /// `u32::MAX` UBTC/UETH on the node) signs the deposit `spotSend` that
+    /// credits the user's spot on the node.
+    pub unit_node_guardian_key: Option<[u8; 32]>,
     /// Hard cap for mock Unit withdrawal release work after Hyperliquid
     /// accepts the source transfer.
     pub unit_withdrawal_release_timeout: Duration,
@@ -399,6 +412,8 @@ impl Default for MockIntegratorConfig {
             hyperliquid_bridge_deposit_latency: Duration::ZERO,
             hyperliquid_bridge_deposit_failure_probability_bps: 0,
             unit_evm_rpc_urls: BTreeMap::new(),
+            unit_node_api_url: None,
+            unit_node_guardian_key: None,
             unit_withdrawal_release_timeout: DEFAULT_MOCK_UNIT_WITHDRAWAL_RELEASE_TIMEOUT,
             mock_service_evm_chains: BTreeMap::new(),
             mock_service_paymasters: BTreeMap::new(),
@@ -520,6 +535,22 @@ impl MockIntegratorConfig {
     pub fn with_unit_evm_rpc_url(mut self, chain: UnitChain, url: impl Into<String>) -> Self {
         self.unit_evm_rpc_urls
             .insert(chain.as_wire_str().to_string(), url.into());
+        self
+    }
+
+    /// Point the Unit mock at the standalone Hyperliquid node. Deposits then
+    /// credit the user's spot on the node via a guardian `spotSend` (signed by
+    /// `guardian_key`), and a background poller settles Unit withdrawals by
+    /// watching the node for the router's incoming spotSends. Omit (leave
+    /// `None`) to keep the in-process [`HyperliquidCore`] path.
+    #[must_use]
+    pub fn with_unit_node(
+        mut self,
+        node_api_url: impl Into<String>,
+        guardian_key: [u8; 32],
+    ) -> Self {
+        self.unit_node_api_url = Some(node_api_url.into());
+        self.unit_node_guardian_key = Some(guardian_key);
         self
     }
 
@@ -1290,6 +1321,8 @@ impl MockIntegratorState {
             operations: Mutex::default(),
             protocol_private_keys: Mutex::default(),
             evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
+            node_api_url: config.unit_node_api_url.clone(),
+            node_guardian_key: config.unit_node_guardian_key,
             withdrawal_release_timeout: config.unit_withdrawal_release_timeout,
             bitcoin_rpc_url: config.unit_bitcoin_rpc_url.clone(),
             bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),

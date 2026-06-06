@@ -1351,3 +1351,413 @@ async fn wait_for_node_clearinghouse_withdrawable(
     }
     observed
 }
+
+/// Phase 3 — the Unit mock's node-path deposit credit. With `with_unit_node`,
+/// completing a Unit deposit no longer credits the in-process core; instead the
+/// guardian (seeded unbounded UETH/UBTC at node genesis) signs a real
+/// `spotSend(guardian -> user)` against the node's `/exchange`, so the node's
+/// own spot ledger holds the deposited balance. The resulting `SpotTransfer`
+/// ledger update on the recipient carries the deposit's destination nonce so
+/// downstream observers can match it.
+#[tokio::test]
+#[ignore = "integration: spawns devnet"]
+async fn unit_node_deposit_credits_node_spot_and_marks_operation_done() {
+    let (devnet, _funding_sats) = RiftDevnet::builder()
+        .using_hyperliquid_node(true)
+        .build()
+        .await
+        .expect("devnet build");
+    let node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("node spawned with using_hyperliquid_node(true)");
+    let node_url = node.url();
+
+    let server = MockIntegratorServer::spawn_with_config(
+        MockIntegratorConfig::default().with_unit_node(node_url.clone(), node.guardian_key()),
+    )
+    .await
+    .expect("spawn mock integrator");
+
+    let info = HyperliquidInfoClient::new(&node_url).expect("info client");
+
+    let destination = Address::repeat_byte(0x39);
+    let generated: serde_json::Value = reqwest::get(format!(
+        "{}/gen/ethereum/hyperliquid/eth/{destination:#x}",
+        server.hyperunit_url()
+    ))
+    .await
+    .expect("gen")
+    .error_for_status()
+    .expect("gen 200")
+    .json()
+    .await
+    .expect("gen json");
+    let protocol_address = generated["address"].as_str().expect("address").to_string();
+
+    // Complete the Unit deposit with a 0.06 ETH source amount. On the node path
+    // this makes the mock's guardian spotSend 0.06 UETH to the destination on the
+    // node — crediting the NODE's spot ledger, not the in-process core.
+    server
+        .complete_unit_operation_with_source_amount(
+            &protocol_address,
+            60_000_000_000_000_000u128.to_string(),
+        )
+        .await
+        .expect("complete unit deposit via node guardian");
+
+    let state = server
+        .unit_operation_state(&protocol_address)
+        .await
+        .expect("operation state");
+    assert_eq!(state, "done", "unit deposit operation should be done");
+
+    let spot: SpotClearinghouseState = info
+        .spot_clearinghouse_state(destination)
+        .await
+        .expect("spotClearinghouseState");
+    let observed = spot.balance_of("UETH").parse::<f64>().unwrap_or(0.0);
+    assert!(
+        (observed - 0.06).abs() < 1e-9,
+        "node UETH spot for destination should be 0.06, got {observed}"
+    );
+
+    // The guardian spotSend stamps the deposit's destination nonce so the node's
+    // recorded SpotTransfer ledger update matches what the Unit deposit observer
+    // expects. Recover that nonce from the operation's destination_tx_hash
+    // (`"{user}:{nonce}"`) and assert an incoming SpotTransfer carries it.
+    let operations = server.unit_operations().await;
+    let operation = operations
+        .iter()
+        .find(|operation| operation.protocol_address == protocol_address)
+        .expect("deposit op");
+    let expected_nonce: u64 = operation
+        .destination_tx_hash
+        .as_deref()
+        .and_then(|hash| hash.rsplit_once(':'))
+        .and_then(|(_, nonce)| nonce.parse::<u64>().ok())
+        .expect("destination_tx_hash nonce");
+    let updates = info
+        .user_non_funding_ledger_updates(destination, 0, None)
+        .await
+        .expect("ledger updates");
+    let credited = updates.iter().any(|u| match &u.delta {
+        UserNonFundingLedgerDelta::SpotTransfer {
+            destination: dest,
+            nonce,
+            ..
+        } => {
+            dest.eq_ignore_ascii_case(&format!("{destination:#x}")) && *nonce == expected_nonce
+        }
+        _ => false,
+    });
+    assert!(
+        credited,
+        "node should record a SpotTransfer ledger update to the recipient with nonce {expected_nonce}: {updates:?}"
+    );
+}
+
+/// Reproduction mirroring the e2e deposit leg with the mock's EVM deposit
+/// indexer driving completion (router funds the protocol address on-chain; the
+/// indexer observes the balance and completes the op, which guardian-spotSends
+/// to the node). Concurrency: two deposits to distinct destinations via the one
+/// guardian, like the matrix runs.
+#[tokio::test]
+#[ignore = "integration: spawns devnet"]
+async fn unit_node_deposit_via_evm_indexer_credits_node() {
+    let (devnet, _funding_sats) = RiftDevnet::builder()
+        .using_hyperliquid_node(true)
+        .build()
+        .await
+        .expect("devnet build");
+    let node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("node spawned with using_hyperliquid_node(true)");
+    let node_url = node.url();
+
+    let server = MockIntegratorServer::spawn_with_config(
+        MockIntegratorConfig::default()
+            .with_unit_node(node_url.clone(), node.guardian_key())
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Ethereum,
+                devnet.ethereum.anvil.endpoint_url().to_string(),
+            ),
+    )
+    .await
+    .expect("spawn mock integrator");
+
+    let info = HyperliquidInfoClient::new(&node_url).expect("info client");
+
+    for dst_byte in [0x39u8, 0x4au8] {
+        let destination = Address::repeat_byte(dst_byte);
+        let generated: serde_json::Value = reqwest::get(format!(
+            "{}/gen/ethereum/hyperliquid/eth/{destination:#x}",
+            server.hyperunit_url()
+        ))
+        .await
+        .expect("gen")
+        .error_for_status()
+        .expect("gen 200")
+        .json()
+        .await
+        .expect("gen json");
+        let protocol_address: Address = generated["address"]
+            .as_str()
+            .expect("protocol address")
+            .parse()
+            .expect("parse protocol address");
+
+        // Fund the protocol address on-chain with 0.06 ETH; the EVM indexer
+        // observes it and completes the op (guardian spotSend to the node).
+        devnet
+            .ethereum
+            .fund_eth_address(protocol_address, U256::from(60_000_000_000_000_000u128))
+            .await
+            .expect("fund protocol address");
+
+        let mut observed = 0.0;
+        for _ in 0..100 {
+            let spot: SpotClearinghouseState = info
+                .spot_clearinghouse_state(destination)
+                .await
+                .expect("spotClearinghouseState");
+            observed = spot.balance_of("UETH").parse::<f64>().unwrap_or(0.0);
+            if (observed - 0.06).abs() < 1e-9 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            (observed - 0.06).abs() < 1e-9,
+            "node UETH spot for {destination:#x} should be 0.06 after EVM-indexer deposit, got {observed}"
+        );
+    }
+}
+
+/// Reproduction for the Unit-withdrawal node poller (PHASE 3): the router does a
+/// `sendAsset` of the withdrawal coin to the Unit protocol address on the node;
+/// the node-withdrawal poller must observe that spot credit and settle the Unit
+/// withdrawal (native release to the destination). Mirrors the e2e ETH
+/// withdrawal leg. Here we credit the protocol address's spot on the node
+/// directly (standing in for the router's sendAsset) and assert the poller
+/// releases native ETH to the recipient.
+#[tokio::test]
+#[ignore = "integration: spawns devnet"]
+async fn unit_node_withdrawal_poller_settles_via_node_spot_credit() {
+    let (devnet, _funding_sats) = RiftDevnet::builder()
+        .using_hyperliquid_node(true)
+        .build()
+        .await
+        .expect("devnet build");
+    let node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("node spawned with using_hyperliquid_node(true)");
+    let node_url = node.url();
+
+    // Destination chain Anvil for the native release.
+    let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
+    let recipient = Address::repeat_byte(0x77);
+    let server = MockIntegratorServer::spawn_with_config(
+        MockIntegratorConfig::default()
+            .with_unit_node(node_url.clone(), node.guardian_key())
+            .with_unit_evm_rpc_url(hyperunit_client::UnitChain::Base, anvil.endpoint())
+            .with_mock_service_evm_chain(anvil.chain_id(), anvil.endpoint()),
+    )
+    .await
+    .expect("spawn mock integrator");
+
+    // gen a hyperliquid->base ETH withdrawal; the protocol address is where the
+    // router's sendAsset deposits UETH on the node.
+    let generated: serde_json::Value = reqwest::get(format!(
+        "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+        server.hyperunit_url()
+    ))
+    .await
+    .expect("gen")
+    .error_for_status()
+    .expect("gen 200")
+    .json()
+    .await
+    .expect("gen json");
+    let protocol_address: Address = generated["address"]
+        .as_str()
+        .expect("protocol address")
+        .parse()
+        .expect("parse protocol address");
+
+    // Stand in for the router's sendAsset: move UETH spot to the protocol
+    // address on the node via a guardian spotSend (the guardian is seeded
+    // unbounded UETH at genesis). The node-withdrawal poller should observe this
+    // spot credit and settle the withdrawal.
+    let guardian = PrivateKeySigner::from_bytes(&node.guardian_key().into())
+        .expect("guardian signer");
+    let exchange =
+        HyperliquidExchangeClient::new(&node_url, guardian, None, Network::Testnet)
+            .expect("exchange client");
+    exchange
+        .spot_send(
+            format!("{protocol_address:#x}"),
+            "UETH:0x0000000000000000000000000000000000000000".to_string(),
+            "1.25".to_string(),
+            1_700_000_000_000,
+        )
+        .await
+        .expect("guardian spotSend to protocol address");
+
+    let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+    let mut released = U256::ZERO;
+    for _ in 0..100 {
+        released = provider
+            .get_balance(recipient)
+            .await
+            .expect("recipient balance");
+        if released > U256::ZERO {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        released,
+        U256::from(1_250_000_000_000_000_000u128),
+        "node-withdrawal poller should release 1.25 ETH to the recipient"
+    );
+
+    let state = server
+        .unit_operation_state(&format!("{protocol_address:#x}"))
+        .await
+        .expect("withdrawal op state");
+    assert_eq!(state, "done", "withdrawal op should be done after poller settles");
+}
+
+/// Regression for the Phase-3 node-withdrawal stall: the router's withdrawal
+/// observer matches the Unit operation on `source_address ==
+/// hyperliquid_custody_vault_address` (the HL account that signed the
+/// `sendAsset`). The node's `sendAsset` is Unit-unaware, so the node-withdrawal
+/// poller is what populates the operation; it MUST thread the real HL sender
+/// (read from the node's `SpotTransfer` ledger update) through as
+/// `source_address`. The pre-fix poller used the protocol address itself, so the
+/// observer never matched and the step hung forever. Here we drive a real
+/// `sendAsset` from a funded "custody vault" signer and assert `/operations`
+/// reports that signer as the operation's `source_address`.
+#[tokio::test]
+#[ignore = "integration: spawns devnet"]
+async fn unit_node_withdrawal_poller_threads_sendasset_signer_as_source_address() {
+    let (devnet, _funding_sats) = RiftDevnet::builder()
+        .using_hyperliquid_node(true)
+        .build()
+        .await
+        .expect("devnet build");
+    let node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("node spawned with using_hyperliquid_node(true)");
+    let node_url = node.url();
+
+    let anvil = Anvil::new().prague().try_spawn().expect("anvil spawn");
+    let recipient = Address::repeat_byte(0x55);
+    let server = MockIntegratorServer::spawn_with_config(
+        MockIntegratorConfig::default()
+            .with_unit_node(node_url.clone(), node.guardian_key())
+            .with_unit_evm_rpc_url(hyperunit_client::UnitChain::Base, anvil.endpoint())
+            .with_mock_service_evm_chain(anvil.chain_id(), anvil.endpoint()),
+    )
+    .await
+    .expect("spawn mock integrator");
+
+    // The HL "custody vault": a distinct signer the router would sign the
+    // withdrawal `sendAsset` from. Seed it UETH on the node by having the
+    // genesis-funded guardian spotSend to it (the node's only public funding
+    // primitive), so it can then transfer to the protocol address.
+    let custody_vault = PrivateKeySigner::random();
+    let custody_vault_address = custody_vault.address();
+    let guardian = PrivateKeySigner::from_bytes(&node.guardian_key().into())
+        .expect("guardian signer");
+    let guardian_exchange =
+        HyperliquidExchangeClient::new(&node_url, guardian, None, Network::Testnet)
+            .expect("guardian exchange client");
+    guardian_exchange
+        .spot_send(
+            format!("{custody_vault_address:#x}"),
+            "UETH:0x0000000000000000000000000000000000000000".to_string(),
+            "2".to_string(),
+            1_700_000_000_000,
+        )
+        .await
+        .expect("guardian spotSend funds custody vault");
+
+    let generated: serde_json::Value = reqwest::get(format!(
+        "{}/gen/hyperliquid/base/eth/{recipient:#x}",
+        server.hyperunit_url()
+    ))
+    .await
+    .expect("gen")
+    .error_for_status()
+    .expect("gen 200")
+    .json()
+    .await
+    .expect("gen json");
+    let protocol_address: Address = generated["address"]
+        .as_str()
+        .expect("protocol address")
+        .parse()
+        .expect("parse protocol address");
+
+    // The router's withdrawal action: a spot->spot `sendAsset` of UETH from the
+    // custody vault to the protocol address on the node.
+    let exchange = HyperliquidExchangeClient::new(
+        &node_url,
+        custody_vault,
+        None,
+        Network::Testnet,
+    )
+    .expect("exchange client");
+    exchange
+        .send_asset(
+            format!("{protocol_address:#x}"),
+            "spot".to_string(),
+            "spot".to_string(),
+            "UETH:0x0000000000000000000000000000000000000000".to_string(),
+            "1.25".to_string(),
+            1_700_000_000_001,
+        )
+        .await
+        .expect("custody-vault sendAsset to protocol address");
+
+    // Poll `/operations/{protocol_address}` until the poller settles it, then
+    // assert the operation carries the custody vault as `source_address` (what
+    // the router's observer matches on) — not the protocol address.
+    let mut last: Option<hyperunit_client::UnitOperation> = None;
+    for _ in 0..100 {
+        let response: hyperunit_client::UnitOperationsResponse = reqwest::get(format!(
+            "{}/operations/{protocol_address:#x}",
+            server.hyperunit_url()
+        ))
+        .await
+        .expect("operations")
+        .error_for_status()
+        .expect("operations 200")
+        .json()
+        .await
+        .expect("operations json");
+        if let Some(op) = response.operations.into_iter().next() {
+            let done = op.state.as_deref() == Some("done");
+            last = Some(op);
+            if done {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let op = last.expect("poller should produce a withdrawal operation");
+    assert_eq!(op.state.as_deref(), Some("done"), "operation: {op:?}");
+    assert_eq!(
+        op.source_address
+            .as_deref()
+            .map(|address| address.to_ascii_lowercase()),
+        Some(format!("{custody_vault_address:#x}")),
+        "withdrawal source_address must be the HL sendAsset signer (custody vault), got {:?}",
+        op.source_address
+    );
+}

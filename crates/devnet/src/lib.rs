@@ -11,7 +11,9 @@ pub mod token_indexerd;
 pub use bitcoin_devnet::BitcoinDevnet;
 use blockchain_utils::P2WPKHBitcoinWallet;
 pub use evm_devnet::EthDevnet;
-pub use hyperliquid_devnet::{HyperliquidNode, HyperliquidNodeConfig};
+pub use hyperliquid_devnet::{
+    HyperliquidNode, HyperliquidNodeConfig, HYPERLIQUID_GUARDIAN_PRIVATE_KEY,
+};
 pub use manifest::{
     deterministic_loadgen_evm_accounts, DevnetEvmAccount, DevnetManifest, DEVNET_ARBITRUM_RPC_PORT,
     DEVNET_ARBITRUM_TOKEN_INDEXER_PORT, DEVNET_BASE_RPC_PORT, DEVNET_BASE_TOKEN_INDEXER_PORT,
@@ -646,9 +648,10 @@ pub struct RiftDevnet {
     pub arbitrum: Arc<EthDevnet>,
     /// The standalone, RiftDevnet-owned Hyperliquid node (its own
     /// `HyperliquidCore` + dedicated `/info`+`/exchange` server). Present
-    /// whenever the venue mocks are (`using_mock_integrators`). This is the
-    /// additive, dual peer of the venue mock's `/hyperliquid` nest; the live
-    /// path does not consume it this phase.
+    /// whenever `using_hyperliquid_node` resolves true — which defaults to
+    /// `using_mock_integrators` but can be set independently. This is the
+    /// additive, dual peer of the venue mock's `/hyperliquid` nest; the devnet
+    /// e2e consumes it (live/phala stay on the real HL API).
     pub hyperliquid: Option<HyperliquidNode>,
     pub loadgen_evm_accounts: Vec<DevnetEvmAccount>,
     pub mock_integrators: Option<mock_integrators::MockIntegratorServer>,
@@ -676,6 +679,11 @@ pub struct RiftDevnetBuilder {
     fork_config: Option<ForkConfig>,
     using_esplora: bool,
     using_mock_integrators: bool,
+    /// When set, overrides whether the standalone Hyperliquid node spawns. When
+    /// `None`, the node tracks `using_mock_integrators` (the historical
+    /// behavior), so existing callers are unchanged. Set independently to spawn
+    /// the node without — or suppress it with — the venue mocks.
+    using_hyperliquid_node: Option<bool>,
     token_indexer_database_url: Option<String>,
     bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode,
     loadgen_evm_account_count: usize,
@@ -698,6 +706,7 @@ impl RiftDevnetBuilder {
             fork_config: None,
             using_esplora: true,
             using_mock_integrators: false,
+            using_hyperliquid_node: None,
             token_indexer_database_url: None,
             bitcoin_mining_mode: crate::bitcoin_devnet::MiningMode::default(),
             loadgen_evm_account_count: 0,
@@ -721,6 +730,17 @@ impl RiftDevnetBuilder {
     /// Start local provider mocks alongside the interactive devnet.
     pub fn using_mock_integrators(mut self, value: bool) -> Self {
         self.using_mock_integrators = value;
+        self
+    }
+
+    /// Override whether the standalone Hyperliquid node spawns. By default the
+    /// node tracks [`using_mock_integrators`](Self::using_mock_integrators); set
+    /// this to spawn the node independently (e.g. so the e2e suite can point
+    /// the router/sauron/hl-shim/Unit mock at the node's `/info`+`/exchange`).
+    /// The node always wires its own Bridge2 against the (always-present)
+    /// Arbitrum chain.
+    pub fn using_hyperliquid_node(mut self, value: bool) -> Self {
+        self.using_hyperliquid_node = Some(value);
         self
     }
 
@@ -1145,7 +1165,15 @@ impl RiftDevnetBuilder {
         // after the Arbitrum chain is up and `evm_devnet` has deployed Bridge2
         // (the deterministic `hyperliquid_bridge_address(Testnet)` is live), so
         // the node's bridge indexer connects to an already-deployed contract.
-        let hyperliquid = if self.using_mock_integrators {
+        // The node spawns when `using_hyperliquid_node` resolves true; that
+        // flag defaults to `using_mock_integrators` so existing callers are
+        // unchanged, but the e2e can enable the node on its own. The Arbitrum
+        // chain + Bridge2 are deployed unconditionally above, so the node's
+        // bridge wiring is always satisfiable whenever it is enabled.
+        let using_hyperliquid_node = self
+            .using_hyperliquid_node
+            .unwrap_or(self.using_mock_integrators);
+        let hyperliquid = if using_hyperliquid_node {
             // Release signer: the Arbitrum Anvil account-0 — a known-funded key
             // (pre-funded with ETH, the mock-USDC master minter). Mirrors how
             // the venue mock obtains a funded signer for its on-chain release.
