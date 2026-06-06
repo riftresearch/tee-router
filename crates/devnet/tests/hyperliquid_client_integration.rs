@@ -17,9 +17,12 @@ use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
+use devnet::evm_devnet::ARBITRUM_USDC_ADDRESS;
 use devnet::mock_integrators::MockHyperliquidBridge2::MockHyperliquidBridge2Instance;
 use devnet::mock_integrators::{MockIntegratorConfig, MockIntegratorServer};
+use devnet::RiftDevnet;
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
+use serde_json::{json, Value};
 use hyperliquid_client::{
     client::Network, CancelRequest, ClearinghouseState, HyperliquidClient,
     HyperliquidExchangeClient, HyperliquidInfoClient, Limit, Order, OrderRequest,
@@ -1219,4 +1222,132 @@ async fn ubtc_to_ueth_round_trip_swaps_balances() {
 
     assert!((server.hyperliquid_balance_of(user, "USDC").await).abs() < 1e-6);
     assert!((server.hyperliquid_balance_of(user, "UETH").await - 10.0).abs() < 1e-9);
+}
+
+/// Phase 2 — the standalone Hyperliquid **node**'s OWN Bridge2 deposit indexer.
+///
+/// Spins up a full `RiftDevnet` (Arbitrum Anvil + the deterministic Bridge2 +
+/// the node, all gated behind `using_mock_integrators`), transfers USDC into the
+/// Bridge2 address on the Arbitrum chain, and asserts the **node's** own
+/// clearinghouse (read over the node's real `/info` HTTP endpoint) credits the
+/// depositor. This is independent of, and dual to, the venue mock — both watch
+/// the same Bridge2; this assertion only reads the node's ledger.
+///
+/// Ignored by default: it spawns a full devnet (Bitcoin regtest + 3 Anvil
+/// chains + the mock integrator server + the node), which is heavier than the
+/// `MockIntegratorServer`-only tests above.
+#[tokio::test]
+#[ignore = "integration: spawns devnet"]
+async fn node_bridge_deposit_credits_node_clearinghouse() {
+    let (devnet, _funding_sats) = RiftDevnet::builder()
+        .using_mock_integrators(true)
+        .build()
+        .await
+        .expect("devnet build");
+
+    let node = devnet
+        .hyperliquid
+        .as_ref()
+        .expect("node spawned with mock integrators");
+    let node_url = node.url();
+
+    // The node watches the SAME deterministic Bridge2 the venue mock watches.
+    let bridge_address = hyperliquid_client::bridge_address(Network::Testnet);
+    let usdc_address: Address = ARBITRUM_USDC_ADDRESS.parse().expect("usdc address");
+
+    // Depositor = the Arbitrum funded account-0 (a configured mock-USDC minter).
+    let depositor = devnet.arbitrum.funded_address;
+    let amount_raw = U256::from(10_000_000u64); // 10 USDC, above the 5 USDC minimum.
+
+    // Mint USDC to the depositor, then transfer it into the Bridge2 address.
+    // The transfer's `Transfer(from = depositor, to = bridge)` log is exactly
+    // what the node's bridge indexer observes and credits.
+    let usdc = GenericEIP3009ERC20Instance::new(usdc_address, devnet.arbitrum.funded_provider.clone());
+    usdc.mint(depositor, amount_raw)
+        .send()
+        .await
+        .expect("mint usdc send")
+        .get_receipt()
+        .await
+        .expect("mint usdc receipt");
+    usdc.transfer(bridge_address, amount_raw)
+        .send()
+        .await
+        .expect("transfer to bridge send")
+        .get_receipt()
+        .await
+        .expect("transfer to bridge receipt");
+
+    // Poll the NODE's own /info clearinghouseState for the credit.
+    let observed = wait_for_node_clearinghouse_withdrawable(&node_url, depositor, 10.0).await;
+    assert!(
+        (observed - 10.0).abs() < 1e-9,
+        "node clearinghouse withdrawable should be 10.0 after a 10 USDC Bridge2 deposit, got {observed}"
+    );
+
+    // Phase 2 — withdraw3 → on-chain Bridge2 release. Withdraw 6 USDC from the
+    // node's clearinghouse to a fresh destination; the node debits the
+    // clearinghouse AND submits the Bridge2 `release` on-chain, paying out
+    // (gross - 1 USDC fee) = 5 USDC of real USDC to the destination.
+    let depositor_key: [u8; 32] = devnet.arbitrum.anvil.keys()[0].clone().to_bytes().into();
+    let depositor_wallet = PrivateKeySigner::from_bytes(&depositor_key.into()).expect("depositor key");
+    let withdraw_destination = Address::repeat_byte(0x77);
+    let exchange = HyperliquidExchangeClient::new(&node_url, depositor_wallet, None, Network::Testnet)
+        .expect("exchange client");
+    let withdraw_resp = exchange
+        .withdraw_to_bridge(
+            format!("{withdraw_destination:#x}"),
+            "6".to_string(),
+            1_700_000_000_000,
+        )
+        .await
+        .expect("withdraw3");
+    assert_eq!(withdraw_resp["status"], "ok", "withdraw3 accepted: {withdraw_resp}");
+
+    // The node debited the full 6 USDC gross from its clearinghouse: 10 - 6 = 4.
+    let after_withdraw = wait_for_node_clearinghouse_withdrawable(&node_url, depositor, 4.0).await;
+    assert!(
+        (after_withdraw - 4.0).abs() < 1e-9,
+        "node clearinghouse should be 4.0 after withdrawing 6 gross USDC, got {after_withdraw}"
+    );
+
+    // The on-chain Bridge2 release paid out (6 - 1 fee) = 5 USDC to destination.
+    let expected_payout = U256::from(5_000_000u64);
+    let paid = wait_for_token_balance(&usdc, withdraw_destination, expected_payout).await;
+    assert_eq!(
+        paid, expected_payout,
+        "Bridge2 release should pay 5 USDC on-chain to the withdrawal destination"
+    );
+}
+
+async fn wait_for_node_clearinghouse_withdrawable(
+    node_url: &str,
+    user: Address,
+    expected: f64,
+) -> f64 {
+    let client = reqwest::Client::new();
+    let mut observed = 0.0;
+    for _ in 0..100 {
+        let state: Value = client
+            .post(format!("{node_url}/info"))
+            .json(&json!({
+                "type": "clearinghouseState",
+                "user": format!("{user:#x}"),
+            }))
+            .send()
+            .await
+            .expect("POST /info clearinghouseState")
+            .json()
+            .await
+            .expect("clearinghouseState json");
+        observed = state["withdrawable"]
+            .as_str()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if (observed - expected).abs() < 1e-9 {
+            return observed;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    observed
 }

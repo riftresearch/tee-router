@@ -23,24 +23,35 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use alloy::{
     hex,
-    primitives::{Address, U256},
+    network::EthereumWallet,
+    primitives::{Address, Bytes, B256, U256},
+    providers::{DynProvider, Provider, ProviderBuilder},
+    rpc::types::Filter,
+    signers::local::PrivateKeySigner,
+    sol_types::{SolCall, SolEvent},
 };
 use axum::{
     extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
 };
+use chrono::Utc;
 use hyperliquid_client::{
     recover_l1_signer, recover_typed_signer, Actions, SendAsset, SpotSend, UsdClassTransfer,
-    UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, Withdraw3,
+    UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, task::JoinHandle};
 
-use crate::hyperliquid_core::{hyperliquid_has_sufficient_amount, HyperliquidCore};
+use crate::hyperliquid_core::{
+    format_hl_amount, hyperliquid_has_sufficient_amount, HyperliquidCore,
+};
+use crate::mock_integrators::hyperliquid_bridge::contract::MockHyperliquidBridge2;
+use crate::mock_integrators::{mock_evm_indexer_initial_last_scanned, IERC20, IMockMintableERC20};
 
 /// The Unit "guardian" HL account seeded at node genesis. This account is
 /// credited with effectively unbounded spot UBTC / UETH so that — in a later
@@ -63,7 +74,19 @@ const GUARDIAN_GENESIS_BALANCE: f64 = u32::MAX as f64;
 const HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW: u64 = 1_000_000;
 
 /// Configuration for a [`HyperliquidNode`].
-#[derive(Debug, Clone, Default)]
+///
+/// The bridge-wiring fields ([`arbitrum_rpc_url`](Self::arbitrum_rpc_url),
+/// [`bridge_address`](Self::bridge_address),
+/// [`usdc_token_address`](Self::usdc_token_address),
+/// [`release_signer_key`](Self::release_signer_key)) are all `Option` so a
+/// Phase-1 caller (or a unit test) without a chain still gets a fully working
+/// node — it just runs *without* its own Bridge2 deposit indexer and `withdraw3`
+/// stays a clearinghouse-only debit. When **all four** are present, the node
+/// spawns its OWN Bridge2 deposit indexer and completes `withdraw3` with the
+/// on-chain Bridge2 `release`. This is independent of (and dual to) the venue
+/// mock's bridge wiring: both observe the same Bridge2 on the Arbitrum Anvil
+/// chain, each crediting its own [`HyperliquidCore`].
+#[derive(Clone, Default)]
 pub struct HyperliquidNodeConfig {
     /// TCP port to bind. `None` binds an ephemeral OS-assigned port (mirroring
     /// the venue mock); `Some(p)` binds that fixed port (mirroring
@@ -72,6 +95,42 @@ pub struct HyperliquidNodeConfig {
     /// Treat signatures as mainnet (`true`) or testnet (`false`). Devnet runs
     /// testnet.
     pub mainnet: bool,
+    /// JSON-RPC URL of the Arbitrum Anvil chain hosting the Bridge2 contract.
+    pub arbitrum_rpc_url: Option<String>,
+    /// The deterministic Bridge2 (`MockHyperliquidBridge2`) address on Arbitrum.
+    pub bridge_address: Option<Address>,
+    /// The Arbitrum USDC token address Bridge2 deposits / releases move.
+    pub usdc_token_address: Option<Address>,
+    /// Raw secp256k1 scalar of the on-chain release signer. Mirrors the mock's
+    /// signer mechanism: a *known funded key* (the Arbitrum Anvil account-0,
+    /// which is pre-funded with ETH and is the mock-USDC master minter) used to
+    /// mint the payout to the bridge and submit the Bridge2 `release` tx.
+    pub release_signer_key: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for HyperliquidNodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperliquidNodeConfig")
+            .field("port", &self.port)
+            .field("mainnet", &self.mainnet)
+            .field("arbitrum_rpc_url", &self.arbitrum_rpc_url)
+            .field("bridge_address", &self.bridge_address)
+            .field("usdc_token_address", &self.usdc_token_address)
+            .field("release_signer_key", &self.release_signer_key.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// The bridge-release wiring the node's `withdraw3` handler needs to submit the
+/// on-chain Bridge2 `release` after debiting the clearinghouse. Cloned into the
+/// HTTP state so handlers can reach it; `None` when the node was spawned without
+/// a chain (Phase-1 callers / unit tests).
+#[derive(Clone)]
+struct NodeBridgeReleaseWiring {
+    arbitrum_rpc_url: String,
+    bridge_address: Address,
+    usdc_token_address: Address,
+    release_signer_key: [u8; 32],
 }
 
 /// The Hyperliquid devnet node: its own [`HyperliquidCore`] ledger plus a
@@ -92,13 +151,25 @@ pub struct HyperliquidNode {
     /// The serving task handle, kept alive for the node's lifetime.
     #[allow(dead_code)]
     handle: JoinHandle<()>,
+    /// Graceful-shutdown trigger for the node's OWN Bridge2 deposit indexer
+    /// (sent on `Drop`). `None` when spawned without a chain.
+    bridge_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The node's OWN Bridge2 deposit-indexer task handle, kept alive for the
+    /// node's lifetime. `None` when spawned without a chain.
+    #[allow(dead_code)]
+    bridge_indexer_handle: Option<JoinHandle<()>>,
 }
 
-/// Shared HTTP state for the node's handlers: the node's own ledger plus the
-/// mainnet-signing flag. Thin by design — the node has no Unit / Bridge2 wiring.
+/// Shared HTTP state for the node's handlers: the node's own ledger, the
+/// mainnet-signing flag, and (when wired) the Bridge2 release wiring its
+/// `withdraw3` handler uses to perform the on-chain payout. The node has no Unit
+/// wiring; the bridge wiring is the node's OWN, dual to the venue mock's.
 struct HyperliquidNodeState {
     core: Arc<HyperliquidCore>,
     mainnet: bool,
+    /// `None` when spawned without a chain — `withdraw3` then stays a
+    /// clearinghouse-only debit (Phase-1 behavior).
+    bridge_release: Option<NodeBridgeReleaseWiring>,
 }
 
 impl HyperliquidNode {
@@ -128,9 +199,61 @@ impl HyperliquidNode {
             hl.credit_spot(guardian_address, "UETH", GUARDIAN_GENESIS_BALANCE);
         }
 
+        // The node's OWN Bridge2 release wiring. Present only when the caller
+        // supplied all four pieces (RPC, bridge, USDC, signer key). This is
+        // independent of the venue mock's wiring — both watch the same Bridge2.
+        let bridge_release = match (
+            config.arbitrum_rpc_url.clone(),
+            config.bridge_address,
+            config.usdc_token_address,
+            config.release_signer_key,
+        ) {
+            (
+                Some(arbitrum_rpc_url),
+                Some(bridge_address),
+                Some(usdc_token_address),
+                Some(release_signer_key),
+            ) => Some(NodeBridgeReleaseWiring {
+                arbitrum_rpc_url,
+                bridge_address,
+                usdc_token_address,
+                release_signer_key,
+            }),
+            _ => None,
+        };
+
+        // Spawn the node's OWN Bridge2 deposit indexer when the bridge is wired.
+        // It watches the same Bridge2 the venue mock watches, but credits THIS
+        // node's core. Managed (shutdown + handle) like the axum server below.
+        let (bridge_indexer_shutdown, bridge_indexer_handle) = match &bridge_release {
+            Some(wiring) => {
+                let provider: DynProvider = ProviderBuilder::new()
+                    .connect(&wiring.arbitrum_rpc_url)
+                    .await
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("hyperliquid node bridge indexer RPC init failed: {err}"),
+                        )
+                    })?
+                    .erased();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(run_node_bridge_deposit_indexer(
+                    provider,
+                    wiring.usdc_token_address,
+                    wiring.bridge_address,
+                    core.clone(),
+                    rx,
+                ));
+                (Some(tx), Some(handle))
+            }
+            None => (None, None),
+        };
+
         let state = Arc::new(HyperliquidNodeState {
             core: core.clone(),
             mainnet: config.mainnet,
+            bridge_release,
         });
         let app = router().with_state(state);
 
@@ -152,6 +275,8 @@ impl HyperliquidNode {
             url: format!("http://{addr}"),
             shutdown: Some(shutdown_tx),
             handle,
+            bridge_indexer_shutdown,
+            bridge_indexer_handle,
         })
     }
 
@@ -180,15 +305,134 @@ impl Drop for HyperliquidNode {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Some(shutdown) = self.bridge_indexer_shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
 /// The guardian HL account address, derived once from the well-known devnet key.
 fn guardian_address() -> Address {
     let signer =
-        alloy::signers::local::PrivateKeySigner::from_bytes(&HYPERLIQUID_GUARDIAN_PRIVATE_KEY.into())
+        PrivateKeySigner::from_bytes(&HYPERLIQUID_GUARDIAN_PRIVATE_KEY.into())
             .expect("static guardian key bytes are a valid secp256k1 scalar");
     signer.address()
+}
+
+/// The node's OWN Bridge2 deposit indexer. Watches the USDC `Transfer` log on
+/// the Arbitrum Anvil chain, filters for transfers *into* the Bridge2 address,
+/// and credits THIS node's [`HyperliquidCore`] clearinghouse (plus a ledger
+/// update) — exactly the same observation the venue mock's
+/// [`run_hyperliquid_bridge_indexer`](crate::mock_integrators::hyperliquid_bridge)
+/// performs, but on the node's own core. The two are independent and dual: both
+/// observe the same Bridge2, each crediting its own ledger.
+///
+/// Unlike the venue mock, the node is a plain observer: no latency / failure
+/// injection (those are mock-server tunables). Returns on `shutdown`.
+async fn run_node_bridge_deposit_indexer(
+    provider: DynProvider,
+    token_address: Address,
+    bridge_address: Address,
+    core: Arc<HyperliquidCore>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
+    let signature: B256 = IERC20::Transfer::SIGNATURE_HASH;
+    let poll = Duration::from_millis(100);
+    let mut last_scanned: u64 = mock_evm_indexer_initial_last_scanned();
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tokio::time::sleep(poll) => {}
+        }
+        let head = match provider.get_block_number().await {
+            Ok(head) => head,
+            Err(err) => {
+                tracing::warn!(%err, "hyperliquid node bridge indexer: get_block_number failed");
+                continue;
+            }
+        };
+        if head <= last_scanned {
+            continue;
+        }
+        let filter = Filter::new()
+            .address(token_address)
+            .event_signature(signature)
+            .from_block(last_scanned + 1)
+            .to_block(head);
+        let logs = match provider.get_logs(&filter).await {
+            Ok(logs) => logs,
+            Err(err) => {
+                tracing::warn!(%err, "hyperliquid node bridge indexer: get_logs failed");
+                continue;
+            }
+        };
+        for log in logs {
+            let decoded = match IERC20::Transfer::decode_log(&log.inner) {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!(%err, "hyperliquid node bridge indexer: decode Transfer failed");
+                    continue;
+                }
+            };
+            let event = decoded.data;
+            if event.to != bridge_address {
+                continue;
+            }
+            if event.value < U256::from(MINIMUM_BRIDGE_DEPOSIT_USDC) {
+                tracing::debug!(
+                    from = %event.from,
+                    amount = %event.value,
+                    "hyperliquid node bridge indexer: ignoring sub-minimum bridge deposit"
+                );
+                continue;
+            }
+            let Some(amount) = raw_usdc_to_natural_f64(event.value) else {
+                tracing::warn!(
+                    from = %event.from,
+                    amount = %event.value,
+                    "hyperliquid node bridge indexer: failed to convert transfer value"
+                );
+                continue;
+            };
+            let tx_hash = log
+                .transaction_hash
+                .map(|hash| format!("{hash:#x}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "0x{}",
+                        hex::encode(Sha256::digest(format!(
+                            "node-hl-deposit:{}:{}",
+                            event.from, event.value
+                        )))
+                    )
+                });
+            let mut hl = core.lock().await;
+            hl.credit_clearinghouse(event.from, "USDC", amount);
+            hl.record_ledger_update(
+                event.from,
+                UserNonFundingLedgerUpdate {
+                    time: Utc::now().timestamp_millis().max(0) as u64,
+                    hash: tx_hash.clone(),
+                    delta: UserNonFundingLedgerDelta::Deposit {
+                        usdc: format_hl_amount(amount),
+                    },
+                },
+            );
+            drop(hl);
+            tracing::debug!(
+                user = %event.from,
+                amount,
+                tx_hash,
+                "hyperliquid node bridge indexer: credited clearinghouse deposit"
+            );
+        }
+        last_scanned = head;
+    }
+}
+
+fn raw_usdc_to_natural_f64(value: U256) -> Option<f64> {
+    let raw: u128 = value.try_into().ok()?;
+    Some(raw as f64 / 1_000_000.0)
 }
 
 /// Builds the node's router: the same `/info` + `/exchange` routes Hyperliquid
@@ -790,12 +1034,84 @@ async fn handle_withdraw3(
             },
         },
     );
-    // TODO(phase 2): release `amount_raw - HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW`
-    // to `destination` on the Arbitrum Bridge2 contract. The bridge moves into
-    // the node next phase; for now this is a clearinghouse-only debit and the
-    // on-chain release is intentionally not wired.
+    drop(hl);
+
+    // Phase 2: release `amount_raw - fee` to `destination` on the Arbitrum
+    // Bridge2 contract — the node now owns this on-chain effect. Mirrors the
+    // venue mock's `send_mock_hyperliquid_withdrawal_release`: mint the payout
+    // to the bridge, then submit the Bridge2 `release` tx. The node uses its OWN
+    // known-funded release signer (instead of the mock's EIP-7702 paymaster). No
+    // bridge wiring => clearinghouse-only debit (Phase-1 behavior preserved).
+    let payout_raw = amount_raw - HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW;
+    if let Some(wiring) = state.bridge_release.clone() {
+        tokio::spawn(async move {
+            if let Err(err) =
+                send_node_bridge_withdrawal_release(&wiring, destination, payout_raw).await
+            {
+                tracing::warn!(
+                    %err,
+                    %destination,
+                    payout_raw,
+                    "hyperliquid node withdraw release failed"
+                );
+            }
+        });
+    }
 
     Json(json!({ "status": "ok", "response": { "type": "default" } })).into_response()
+}
+
+/// Submits the node's OWN on-chain Bridge2 withdrawal release: mints `payout_raw`
+/// USDC to the bridge (the bridge must hold the funds it `transfer`s out), then
+/// calls Bridge2 `release(destination, payout_raw)`. Mirrors the venue mock's
+/// [`send_mock_hyperliquid_withdrawal_release`](crate::mock_integrators::hyperliquid_bridge)
+/// — same two-step mint+release against the SAME bridge bindings
+/// ([`MockHyperliquidBridge2`]) — but signs with the node's known-funded release
+/// key (the Arbitrum Anvil account-0, the mock-USDC master minter) via a plain
+/// wallet provider, rather than the mock-server's EIP-7702 paymaster.
+async fn send_node_bridge_withdrawal_release(
+    wiring: &NodeBridgeReleaseWiring,
+    destination: Address,
+    payout_raw: u64,
+) -> Result<(), String> {
+    let signer = PrivateKeySigner::from_bytes(&wiring.release_signer_key.into())
+        .map_err(|err| format!("invalid hyperliquid node release signer key: {err}"))?;
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::new(signer))
+        .connect(&wiring.arbitrum_rpc_url)
+        .await
+        .map_err(|err| format!("hyperliquid node release RPC init failed: {err}"))?;
+
+    // 1) Fund the bridge with the payout so its `release` `transfer` succeeds.
+    let mint_calldata = Bytes::from(
+        IMockMintableERC20::mintCall {
+            recipient: wiring.bridge_address,
+            amount: U256::from(payout_raw),
+        }
+        .abi_encode(),
+    );
+    let mint = alloy::rpc::types::TransactionRequest::default()
+        .to(wiring.usdc_token_address)
+        .input(mint_calldata.into());
+    provider
+        .send_transaction(mint)
+        .await
+        .map_err(|err| format!("hyperliquid node release mint submit failed: {err}"))?
+        .get_receipt()
+        .await
+        .map_err(|err| format!("hyperliquid node release mint receipt failed: {err}"))?;
+
+    // 2) Call Bridge2 `release(destination, payout_raw)` via the shared bindings.
+    let bridge = MockHyperliquidBridge2::new(wiring.bridge_address, provider);
+    bridge
+        .release(destination, payout_raw)
+        .send()
+        .await
+        .map_err(|err| format!("hyperliquid node bridge release submit failed: {err}"))?
+        .get_receipt()
+        .await
+        .map_err(|err| format!("hyperliquid node bridge release receipt failed: {err}"))?;
+    Ok(())
 }
 
 /// The plain token symbol from a HL wire token string (`"SYMBOL:0x..."`).

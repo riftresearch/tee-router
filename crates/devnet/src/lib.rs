@@ -1134,13 +1134,34 @@ impl RiftDevnetBuilder {
 
         // Spawn the standalone Hyperliquid node alongside the venue mocks. It is
         // additive and dual: an independent, RiftDevnet-owned service with its
-        // own `HyperliquidCore`, not wired into the live settlement path this
-        // phase. Reuse the same gate as the venue mocks.
+        // own `HyperliquidCore`. As of Phase 2 it also owns its OWN Bridge2
+        // deposit indexer + on-chain `withdraw3` release, watching the SAME
+        // Bridge2 the venue mock watches on the Arbitrum Anvil chain and
+        // crediting/debiting its own core. The venue mock's bridge wiring is
+        // untouched; the live settlement path still uses the mock. Reuse the
+        // same gate as the venue mocks.
+        //
+        // ORDERING: this runs after `setup_mock_integrators`, which itself runs
+        // after the Arbitrum chain is up and `evm_devnet` has deployed Bridge2
+        // (the deterministic `hyperliquid_bridge_address(Testnet)` is live), so
+        // the node's bridge indexer connects to an already-deployed contract.
         let hyperliquid = if self.using_mock_integrators {
+            // Release signer: the Arbitrum Anvil account-0 — a known-funded key
+            // (pre-funded with ETH, the mock-USDC master minter). Mirrors how
+            // the venue mock obtains a funded signer for its on-chain release.
+            let release_signer_key: [u8; 32] =
+                arbitrum_devnet.anvil.keys()[0].clone().to_bytes().into();
+            let usdc_token_address = ARBITRUM_USDC_ADDRESS.parse().map_err(|error| {
+                eyre::eyre!("[devnet builder] invalid Arbitrum USDC address: {error}")
+            })?;
             Some(
                 HyperliquidNode::spawn_with_config(HyperliquidNodeConfig {
                     port: None,
                     mainnet: false,
+                    arbitrum_rpc_url: Some(arbitrum_devnet.anvil.endpoint()),
+                    bridge_address: Some(hyperliquid_bridge_address(HyperliquidNetwork::Testnet)),
+                    usdc_token_address: Some(usdc_token_address),
+                    release_signer_key: Some(release_signer_key),
                 })
                 .await
                 .map_err(|error| {
