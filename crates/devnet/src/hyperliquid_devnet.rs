@@ -305,6 +305,47 @@ impl HyperliquidNode {
     pub(crate) fn core(&self) -> &Arc<HyperliquidCore> {
         &self.core
     }
+
+    // --- Public test-helper accessors over the node's own HyperliquidCore. ---
+    //
+    // These mirror the venue mock's `MockIntegratorServer` HL accessors
+    // byte-for-byte in unit/type semantics so external-crate test suites that
+    // migrate from the mock to the node translate 1:1 (only the receiver
+    // changes). All amounts/balances are NATURAL units (e.g. `1.0` UBTC,
+    // `100.0` USDC), matching `credit_spot` / `spot_total` /
+    // `credit_clearinghouse` / `clearinghouse_total` on `HyperliquidCore`.
+
+    /// Seed `amount` of `coin` (e.g. "UETH", "UBTC", "USDC") into `user`'s spot
+    /// balance. Mirrors `MockIntegratorServer::credit_hyperliquid_balance`.
+    /// Used to fund an account before placing orders without a deposit flow.
+    pub async fn seed_spot(&self, user: Address, coin: &str, amount: f64) {
+        self.core.lock().await.credit_spot(user, coin, amount);
+    }
+
+    /// Seed `amount` of USDC collateral into `user`'s clearinghouse balance —
+    /// the surface real Bridge2 deposits land on. Mirrors
+    /// `MockIntegratorServer::credit_hyperliquid_clearinghouse_balance` with the
+    /// coin fixed to "USDC" (the only clearinghouse coin that matters).
+    pub async fn seed_clearinghouse(&self, user: Address, amount: f64) {
+        self.core
+            .lock()
+            .await
+            .credit_clearinghouse(user, "USDC", amount);
+    }
+
+    /// Read `user`'s `coin` spot `total` balance (natural units). Returns 0.0
+    /// when absent. Mirrors `MockIntegratorServer::hyperliquid_balance_of`.
+    pub async fn spot_balance_of(&self, user: Address, coin: &str) -> f64 {
+        self.core.lock().await.spot_total(user, coin)
+    }
+
+    /// Read `user`'s `coin` clearinghouse balance (natural units). Returns 0.0
+    /// when absent. Mirrors
+    /// `MockIntegratorServer::hyperliquid_clearinghouse_balance_of` (which takes
+    /// the coin explicitly; callers pass "USDC").
+    pub async fn clearinghouse_balance_of(&self, user: Address, coin: &str) -> f64 {
+        self.core.lock().await.clearinghouse_total(user, coin)
+    }
 }
 
 impl Drop for HyperliquidNode {

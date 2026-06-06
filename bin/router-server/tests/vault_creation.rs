@@ -13,7 +13,7 @@ use chains::{
 use chrono::Utc;
 use devnet::{
     mock_integrators::{MockAddressRiskLevel, MockIntegratorConfig, MockIntegratorServer},
-    RiftDevnet,
+    HyperliquidNode, RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
@@ -43,6 +43,7 @@ use router_core::{
         asset_registry::{AssetRegistry, ProviderId},
         custody_action_executor::{
             ChainCall, CustodyAction, CustodyActionExecutor, CustodyActionRequest, EvmCall,
+            PaymasterRegistry,
         },
         market_order_planner::MarketOrderRoutePlanner,
         pricing::PricingSnapshot,
@@ -207,6 +208,36 @@ impl TestHarness {
 
     fn arbitrum_spawned_api_paymaster_private_key(&self) -> String {
         self.with_devnet(|devnet| anvil_spawned_api_paymaster_private_key(&devnet.arbitrum))
+    }
+
+    /// Mirror the production `quote_paymaster_registry` (see `app.rs`) for the
+    /// shared harness: register the EVM paymaster address (account #9, the gas
+    /// sponsor wired into `harness().chain_registry`) for every EVM chain. The
+    /// planner's `ensure_paymasters_can_fund_path` requires a registered
+    /// paymaster for each chain in the route, so any `OrderManager` that quotes
+    /// an EVM-paymaster route must be built `.with_paymasters(this)`.
+    fn harness_paymaster_registry(&self) -> PaymasterRegistry {
+        use router_core::services::custody_action_executor::evm_address_from_private_key;
+        let mut registry = PaymasterRegistry::new();
+        for (chain, private_key) in [
+            (
+                ChainType::Ethereum,
+                self.with_devnet(|devnet| anvil_paymaster_private_key(&devnet.ethereum)),
+            ),
+            (
+                ChainType::Base,
+                self.with_devnet(|devnet| anvil_paymaster_private_key(&devnet.base)),
+            ),
+            (
+                ChainType::Arbitrum,
+                self.with_devnet(|devnet| anvil_paymaster_private_key(&devnet.arbitrum)),
+            ),
+        ] {
+            let address = evm_address_from_private_key(&private_key)
+                .expect("derive harness paymaster address");
+            registry.register(chain, address);
+        }
+        registry
     }
 
     async fn deal_bitcoin(
@@ -1122,7 +1153,8 @@ async fn test_order_manager(
             settings,
             h.chain_registry.clone(),
             action_providers,
-        ),
+        )
+        .with_paymasters(h.harness_paymaster_registry()),
         db,
     )
 }
@@ -1130,9 +1162,9 @@ async fn test_order_manager(
 async fn mock_order_manager(
     db: Database,
     chain_registry: Arc<ChainRegistry>,
-) -> (OrderManager, MockIntegratorServer) {
+) -> (OrderManager, MockIntegratorServer, HyperliquidNode) {
     let h = harness().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, node) = spawn_harness_mocks(h, "evm:8453").await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
     let order_manager = OrderManager::with_action_providers(
@@ -1140,8 +1172,9 @@ async fn mock_order_manager(
         settings,
         chain_registry,
         Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-    );
-    (order_manager, mocks)
+    )
+    .with_paymasters(h.harness_paymaster_registry());
+    (order_manager, mocks, node)
 }
 
 /// Spawn a `MockIntegratorServer` wired to the shared harness devnet so the
@@ -1150,7 +1183,33 @@ async fn mock_order_manager(
 /// subscribes to that contract's `FundsDeposited` events on the harness's
 /// Anvil ws endpoint. The origin chain determines which EVM devnet we wire:
 /// `"evm:1"` → Ethereum, `"evm:8453"` → Base, `"evm:42161"` → Arbitrum.
-async fn spawn_harness_mocks(h: &TestHarness, origin_chain_id: &str) -> MockIntegratorServer {
+/// Spawn a standalone [`HyperliquidNode`] plus a [`MockIntegratorServer`] whose
+/// Unit client is wired to that node (via `with_unit_node`), so all Hyperliquid
+/// traffic routes through the node rather than the venue mock's (now removed)
+/// in-process `/hyperliquid`. Returns both; the node must be kept alive for the
+/// duration of the test (its `Drop` shuts the server down).
+///
+/// Use `node.url()` for the router's `hyperliquid_api_url`, and the node's
+/// state helpers (`seed_spot`, `spot_balance_of`, `clearinghouse_balance_of`,
+/// …) to seed/read Hyperliquid balances.
+async fn spawn_mocks_with_node(
+    config: MockIntegratorConfig,
+) -> (MockIntegratorServer, HyperliquidNode) {
+    let node = HyperliquidNode::spawn()
+        .await
+        .expect("spawn standalone hyperliquid node");
+    let mocks = MockIntegratorServer::spawn_with_config(
+        config.with_unit_node(node.url(), node.guardian_key()),
+    )
+    .await
+    .expect("spawn mock integrator wired to hyperliquid node");
+    (mocks, node)
+}
+
+async fn spawn_harness_mocks(
+    h: &TestHarness,
+    origin_chain_id: &str,
+) -> (MockIntegratorServer, HyperliquidNode) {
     spawn_harness_mocks_with_unit_indexers(h, origin_chain_id, true).await
 }
 
@@ -1158,7 +1217,7 @@ async fn spawn_harness_mocks_with_unit_indexers(
     h: &TestHarness,
     origin_chain_id: &str,
     enable_unit_indexers: bool,
-) -> MockIntegratorServer {
+) -> (MockIntegratorServer, HyperliquidNode) {
     match origin_chain_id {
         "evm:1" | "evm:8453" | "evm:42161" => {}
         other => panic!("spawn_harness_mocks: unsupported origin chain {other}"),
@@ -1198,9 +1257,7 @@ async fn spawn_harness_mocks_with_unit_indexers(
             )
             .with_unit_bitcoin_rpc(h.bitcoin_rpc_url(), h.bitcoin_cookie_path());
     }
-    MockIntegratorServer::spawn_with_config(config)
-        .await
-        .expect("spawn harness-wired mock integrator")
+    spawn_mocks_with_node(config).await
 }
 
 fn make_cancellation_pair() -> (String, String) {
@@ -1816,7 +1873,8 @@ async fn quote_market_order_persists_no_custody_vault() {
         settings,
         h.chain_registry.clone(),
         Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
-    );
+    )
+    .with_paymasters(h.harness_paymaster_registry());
 
     let connect_options =
         PgConnectOptions::from_str(&url).expect("parse isolated test database URL");
@@ -2177,7 +2235,7 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
 #[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     let h = harness().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, _node) = spawn_harness_mocks(h, "evm:8453").await;
     let db = test_db().await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
@@ -2196,7 +2254,8 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         settings,
         h.chain_registry.clone(),
         Arc::new(action_providers),
-    );
+    )
+    .with_paymasters(h.harness_paymaster_registry());
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").unwrap(),
         asset: AssetId::reference("0x3333333333333333333333333333333333333333"),
@@ -2281,7 +2340,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
 #[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_before_top_k() {
     let h = harness().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, node) = spawn_harness_mocks(h, "evm:8453").await;
     let db = test_db().await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
@@ -2293,7 +2352,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
         Some(CctpHttpProviderConfig::mock(mocks.cctp_url())),
         Some(mocks.hyperunit_url()),
         None,
-        Some(mocks.hyperliquid_url()),
+        Some(node.url()),
         Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
@@ -2333,7 +2392,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
 #[ignore = "integration: spawns devnet stack"]
 async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_retention() {
     let h = harness().await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let (mocks, node) = spawn_harness_mocks(h, "evm:8453").await;
     let db = test_db().await;
     let dir = tempfile::tempdir().unwrap();
     let settings = Arc::new(test_settings(dir.path()));
@@ -2345,7 +2404,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
         Some(CctpHttpProviderConfig::mock(mocks.cctp_url())),
         Some(mocks.hyperunit_url()),
         None,
-        Some(mocks.hyperliquid_url()),
+        Some(node.url()),
         Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
@@ -2355,7 +2414,8 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
         settings,
         h.chain_registry.clone(),
         Arc::new(action_providers),
-    );
+    )
+    .with_paymasters(h.harness_paymaster_registry());
 
     let response = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -2420,7 +2480,7 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
 #[ignore = "integration: spawns devnet stack"]
 async fn mock_velora_transaction_spends_input_and_mints_output_on_local_evm() {
     let h = harness().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, _node) = spawn_harness_mocks(h, "evm:8453").await;
     let signer = alloy::signers::local::PrivateKeySigner::random();
     let source_address = signer.address();
     let wallet = alloy::network::EthereumWallet::new(signer);
@@ -2630,7 +2690,8 @@ async fn quote_limit_order_base_usdc_to_eth_includes_downstream_ueth_retention()
         settings,
         h.chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(h.harness_paymaster_registry());
 
     let requested_output = "40000000000000000";
     let response = order_manager
@@ -2704,12 +2765,12 @@ async fn router_api_quote_and_order_flow_uses_production_component_initializatio
     let h = harness().await;
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
-    let mocks = MockIntegratorServer::spawn().await.unwrap();
+    let (mocks, node) = spawn_mocks_with_node(MockIntegratorConfig::default()).await;
     let mut args = test_router_args(h, dir.path(), database_url);
     args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.hyperunit_url());
-    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.hyperliquid_api_url = Some(node.url());
     args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
@@ -2912,7 +2973,7 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
     let blocked_recipient = "0x2222222222222222222222222222222222222222";
     let provider_error_recipient = "0x3333333333333333333333333333333333333333";
     let blocked_refund = "0x4444444444444444444444444444444444444444";
-    let mocks = MockIntegratorServer::spawn_with_config(
+    let (mocks, node) = spawn_mocks_with_node(
         MockIntegratorConfig::default()
             .with_address_screening_risk(
                 blocked_recipient,
@@ -2930,13 +2991,12 @@ async fn router_api_address_screening_covers_allow_block_and_provider_error() {
                 "chainalysis temporarily unavailable",
             ),
     )
-    .await
-    .unwrap();
+    .await;
     let mut args = test_router_args(h, dir.path(), database_url);
     args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.hyperunit_url());
-    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.hyperliquid_api_url = Some(node.url());
     args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
     args.chainalysis_host = Some(mocks.chainalysis_url());
     args.chainalysis_token = Some("mock-chainalysis-token".to_string());
@@ -3424,12 +3484,12 @@ async fn router_admin_provider_policy_drain_excludes_provider_from_new_quotes_im
     let h = harness().await;
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, node) = spawn_harness_mocks(h, "evm:8453").await;
     let mut args = test_router_args(h, dir.path(), database_url);
     args.across_api_url = Some(mocks.across_url());
     args.across_api_key = Some("mock-across-api-key".to_string());
     args.hyperunit_api_url = Some(mocks.hyperunit_url());
-    args.hyperliquid_api_url = Some(mocks.hyperliquid_url());
+    args.hyperliquid_api_url = Some(node.url());
     args.coinbase_price_api_base_url = Some(mocks.coinbase_url());
     args.router_admin_api_key = Some(TEST_ADMIN_API_KEY.to_string());
     let (base_url, api_task) = spawn_router_api(args).await;
@@ -3526,7 +3586,8 @@ async fn funding_hints_validate_balance_once_and_mark_vault_funded() {
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let quote = order_manager
@@ -4682,7 +4743,7 @@ async fn route_cost_upsert_preserves_newer_snapshot_against_stale_write() {
 async fn route_cost_refresh_samples_configured_bridge_providers() {
     let h = harness().await;
     let db = test_db().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, _node) = spawn_harness_mocks(h, "evm:8453").await;
     let service = RouteCostService::new(
         db.clone(),
         Arc::new(ActionProviderRegistry::mock_http(mocks.base_url())),
@@ -4807,7 +4868,8 @@ async fn create_vault_with_order_id_links_generic_order_to_vault() {
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let quote = order_manager
@@ -5771,7 +5833,8 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let quote = order_manager
@@ -5905,7 +5968,8 @@ async fn market_order_route_planner_uses_direct_unit_when_source_is_unit_ingress
 async fn execution_leg_rollup_ignores_cancelled_failed_retry_actions() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
 
     let quote = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -6107,7 +6171,8 @@ async fn execution_leg_rollup_ignores_cancelled_failed_retry_actions() {
 async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_decimal() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
 
     let quote = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -6252,7 +6317,8 @@ async fn execution_leg_rollup_uses_step_amount_when_provider_source_amount_is_de
 async fn execution_leg_rollup_uses_unit_deposit_source_amount_as_output_evidence() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
 
     let quote = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -6672,7 +6738,8 @@ async fn execution_leg_usd_valuation_update_returns_updated_leg() {
 async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_evidence() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
 
     let quote = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -6800,7 +6867,8 @@ async fn execution_leg_rollup_rejects_completed_leg_without_actual_amount_eviden
 async fn release_quote_after_vault_creation_failure_allows_order_retry() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
 
     let quote = order_manager
         .quote_market_order(MarketOrderQuoteRequest {
@@ -6882,7 +6950,8 @@ async fn release_quote_after_vault_creation_failure_allows_order_retry() {
 async fn create_order_from_quote_resumes_after_funding_vault_attached() {
     let h = harness().await;
     let db = test_db().await;
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let dir = tempfile::tempdir().unwrap();
     let vault_manager = VaultManager::new(
         db,
@@ -7081,7 +7150,8 @@ async fn market_order_route_planner_uses_across_only_when_unit_needs_ingress_bri
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let quote = order_manager
@@ -7224,7 +7294,8 @@ async fn market_order_route_planner_reserves_bitcoin_fee_for_unit_ingress() {
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let quote = order_manager
@@ -7343,7 +7414,8 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
     let h = harness().await;
     let db = test_db().await;
     let settings = Arc::new(test_settings(dir.path()));
-    let (order_manager, _mocks) = mock_order_manager(db.clone(), h.chain_registry.clone()).await;
+    let (order_manager, _mocks, _node) =
+        mock_order_manager(db.clone(), h.chain_registry.clone()).await;
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let base_usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_string();
@@ -7500,7 +7572,7 @@ async fn market_order_route_planner_supports_cctp_to_hyperliquid_bridge_path() {
 #[ignore = "integration: spawns devnet stack"]
 async fn provider_quotes_support_across_to_hyperliquid_bridge_path_under_mocks() {
     let h = harness().await;
-    let mocks = spawn_harness_mocks(h, "evm:8453").await;
+    let (mocks, _node) = spawn_harness_mocks(h, "evm:8453").await;
     let providers = ActionProviderRegistry::mock_http(mocks.base_url());
 
     let base_usdc = DepositAsset {
@@ -8362,7 +8434,8 @@ async fn vault_address_matches_deterministic_derivation_from_quote() {
         settings.clone(),
         h.chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(h.harness_paymaster_registry());
     let vault_manager = VaultManager::new(db.clone(), settings.clone(), h.chain_registry.clone());
 
     let source_asset = DepositAsset {

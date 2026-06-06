@@ -1052,7 +1052,7 @@ fn router_args(
         cctp_transfer_mode: None,
         hyperunit_api_url: Some(mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_api_url: Some(mocks.hyperliquid_url()),
+        hyperliquid_api_url: Some(hyperliquid_node(devnet).url()),
         hyperliquid_proxy_url: None,
         velora_api_url: None,
         velora_proxy_url: None,
@@ -1065,7 +1065,7 @@ fn router_args(
         router_gateway_api_key: None,
         router_admin_api_key: None,
         hyperliquid_network:
-            router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
+            router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
         worker_refund_poll_seconds: 1,
@@ -2154,6 +2154,13 @@ fn route_expected_hl_trade_steps(route: RuntimeRoute) -> usize {
     }
 }
 
+fn hyperliquid_node(devnet: &RiftDevnet) -> &devnet::HyperliquidNode {
+    devnet
+        .hyperliquid
+        .as_ref()
+        .expect("RiftDevnet built with using_hyperliquid_node(true) exposes devnet.hyperliquid")
+}
+
 async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIntegratorServer {
     let mut config = MockIntegratorConfig::default()
         .with_across_chain(
@@ -2180,16 +2187,33 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIn
             ),
             devnet.arbitrum.anvil.ws_endpoint_url().to_string(),
         )
+        .with_mock_service_evm_chain(
+            devnet.ethereum.anvil.chain_id(),
+            devnet.ethereum.anvil.endpoint_url().to_string(),
+        )
+        .with_mock_service_evm_chain(
+            devnet.base.anvil.chain_id(),
+            devnet.base.anvil.endpoint_url().to_string(),
+        )
+        .with_mock_service_evm_chain(
+            devnet.arbitrum.anvil.chain_id(),
+            devnet.arbitrum.anvil.endpoint_url().to_string(),
+        )
         .with_unit_evm_rpc_url(
             hyperunit_client::UnitChain::Ethereum,
             devnet.ethereum.anvil.endpoint(),
+        )
+        .with_unit_evm_rpc_url(
+            hyperunit_client::UnitChain::Base,
+            devnet.base.anvil.endpoint(),
         )
         .with_unit_bitcoin_rpc(
             devnet.bitcoin.rpc_url.clone(),
             devnet.bitcoin.cookie.clone(),
         )
         .with_across_status_latency(Duration::from_secs(2))
-        .with_mainnet_hyperliquid(true);
+        .with_mainnet_hyperliquid(false)
+        .with_unit_node(hyperliquid_node(devnet).url(), hyperliquid_node(devnet).guardian_key());
     if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
         config = config
             .with_cctp_token_messenger_address(
@@ -2216,7 +2240,6 @@ async fn submit_quote_request(
         router_base_url,
         route,
         route_amount_in(route).to_string(),
-        valid_regtest_btc_address(),
     )
     .await
 }
@@ -2226,7 +2249,6 @@ async fn submit_quote_request_custom(
     router_base_url: &str,
     route: RuntimeRoute,
     amount_in: String,
-    recipient_address: String,
 ) -> RouterOrderQuoteEnvelope {
     let from_asset = match route {
         RuntimeRoute::BaseEthToBtc => json!({
@@ -2248,7 +2270,6 @@ async fn submit_quote_request_custom(
                 "chain": "bitcoin",
                 "asset": "native"
             },
-            "recipient_address": recipient_address,
             "amount_in": amount_in
         }))
         .send()
@@ -2256,7 +2277,7 @@ async fn submit_quote_request_custom(
         .expect("quote request");
     let status = quote_response.status();
     let body = quote_response.text().await.expect("quote body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     serde_json::from_str(&body).expect("quote response")
 }
 
@@ -2265,12 +2286,14 @@ async fn submit_order_request(
     router_base_url: &str,
     quote_id: Uuid,
     route: RuntimeRoute,
+    recipient_address: String,
 ) -> RouterOrderEnvelope {
     let order_response = client
         .post(format!("{router_base_url}/api/v1/orders"))
         .json(&json!({
             "quote_id": quote_id,
             "idempotency_key": format!("sauron-provider-operation-e2e:{route:?}:{quote_id}"),
+            "recipient_address": recipient_address,
             "refund_address": valid_evm_address(),
             "metadata": {
                 "test": route_order_metadata(route)
@@ -2281,7 +2304,7 @@ async fn submit_order_request(
         .expect("order request");
     let status = order_response.status();
     let body = order_response.text().await.expect("order body");
-    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
     serde_json::from_str(&body).expect("order response")
 }
 
@@ -2589,7 +2612,6 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
         &router_base_url,
         route,
         amount_in.clone(),
-        live.bitcoin_recipient_address.clone(),
     )
     .await;
     let market_quote = quote.quote.as_market_order().expect("market order quote");
@@ -2612,7 +2634,14 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     })
     .await;
 
-    let order = submit_order_request(&client, &router_base_url, market_quote.id, route).await;
+    let order = submit_order_request(
+        &client,
+        &router_base_url,
+        market_quote.id,
+        route,
+        live.bitcoin_recipient_address.clone(),
+    )
+    .await;
     let funding_vault = order
         .funding_vault
         .as_ref()
@@ -2739,6 +2768,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let hl_shim_database_url = create_test_database(&postgres.admin_database_url).await;
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
+        .using_hyperliquid_node(true)
         .using_token_indexer(database_url.clone())
         .build()
         .await
@@ -2789,7 +2819,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
     let db = worker_components.db.clone();
     let (router_base_url, _api_task) = spawn_router_api(args.clone()).await;
     let (hl_shim_base_url, _hl_shim_task) =
-        spawn_hl_shim_indexer(&hl_shim_database_url, &mocks.hyperliquid_url()).await;
+        spawn_hl_shim_indexer(&hl_shim_database_url, &hyperliquid_node(&devnet).url()).await;
     let (bitcoin_observer_urls, _bitcoin_observer_tasks) = spawn_bitcoin_observers(&devnet).await;
     let mut temporal_worker_task = spawn_temporal_order_worker(&args).await;
     let order_workflow_client = std::sync::Arc::new(
@@ -2852,6 +2882,7 @@ async fn run_mock_runtime_route(route: RuntimeRoute) {
             .expect("market order quote")
             .id,
         route,
+        valid_regtest_btc_address(),
     )
     .await;
     let funding_vault = order

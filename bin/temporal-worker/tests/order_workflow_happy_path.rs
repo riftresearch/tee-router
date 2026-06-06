@@ -19,7 +19,7 @@ use chrono::Utc;
 use devnet::{
     evm_devnet::MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS,
     mock_integrators::{MockIntegratorConfig, MockIntegratorServer, MockUnitOperationRecord},
-    RiftDevnet,
+    HyperliquidNode, RiftDevnet,
 };
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use router_core::{
@@ -35,6 +35,7 @@ use router_core::{
     services::{
         custody_action_executor::{
             CustodyActionExecutor, HyperliquidCallNetwork, HyperliquidRuntimeConfig,
+            PaymasterRegistry,
         },
         AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
         CctpHttpProviderConfig, RouteCostService, VeloraHttpProviderConfig,
@@ -104,12 +105,22 @@ struct WorkflowRun {
     output: OrderWorkflowOutput,
     refund_address_balance: U256,
     refund_address_base_usdc_balance: U256,
+    refund_address_ethereum_balance: U256,
 }
 
 #[derive(Clone, Copy, Default)]
 enum WorkflowRoute {
     #[default]
     VeloraBaseEthToBaseUsdc,
+    // A single-Velora-swap order whose *source* asset is Ethereum-native ETH.
+    // The HyperliquidSpot refund test needs a source asset that a
+    // HyperliquidSpot position can actually be refunded back to via a Unit
+    // withdrawal. Unit only registers an ETH withdrawal capability on Ethereum
+    // (`evm:1`), never Base — so the default Base-ETH source has *no* reachable
+    // HyperliquidSpot -> Unit refund path. The primary execution still fails
+    // through the deterministic Velora injection lever (it is a Velora swap),
+    // so the retry budget exhausts identically to the other refund tests.
+    VeloraEthereumEthToEthereumUsdc,
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
     CctpBaseUsdcToBitcoin,
@@ -695,6 +706,7 @@ async fn order_workflow_refunds_external_custody_across_then_universal_router_af
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
+        route: WorkflowRoute::VeloraEthereumEthToEthereumUsdc,
         velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         expect_hyperliquid_spot_unit_refund: true,
         ..WorkflowOptions::default()
@@ -729,8 +741,9 @@ async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exh
         .get_execution_steps_for_attempt(attempts[2].id)
         .await
         .expect("load HyperliquidSpot refund attempt steps");
-    assert_eq!(refund_steps.len(), 1);
-    let refund_step = &refund_steps[0];
+    let refund_step = refund_steps
+        .last()
+        .expect("HyperliquidSpot refund attempt should record a settlement step");
     assert_eq!(
         refund_step.step_type,
         OrderExecutionStepType::UnitWithdrawal
@@ -738,8 +751,9 @@ async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exh
     assert_eq!(refund_step.provider, "unit");
     assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
     assert!(
-        run.refund_address_balance >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
-        "refund address should receive the Unit withdrawal from HyperliquidSpot"
+        run.refund_address_ethereum_balance
+            >= U256::from_str_radix(ORDER_AMOUNT_IN_WEI, 10).unwrap(),
+        "refund address should receive the Unit ETH withdrawal from HyperliquidSpot"
     );
 }
 
@@ -1357,6 +1371,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
 
     let (devnet, _) = RiftDevnet::builder()
         .using_esplora(true)
+        .using_hyperliquid_node(true)
         .build()
         .await
         .expect("devnet setup failed");
@@ -1367,6 +1382,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     .await;
     let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
         || options.expect_external_custody_across_then_velora_refund;
+    // The Ethereum-source Velora route needs the Ethereum chain, its mock-USDC
+    // clone, and the Ethereum Velora contract/provider wired even though it is
+    // not an Across route.
+    let ethereum_velora_enabled =
+        matches!(options.route, WorkflowRoute::VeloraEthereumEthToEthereumUsdc);
+    let ethereum_enabled = across_enabled || ethereum_velora_enabled;
     let cctp_enabled = matches!(
         options.route,
         WorkflowRoute::CctpBaseUsdcToArbitrumEth | WorkflowRoute::CctpBaseUsdcToBitcoin
@@ -1389,7 +1410,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             | WorkflowRoute::CctpBaseUsdcToBitcoin
             | WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
     );
-    if across_enabled {
+    if ethereum_enabled {
         install_mock_usdc_clone(
             &devnet.ethereum,
             ETHEREUM_USDC_ADDRESS
@@ -1415,7 +1436,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             &devnet,
             options.route,
             hyperliquid_enabled,
-            across_enabled,
+            ethereum_enabled,
             arbitrum_enabled,
             bitcoin_enabled,
         )
@@ -1423,17 +1444,19 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     );
     let action_providers = Arc::new(test_action_providers(
         &mocks,
+        hyperliquid_enabled.then(|| hyperliquid_node(&devnet).url()),
         options.route,
         hyperliquid_enabled,
         across_enabled,
         cctp_enabled,
     ));
     let mut custody_executor =
-        CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone());
+        CustodyActionExecutor::new(db.clone(), settings.clone(), chain_registry.clone())
+            .with_paymasters(test_paymasters(&devnet));
     if hyperliquid_enabled {
         custody_executor =
             custody_executor.with_hyperliquid_runtime(Some(HyperliquidRuntimeConfig::new(
-                mocks.hyperliquid_url(),
+                hyperliquid_node(&devnet).url(),
                 HyperliquidCallNetwork::Testnet,
             )));
     }
@@ -1442,6 +1465,17 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     let seeded = match options.route {
         WorkflowRoute::VeloraBaseEthToBaseUsdc => {
             seed_funded_single_step_order(
+                &db,
+                settings.clone(),
+                chain_registry.clone(),
+                action_providers.clone(),
+                &devnet,
+                ORDER_AMOUNT_IN_WEI.to_string(),
+            )
+            .await
+        }
+        WorkflowRoute::VeloraEthereumEthToEthereumUsdc => {
+            seed_funded_ethereum_velora_order(
                 &db,
                 settings.clone(),
                 chain_registry.clone(),
@@ -1506,7 +1540,6 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     if options.expect_hyperliquid_spot_unit_refund {
         seed_hyperliquid_spot_refund_position(
             &custody_executor,
-            &mocks,
             &devnet,
             order_id,
             &seeded.funding_vault_address,
@@ -1732,7 +1765,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 signal_order_hyperliquid_bridge_deposit_observation(
                     &client,
                     &db_for_workflow,
-                    &mocks,
+                    devnet_for_workflow,
                     &workflow_id,
                     order_id,
                 )
@@ -1850,6 +1883,11 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         Address::from_str(&valid_evm_address()).expect("valid refund address"),
     )
     .await;
+    let refund_address_ethereum_balance = if ethereum_enabled {
+        native_balance(&devnet.ethereum, &valid_evm_address()).await
+    } else {
+        U256::ZERO
+    };
     temporal.shutdown().await;
 
     WorkflowRun {
@@ -1859,6 +1897,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         output,
         refund_address_balance,
         refund_address_base_usdc_balance,
+        refund_address_ethereum_balance,
     }
 }
 
@@ -1937,7 +1976,7 @@ async fn test_chain_registry(
     devnet: &RiftDevnet,
     _route: WorkflowRoute,
     hyperliquid_enabled: bool,
-    across_enabled: bool,
+    ethereum_enabled: bool,
     arbitrum_enabled: bool,
     bitcoin_enabled: bool,
 ) -> ChainRegistry {
@@ -1958,7 +1997,7 @@ async fn test_chain_registry(
     .expect("base chain setup");
     let mut registry = ChainRegistry::new();
     registry.register_evm(ChainType::Base, Arc::new(base_chain));
-    if across_enabled {
+    if ethereum_enabled {
         let ethereum_chain = EvmChain::new_with_gas_sponsor(
             &devnet.ethereum.anvil.endpoint(),
             ChainType::Ethereum,
@@ -2023,6 +2062,7 @@ async fn test_chain_registry(
 
 fn test_action_providers(
     mocks: &MockIntegratorServer,
+    hyperliquid_node_url: Option<String>,
     route: WorkflowRoute,
     hyperliquid_enabled: bool,
     across_enabled: bool,
@@ -2035,11 +2075,12 @@ fn test_action_providers(
         cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.cctp_url())),
         hyperunit_base_url: hyperliquid_enabled.then(|| mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
-        hyperliquid_base_url: hyperliquid_enabled.then(|| mocks.hyperliquid_url()),
+        hyperliquid_base_url: hyperliquid_node_url,
         hyperliquid_proxy_url: None,
         velora: matches!(
             route,
             WorkflowRoute::VeloraBaseEthToBaseUsdc
+                | WorkflowRoute::VeloraEthereumEthToEthereumUsdc
                 | WorkflowRoute::AcrossBaseEthToEthereumUsdc
                 | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
@@ -2069,6 +2110,12 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
         config = config.with_velora_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+        );
+    }
+    if matches!(options.route, WorkflowRoute::VeloraEthereumEthToEthereumUsdc) {
+        config = config.with_velora_swap_contract_address(
+            devnet.ethereum.anvil.chain_id(),
+            format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
         );
     }
     if across_enabled {
@@ -2121,7 +2168,26 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             .with_cctp_destination_token(devnet.arbitrum.anvil.chain_id(), ARBITRUM_USDC_ADDRESS);
     }
     if unit_enabled {
+        let node = hyperliquid_node(devnet);
         config = config
+            // Mock-service paymasters for the EVM chains the Unit withdrawal
+            // release submits on (e.g. native-ETH release on Ethereum).
+            .with_mock_service_evm_chain(
+                devnet.ethereum.anvil.chain_id(),
+                devnet.ethereum.anvil.endpoint_url().to_string(),
+            )
+            .with_mock_service_evm_chain(
+                devnet.base.anvil.chain_id(),
+                devnet.base.anvil.endpoint_url().to_string(),
+            )
+            .with_mock_service_evm_chain(
+                devnet.arbitrum.anvil.chain_id(),
+                devnet.arbitrum.anvil.endpoint_url().to_string(),
+            )
+            .with_unit_evm_rpc_url(
+                hyperunit_client::UnitChain::Ethereum,
+                devnet.ethereum.anvil.endpoint_url().to_string(),
+            )
             .with_unit_evm_rpc_url(
                 hyperunit_client::UnitChain::Base,
                 devnet.base.anvil.endpoint_url().to_string(),
@@ -2129,16 +2195,16 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             .with_hyperliquid_bridge_address(TESTNET_HYPERLIQUID_BRIDGE_ADDRESS)
             .with_hyperliquid_evm_rpc_url(devnet.arbitrum.anvil.endpoint())
             .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS)
-            .with_mainnet_hyperliquid(false);
-    }
-    if matches!(
-        options.route,
-        WorkflowRoute::UnitBitcoinToBaseEth | WorkflowRoute::CctpBaseUsdcToBitcoin
-    ) {
-        config = config.with_unit_bitcoin_rpc(
-            devnet.bitcoin.rpc_url.clone(),
-            devnet.bitcoin.cookie.clone(),
-        );
+            .with_mainnet_hyperliquid(false)
+            .with_unit_node(node.url(), node.guardian_key())
+            // Bitcoin-destination Unit withdrawals release native BTC, so the
+            // mock needs Bitcoin RPC wired for the withdrawal-release step. (The
+            // HyperliquidSpot ETH refund instead releases native ETH on
+            // Ethereum via the EVM RPC URLs wired above.)
+            .with_unit_bitcoin_rpc(
+                devnet.bitcoin.rpc_url.clone(),
+                devnet.bitcoin.cookie.clone(),
+            );
     }
     config = config
         .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
@@ -2146,6 +2212,17 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
     MockIntegratorServer::spawn_with_config(config)
         .await
         .expect("spawn mock integrators")
+}
+
+/// The RiftDevnet-owned standalone Hyperliquid node. Present because the suite
+/// builds the devnet with `using_hyperliquid_node(true)`; all Hyperliquid state
+/// (spot seeding, clearinghouse reads) and Unit deposit/withdrawal settlement
+/// route through it rather than the venue mock's `/hyperliquid`.
+fn hyperliquid_node(devnet: &RiftDevnet) -> &HyperliquidNode {
+    devnet
+        .hyperliquid
+        .as_ref()
+        .expect("RiftDevnet built with using_hyperliquid_node(true)")
 }
 
 async fn expire_market_order_quote_legs(
@@ -2194,13 +2271,15 @@ async fn expire_market_order_quote_legs(
 
 async fn seed_hyperliquid_spot_refund_position(
     custody_executor: &CustodyActionExecutor,
-    mocks: &MockIntegratorServer,
     devnet: &RiftDevnet,
     order_id: Uuid,
     funding_vault_address: &str,
 ) {
+    // The HyperliquidSpot refund test funds on Ethereum (`evm:1`); zero the
+    // Ethereum funding vault so refund discovery skips it and selects the seeded
+    // HyperliquidSpot position instead of refunding the original funding vault.
     set_native_balance(
-        &devnet.base,
+        &devnet.ethereum,
         Address::from_str(funding_vault_address).expect("funding vault EVM address"),
         U256::ZERO,
     )
@@ -2223,8 +2302,8 @@ async fn seed_hyperliquid_spot_refund_position(
         .parse::<f64>()
         .expect("amount parses as f64")
         / 1_000_000_000_000_000_000_f64;
-    mocks
-        .credit_hyperliquid_balance(user, "UETH", natural_eth)
+    hyperliquid_node(devnet)
+        .seed_spot(user, "UETH", natural_eth)
         .await;
 }
 
@@ -2538,7 +2617,7 @@ async fn signal_order_cctp_receive_observed(
 async fn signal_order_hyperliquid_bridge_deposit_observation(
     client: &Client,
     db: &Database,
-    mocks: &MockIntegratorServer,
+    devnet: &RiftDevnet,
     workflow_id: &str,
     order_id: Uuid,
 ) {
@@ -2571,8 +2650,8 @@ async fn signal_order_hyperliquid_bridge_deposit_observation(
     let expected_withdrawable = expected_withdrawable_raw / 1_000_000_f64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
-        let observed = mocks
-            .hyperliquid_clearinghouse_balance_of(user, "USDC")
+        let observed = hyperliquid_node(devnet)
+            .clearinghouse_balance_of(user, "USDC")
             .await;
         if observed >= expected_withdrawable {
             break;
@@ -3345,7 +3424,11 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
         .destination_tx_hash
         .clone()
         .expect("completed refund UnitWithdrawal operation should carry destination_tx_hash");
-    let (btc_tx_hash, btc_vout) = split_mock_unit_tx_ref(&destination_tx_hash);
+    // The HyperliquidSpot refund settles a Unit ETH withdrawal back to the
+    // order's Ethereum source. The mock releases native ETH on Ethereum and
+    // records the destination as `0x<hash>:0`; strip the `:0` index to recover
+    // the raw EVM tx hash for the settlement evidence.
+    let (evm_tx_hash, _evm_log_index) = split_mock_unit_tx_ref(&destination_tx_hash);
 
     let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
         order_id.into(),
@@ -3377,17 +3460,17 @@ async fn signal_hyperliquid_spot_refund_unit_withdrawal(
                             .expect("refund UnitWithdrawal request should carry dst_addr")
                             .to_string(),
                         amount: mock_operation.source_amount.clone(),
-                        destination_chain: Some("bitcoin".to_string()),
+                        destination_chain: Some("ethereum".to_string()),
                         destination_tx_hash: Some(destination_tx_hash.clone()),
-                        btc_tx_hash: Some(btc_tx_hash),
-                        btc_vout: Some(btc_vout),
-                        btc_amount: Some(amount.to_string()),
-                        btc_confirmations: Some(10),
-                        evm_chain_id: None,
-                        evm_tx_hash: None,
-                        evm_block_number: None,
+                        btc_tx_hash: None,
+                        btc_vout: None,
+                        btc_amount: None,
+                        btc_confirmations: None,
+                        evm_chain_id: Some("1".to_string()),
+                        evm_tx_hash: Some(evm_tx_hash),
+                        evm_block_number: Some(1),
                         evm_block_hash: None,
-                        evm_status: None,
+                        evm_status: Some(true),
                     },
                 )),
             },
@@ -3792,7 +3875,8 @@ async fn seed_funded_single_step_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").expect("base chain id"),
@@ -3877,6 +3961,111 @@ async fn seed_funded_single_step_order(
     }
 }
 
+/// Seeds a single-Velora-swap order whose source asset is Ethereum-native ETH
+/// (`evm:1`). Used by the HyperliquidSpot refund test: the refund returns to the
+/// order's source asset, and Unit only supports an ETH withdrawal *to Ethereum*,
+/// so the source must live on Ethereum for the HyperliquidSpot -> Unit refund
+/// path to exist. The primary swap is still a Velora step, so it exhausts via
+/// the same deterministic `velora_transaction_fail_next_n` lever.
+async fn seed_funded_ethereum_velora_order(
+    db: &Database,
+    settings: Arc<Settings>,
+    chain_registry: Arc<ChainRegistry>,
+    action_providers: Arc<ActionProviderRegistry>,
+    devnet: &RiftDevnet,
+    amount_in: String,
+) -> SeededOrder {
+    let order_manager = OrderManager::with_action_providers(
+        db.clone(),
+        settings.clone(),
+        chain_registry.clone(),
+        action_providers,
+    )
+    .with_paymasters(test_paymasters(devnet));
+    let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
+    let source_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").expect("ethereum chain id"),
+        asset: AssetId::Native,
+    };
+    let destination_asset = DepositAsset {
+        chain: ChainId::parse("evm:1").expect("ethereum chain id"),
+        asset: AssetId::parse(ETHEREUM_USDC_ADDRESS).expect("ethereum USDC asset"),
+    };
+    let quote = order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset,
+            amount_in,
+        })
+        .await
+        .expect("quote Ethereum Velora order");
+    let market_quote = match quote.quote {
+        RouterOrderQuote::MarketOrder(quote) => quote,
+        RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
+    };
+    assert!(
+        market_quote
+            .provider_id
+            .contains("universal_router_swap:velora"),
+        "expected a single Velora step, got {}",
+        market_quote.provider_id
+    );
+
+    let (order, _) = order_manager
+        .create_order_from_quote(CreateOrderRequest {
+            quote_id: market_quote.id,
+            recipient_address: valid_evm_address(),
+            refund_address: valid_evm_address(),
+            idempotency_key: None,
+            metadata: json!({ "test": "temporal_order_workflow_ethereum_velora" }),
+        })
+        .await
+        .expect("create Ethereum Velora order from quote");
+    let vault = vault_manager
+        .create_vault(CreateVaultRequest {
+            order_id: Some(order.id),
+            deposit_asset: source_asset,
+            action: VaultAction::Null,
+            recovery_address: valid_evm_address(),
+            cancellation_commitment:
+                "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            cancel_after: None,
+            metadata: json!({ "test": "temporal_order_workflow_ethereum_velora" }),
+        })
+        .await
+        .expect("create Ethereum funding vault");
+    fund_native_source_vault(
+        &devnet.ethereum,
+        &vault.deposit_vault_address,
+        &market_quote.amount_in,
+    )
+    .await;
+
+    let now = Utc::now();
+    db.vaults()
+        .transition_status(
+            vault.id,
+            DepositVaultStatus::PendingFunding,
+            DepositVaultStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Ethereum vault funded");
+    db.orders()
+        .transition_status(
+            order.id,
+            RouterOrderStatus::PendingFunding,
+            RouterOrderStatus::Funded,
+            now,
+        )
+        .await
+        .expect("mark Ethereum order funded");
+    SeededOrder {
+        order_id: order.id,
+        funding_vault_address: vault.deposit_vault_address,
+    }
+}
+
 async fn seed_funded_across_order(
     db: &Database,
     settings: Arc<Settings>,
@@ -3889,7 +4078,8 @@ async fn seed_funded_across_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").expect("base chain id"),
@@ -3987,7 +4177,8 @@ async fn seed_funded_cctp_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").expect("base chain id"),
@@ -4086,7 +4277,8 @@ async fn seed_funded_cctp_hyperliquid_unit_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:8453").expect("base chain id"),
@@ -4189,7 +4381,8 @@ async fn seed_funded_arbitrum_hyperliquid_unit_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("evm:42161").expect("arbitrum chain id"),
@@ -4294,7 +4487,8 @@ async fn seed_funded_unit_order(
         settings.clone(),
         chain_registry.clone(),
         action_providers,
-    );
+    )
+    .with_paymasters(test_paymasters(devnet));
     let vault_manager = VaultManager::new(db.clone(), settings, chain_registry);
     let source_asset = DepositAsset {
         chain: ChainId::parse("bitcoin").expect("bitcoin chain id"),
@@ -4390,15 +4584,23 @@ async fn seed_funded_unit_order(
 }
 
 async fn fund_source_vault(devnet: &RiftDevnet, vault_address: &str, amount_in: &str) {
+    fund_native_source_vault(&devnet.base, vault_address, amount_in).await;
+}
+
+async fn fund_native_source_vault(
+    devnet: &devnet::EthDevnet,
+    vault_address: &str,
+    amount_in: &str,
+) {
     let vault_address = Address::from_str(vault_address).expect("funding vault EVM address");
     let amount = U256::from_str_radix(amount_in, 10).expect("amount parses");
     send_native(
-        &devnet.base,
+        devnet,
         vault_address,
         amount + U256::from(EVM_NATIVE_GAS_BUFFER_WEI),
     )
     .await;
-    mine_evm_confirmation_block(&devnet.base).await;
+    mine_evm_confirmation_block(devnet).await;
 }
 
 async fn fund_erc20_source_vault(
@@ -4551,6 +4753,28 @@ fn anvil_signer(devnet: &devnet::EthDevnet) -> PrivateKeySigner {
     )
     .parse()
     .expect("valid Anvil private key")
+}
+
+/// Mirrors the matrix e2e's per-chain paymaster configuration: the quote planner
+/// (`OrderManager::ensure_paymasters_can_fund_path`) and the custody executor's
+/// release sweeps both require a paymaster address registered for every EVM chain
+/// in the route. The gas-sponsor key (anvil key[0]) is well funded on each chain,
+/// so we reuse it as the paymaster address for Base / Ethereum / Arbitrum.
+fn test_paymasters(devnet: &RiftDevnet) -> PaymasterRegistry {
+    let mut paymasters = PaymasterRegistry::new();
+    paymasters.register(
+        ChainType::Base,
+        anvil_signer(&devnet.base).address().to_string(),
+    );
+    paymasters.register(
+        ChainType::Ethereum,
+        anvil_signer(&devnet.ethereum).address().to_string(),
+    );
+    paymasters.register(
+        ChainType::Arbitrum,
+        anvil_signer(&devnet.arbitrum).address().to_string(),
+    );
+    paymasters
 }
 
 fn valid_evm_address() -> String {
