@@ -17,7 +17,9 @@ use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, task::JoinHandle};
 
-use crate::cctp_mock::MockCctpTokenMessengerV2::DepositForBurn;
+pub(crate) mod contract;
+
+use crate::mock_integrators::cctp::contract::MockCctpTokenMessengerV2::DepositForBurn;
 use crate::mock_integrators::{
     bytes32_to_evm_address, error_response, mock_evm_indexer_initial_last_scanned,
     MockIntegratorConfig, MockIntegratorState,

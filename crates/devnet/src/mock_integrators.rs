@@ -32,17 +32,18 @@ use crate::{
 };
 use eip7702_paymaster::{Execution, PaymasterError, PaymasterHandle};
 
-mod across;
+pub(crate) mod across;
 mod chainalysis;
-mod cctp;
+pub(crate) mod cctp;
 mod coinbase;
-mod hyperliquid;
+pub(crate) mod hyperliquid;
 mod hyperunit;
-mod velora;
+pub(crate) mod velora;
 
 pub use across::{MockAcrossChainConfig, MockAcrossDepositRecord};
 pub use chainalysis::{MockAddressRiskLevel, MockAddressScreeningRule};
 pub use cctp::{MockCctpBurnRecord, MockCctpChainConfig, MockCctpDelayReason};
+pub use hyperliquid::contract::MockHyperliquidBridge2;
 pub use hyperunit::{
     MockUnitGenerateAddressRequest, MockUnitOperationKind, MockUnitOperationRecord,
 };

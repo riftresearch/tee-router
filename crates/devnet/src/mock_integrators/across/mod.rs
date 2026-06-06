@@ -24,7 +24,9 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::across_spoke_pool_mock::MockSpokePool::{depositCall, FundsDeposited};
+pub(crate) mod contract;
+
+use crate::mock_integrators::across::contract::MockSpokePool::{depositCall, FundsDeposited};
 use crate::mock_integrators::{
     address_to_bytes32, bytes32_to_evm_address, deterministic_bps, mock_credit_native_on_anvil,
     mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, parse_amount, AcrossDepositKey,
@@ -1876,7 +1878,7 @@ mod tests {
     /// mock and real Across — this test proves the mock completes the loop.
     #[tokio::test]
     async fn deposit_status_indexer_reports_filled_after_deposit() {
-        use crate::across_spoke_pool_mock::MockSpokePool;
+        use crate::mock_integrators::across::contract::MockSpokePool;
         use alloy::node_bindings::Anvil;
 
         let anvil = Anvil::new()

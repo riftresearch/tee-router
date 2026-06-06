@@ -23,8 +23,10 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use eip7702_paymaster::Execution;
 
-use crate::hyperliquid_bridge_mock::MockHyperliquidBridge2;
+pub(crate) mod contract;
+
 use crate::hyperliquid_core::{format_hl_amount, hyperliquid_has_sufficient_amount};
+use crate::mock_integrators::hyperliquid::contract::MockHyperliquidBridge2;
 use crate::mock_integrators::{
     complete_unit_withdrawal_after_hyperliquid_transfer, deterministic_bps, error_response,
     mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, MockIntegratorConfig,

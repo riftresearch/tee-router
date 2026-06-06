@@ -17,7 +17,7 @@ use alloy::{
     providers::{DynProvider, Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
 };
-use devnet::hyperliquid_bridge_mock::MockHyperliquidBridge2::MockHyperliquidBridge2Instance;
+use devnet::mock_integrators::MockHyperliquidBridge2::MockHyperliquidBridge2Instance;
 use devnet::mock_integrators::{MockIntegratorConfig, MockIntegratorServer};
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use hyperliquid_client::{

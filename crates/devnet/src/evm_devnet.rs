@@ -23,17 +23,19 @@ use alloy::{
 };
 
 use crate::{
-    across_spoke_pool_mock::MockSpokePool::MockSpokePoolInstance,
-    cctp_mock::{
-        MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
-        MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
-    },
     get_new_temp_dir,
-    hyperliquid_bridge_mock::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
     manifest::{DEVNET_ETHEREUM_RPC_PORT, MOCK_SERVICE_NATIVE_BALANCE_WEI},
-    mock_integrators::{MockService, MockServicePaymaster},
+    mock_integrators::{
+        across::contract::MockSpokePool::MockSpokePoolInstance,
+        cctp::contract::{
+            MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
+            MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
+        },
+        hyperliquid::contract::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
+        velora::contract::MockVeloraSwap::MockVeloraSwapInstance,
+        MockService, MockServicePaymaster,
+    },
     token_indexerd::{TokenIndexerConfig, TokenIndexerInstance},
-    velora_mock::MockVeloraSwap::MockVeloraSwapInstance,
     MultichainAccount, RiftDevnetCache,
 };
 
