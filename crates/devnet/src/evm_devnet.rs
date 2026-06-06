@@ -31,7 +31,7 @@ use crate::{
             MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
             MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
         },
-        hyperliquid::contract::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
+        hyperliquid_bridge::contract::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
         velora::contract::MockVeloraSwap::MockVeloraSwapInstance,
         MockService, MockServicePaymaster,
     },
