@@ -184,10 +184,15 @@ impl HyperliquidNode {
     /// Construct and spawn a node, binding per `config.port` and seeding the
     /// guardian genesis balance before the server accepts requests.
     pub async fn spawn_with_config(config: HyperliquidNodeConfig) -> Result<Self, std::io::Error> {
-        let bind_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            config.port.unwrap_or(0),
-        );
+        // A fixed port means the interactive devnet-cli/compose stack, where the
+        // router reaches the node cross-container — bind 0.0.0.0. An ephemeral
+        // port means an in-process test — bind loopback.
+        let bind_ip = if config.port.is_some() {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            Ipv4Addr::LOCALHOST
+        };
+        let bind_addr = SocketAddr::new(IpAddr::V4(bind_ip), config.port.unwrap_or(0));
         let listener = TcpListener::bind(bind_addr).await?;
         let addr = listener.local_addr()?;
 
@@ -272,10 +277,19 @@ impl HyperliquidNode {
             }
         });
 
+        // In-process consumers (the Unit mock, same container) connect via url();
+        // when bound to 0.0.0.0 for cross-container reach, advertise loopback so
+        // the in-process connect target is a real address, not the wildcard.
+        let advertise = if addr.ip().is_unspecified() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+        } else {
+            addr
+        };
+
         Ok(Self {
             core,
             guardian_address,
-            url: format!("http://{addr}"),
+            url: format!("http://{advertise}"),
             shutdown: Some(shutdown_tx),
             handle,
             bridge_indexer_shutdown,

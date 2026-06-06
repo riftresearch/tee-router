@@ -73,6 +73,7 @@ services:
       - "50106:50106"
       - "50107:50107"
       - "50108:50108"
+      - "50109:50109"
       - "50110:50110"
       - "50111:50111"
       - "50112:50112"
@@ -113,7 +114,7 @@ services:
       CCTP_TOKEN_MESSENGER_V2_ADDRESS: "0xcccccccccccccccccccccccccccccccccccc0001"
       CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: "0xcccccccccccccccccccccccccccccccccccc0002"
       HYPERUNIT_API_URL: http://devnet:50107/hyperunit
-      HYPERLIQUID_API_URL: http://devnet:50107/hyperliquid
+      HYPERLIQUID_API_URL: http://devnet:50109
       HYPERLIQUID_NETWORK: testnet
       VELORA_API_URL: http://devnet:50107/velora
       COINBASE_PRICE_API_BASE_URL: http://devnet:50107/coinbase
@@ -162,7 +163,7 @@ services:
       devnet:
         condition: service_healthy
     environment:
-      HL_SHIM_INFO_URL: http://devnet:50107/hyperliquid
+      HL_SHIM_INFO_URL: http://devnet:50109
       # Devnet override: no real HL rate limit, push hard.
       HL_SHIM_HOT_CADENCE_MS: 1000
       HL_SHIM_WARM_CADENCE_MS: 2000

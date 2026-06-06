@@ -1170,7 +1170,14 @@ impl RiftDevnetBuilder {
             })?;
             Some(
                 HyperliquidNode::spawn_with_config(HyperliquidNodeConfig {
-                    port: None,
+                    // Fixed port for the interactive devnet-cli/compose stack (so
+                    // the router reaches it by URL like the EVM/Bitcoin RPCs);
+                    // ephemeral for tests so concurrent devnets don't collide.
+                    port: if self.interactive {
+                        Some(crate::manifest::DEVNET_HYPERLIQUID_NODE_PORT)
+                    } else {
+                        None
+                    },
                     mainnet: false,
                     arbitrum_rpc_url: Some(arbitrum_devnet.anvil.endpoint()),
                     bridge_address: Some(hyperliquid_bridge_address(HyperliquidNetwork::Testnet)),
