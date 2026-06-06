@@ -765,6 +765,66 @@ async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
     assert_eq!(after_wallet_balance, U256::from(10_000_000u64));
 }
 
+/// Regression: concurrent withdraw3 releases must not race the release signer's
+/// nonce. The node builds ONE shared, nonce-managed release provider, so
+/// concurrent releases get sequential nonces. A fresh provider per release gave
+/// each call its own nonce cache, so concurrent releases read the same chain
+/// nonce and failed with "nonce too low" — the node logs a WARN but still
+/// returns `ok` (the clearinghouse debit happened), so the on-chain release is
+/// silently dropped and the order's bridge-withdrawal step strands. The prior
+/// single-shot withdraw3 test never exercised concurrency; the loadgen did.
+#[tokio::test]
+#[ignore = "integration: spawns devnet stack"]
+async fn concurrent_withdraw3_releases_do_not_collide_on_signer_nonce() {
+    let minted_raw = U256::from(12_000_000u64);
+    let (anvil, node, _client, _user, token, _bridge_address) = bridge_fixture(minted_raw).await;
+
+    // All withdraw3s are signed by Anvil account-0 (the release signer); seed its
+    // clearinghouse generously so every concurrent withdrawal has withdrawable.
+    let signer_addr = anvil.addresses()[0];
+    node.seed_clearinghouse(signer_addr, 1_000.0).await;
+
+    // Fire 8 withdraw3s in PARALLEL to distinct destinations (accounts 1..=8),
+    // each releasing net 4 USDC (5 gross - 1 fee) with a unique action nonce.
+    let url = node.url();
+    let private_key: [u8; 32] = anvil.keys()[0].clone().to_bytes().into();
+    let pk_hex = format!("0x{}", hex::encode(private_key));
+    let dests: Vec<Address> = anvil.addresses()[1..=8].to_vec();
+    let base_nonce = 1_700_000_000_000u64;
+    let mut set = tokio::task::JoinSet::new();
+    for (i, dest) in dests.iter().copied().enumerate() {
+        let url = url.clone();
+        let pk_hex = pk_hex.clone();
+        let nonce = base_nonce + 1 + i as u64;
+        set.spawn(async move {
+            let wallet = pk_hex
+                .parse::<PrivateKeySigner>()
+                .expect("client wallet");
+            let client = HyperliquidClient::new(&url, wallet, None, Network::Testnet)
+                .expect("client construction");
+            let resp = client
+                .withdraw_to_bridge(format!("{dest:#x}"), "5".to_string(), nonce)
+                .await
+                .expect("withdraw3");
+            assert_eq!(resp["status"], "ok", "withdraw3 to {dest:#x} status");
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        joined.expect("withdraw3 task panicked");
+    }
+
+    // Every destination must have received its net release — proof that no
+    // release was silently dropped to a signer-nonce collision.
+    for (i, dest) in dests.iter().copied().enumerate() {
+        let bal = wait_for_token_balance(&token, dest, U256::from(4_000_000u64)).await;
+        assert_eq!(
+            bal,
+            U256::from(4_000_000u64),
+            "destination {i} ({dest:#x}) did not receive its release"
+        );
+    }
+}
+
 #[tokio::test]
 async fn subminimum_native_bridge_transfer_is_ignored_by_node_crediting() {
     let amount_raw = U256::from(MINIMUM_BRIDGE_DEPOSIT_USDC - 1);

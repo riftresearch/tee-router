@@ -133,7 +133,13 @@ struct NodeBridgeReleaseWiring {
     arbitrum_rpc_url: String,
     bridge_address: Address,
     usdc_token_address: Address,
-    release_signer_key: [u8; 32],
+    /// Shared release provider (wallet + nonce-managed), built ONCE at node
+    /// spawn so a single `CachedNonceManager` hands out sequential nonces across
+    /// concurrent `withdraw3` releases. A fresh provider per release gives each
+    /// its own nonce cache, so concurrent releases read the same chain nonce and
+    /// collide ("nonce too low"), failing the release and stranding the order's
+    /// bridge-withdrawal step in `waiting_external`.
+    release_provider: DynProvider,
 }
 
 /// The Hyperliquid devnet node: its own [`HyperliquidCore`] ledger plus a
@@ -221,12 +227,32 @@ impl HyperliquidNode {
                 Some(bridge_address),
                 Some(usdc_token_address),
                 Some(release_signer_key),
-            ) => Some(NodeBridgeReleaseWiring {
-                arbitrum_rpc_url,
-                bridge_address,
-                usdc_token_address,
-                release_signer_key,
-            }),
+            ) => {
+                let signer = PrivateKeySigner::from_bytes(&release_signer_key.into())
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("invalid hyperliquid node release signer key: {err}"),
+                        )
+                    })?;
+                let release_provider: DynProvider = ProviderBuilder::new()
+                    .wallet(EthereumWallet::new(signer))
+                    .connect(&arbitrum_rpc_url)
+                    .await
+                    .map_err(|err| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("hyperliquid node release RPC init failed: {err}"),
+                        )
+                    })?
+                    .erased();
+                Some(NodeBridgeReleaseWiring {
+                    arbitrum_rpc_url,
+                    bridge_address,
+                    usdc_token_address,
+                    release_provider,
+                })
+            }
             _ => None,
         };
 
@@ -1247,13 +1273,9 @@ async fn send_node_bridge_withdrawal_release(
     destination: Address,
     payout_raw: u64,
 ) -> Result<(), String> {
-    let signer = PrivateKeySigner::from_bytes(&wiring.release_signer_key.into())
-        .map_err(|err| format!("invalid hyperliquid node release signer key: {err}"))?;
-    let provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::new(signer))
-        .connect(&wiring.arbitrum_rpc_url)
-        .await
-        .map_err(|err| format!("hyperliquid node release RPC init failed: {err}"))?;
+    // The shared, nonce-managed release provider (built once at node spawn) so
+    // concurrent withdraw3 releases get sequential nonces instead of colliding.
+    let provider = wiring.release_provider.clone();
 
     // 1) Fund the bridge with the payout so its `release` `transfer` succeeds.
     let mint_calldata = Bytes::from(
