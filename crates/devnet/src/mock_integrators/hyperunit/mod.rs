@@ -15,7 +15,7 @@ use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, 
 use chrono::Utc;
 use hyperliquid_client::{
     client::Network as HyperliquidClientNetwork, HyperliquidExchangeClient, HyperliquidInfoClient,
-    UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate,
+    UserNonFundingLedgerDelta,
 };
 use hyperunit_client::{
     UnitAsset, UnitChain, UnitGenerateAddressResponse, UnitOperation, UnitOperationsResponse,
@@ -137,10 +137,6 @@ pub(crate) struct UnitMockState {
     pub(crate) bitcoin_cookie_path: Option<PathBuf>,
     pub(crate) next_generate_address_error: Mutex<Option<String>>,
     pub(crate) next_withdrawal_completion_error: Mutex<Option<String>>,
-    /// The Hyperliquid devnet "chain" ledger, shared by `Arc`. Unit deposits
-    /// credit spot balances here; the same instance is held by every venue and
-    /// by [`crate::mock_integrators::MockIntegratorState`].
-    pub(crate) core: Arc<crate::hyperliquid_core::HyperliquidCore>,
     /// Cross-cutting infra the EVM withdrawal release needs (mock-service
     /// paymasters keyed by `(service, chain)`). Shared `Arc` instance.
     pub(crate) shared: Arc<crate::mock_integrators::SharedMockState>,
@@ -922,14 +918,16 @@ pub(crate) struct UnitOperationObservation {
 struct MockHyperunitDepositCredit {
     user: Address,
     coin: &'static str,
-    spot_amount: f64,
-    ledger_amount: String,
-    tx_hash: String,
+    /// The 8-decimal (`WIRE_DECIMALS`), half-to-even rounded credit amount — the
+    /// exact value real Hyperliquid records for the deposit. The guardian
+    /// `spotSend`s this string to the user on the node. `> 0` is the gate for
+    /// actually issuing the credit.
+    amount: String,
     /// The nonce stamped on the node-path guardian `spotSend`. Set to the trailing
     /// `:<n>` of the operation's `destination_tx_hash` so the resulting node
     /// `SpotTransfer` ledger update carries the SAME nonce the Unit deposit
     /// observer derives from `destination_tx_hash` — letting the observer match
-    /// the credit. Unused on the in-process path.
+    /// the credit.
     nonce: u64,
 }
 
@@ -1050,7 +1048,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
                     )
                 })?;
                 let coin = hyperliquid_coin_for_unit_asset(entry.asset);
-                let net_amount = net_hyperunit_credit_amounts(
+                let amount = net_hyperunit_credit_amount(
                     entry.asset,
                     entry
                         .operation
@@ -1075,9 +1073,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
                 Some(MockHyperunitDepositCredit {
                     user,
                     coin,
-                    spot_amount: net_amount.spot_amount,
-                    ledger_amount: net_amount.ledger_amount,
-                    tx_hash: entry.operation.source_tx_hash.clone().unwrap_or_default(),
+                    amount,
                     nonce,
                 })
             }
@@ -1127,28 +1123,18 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
     };
 
     if let Some(credit) = maybe_deposit_credit {
-        if credit.spot_amount > 0.0 {
-            // When pointed at the node, the deposit credit MUST land on the
-            // node's core (the consumers read the node now), so the guardian —
-            // seeded `u32::MAX` UBTC/UETH at node genesis — signs a real
-            // `spotSend(guardian -> user)` against the node's `/exchange`.
-            // Otherwise credit the in-process core (standalone venue tests).
-            if let Some(node_api_url) = state.node_api_url.as_deref() {
-                credit_deposit_via_node_guardian(state, node_api_url, &credit).await?;
-            } else {
-                let mut hl = state.core.lock().await;
-                hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
-                hl.record_ledger_update(
-                    credit.user,
-                    UserNonFundingLedgerUpdate {
-                        time: Utc::now().timestamp_millis().max(0) as u64,
-                        hash: credit.tx_hash,
-                        delta: UserNonFundingLedgerDelta::Deposit {
-                            usdc: credit.ledger_amount,
-                        },
-                    },
-                );
-            }
+        let positive = credit.amount.parse::<f64>().map(|v| v > 0.0).unwrap_or(false);
+        if positive {
+            // The deposit credit lands on the standalone Hyperliquid node (the
+            // sole Hyperliquid): the guardian — seeded `u32::MAX` UBTC/UETH at
+            // node genesis — signs a real `spotSend(guardian -> user)` against
+            // the node's `/exchange`. `node_api_url` is required.
+            let node_api_url = state.node_api_url.as_deref().ok_or_else(|| {
+                "mock Unit deposit: node_api_url is required (the node is the sole \
+                 Hyperliquid); call MockIntegratorConfig::with_unit_node"
+                    .to_string()
+            })?;
+            credit_deposit_via_node_guardian(state, node_api_url, &credit).await?;
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
@@ -1291,7 +1277,6 @@ async fn credit_deposit_via_node_guardian(
     // The node splits the token wire form on ':' and keys balances by the plain
     // symbol, so the token-id suffix is cosmetic; use the guardian-seeded coin.
     let token_wire = format!("{}:0x0000000000000000000000000000000000000000", credit.coin);
-    let amount = hyperliquid_client::float_to_wire(credit.spot_amount);
     // Use the operation's destination nonce as the spotSend nonce so the node's
     // resulting `SpotTransfer` ledger update matches what the Unit deposit
     // observer expects (see `MockHyperunitDepositCredit::nonce`).
@@ -1299,7 +1284,7 @@ async fn credit_deposit_via_node_guardian(
         .spot_send(
             format!("{:#x}", credit.user),
             token_wire,
-            amount,
+            credit.amount.clone(),
             credit.nonce,
         )
         .await
@@ -1610,31 +1595,6 @@ fn default_mock_unit_fee_amounts() -> (String, String) {
     ("0".to_string(), "0".to_string())
 }
 
-struct MockHyperunitCreditAmounts {
-    spot_amount: f64,
-    ledger_amount: String,
-}
-
-fn net_hyperunit_credit_amounts(
-    asset: UnitAsset,
-    source_amount: &str,
-    destination_fee_amount: Option<&str>,
-    sweep_fee_amount: Option<&str>,
-) -> Result<MockHyperunitCreditAmounts, String> {
-    let net_raw =
-        net_hyperunit_credit_raw(source_amount, destination_fee_amount, sweep_fee_amount)?;
-    let ledger_amount = net_hyperunit_credit_amount(
-        asset,
-        source_amount,
-        destination_fee_amount,
-        sweep_fee_amount,
-    )?;
-    Ok(MockHyperunitCreditAmounts {
-        spot_amount: scaled_raw_to_f64(net_raw, unit_asset_decimals(asset)),
-        ledger_amount,
-    })
-}
-
 fn net_hyperunit_credit_amount(
     asset: UnitAsset,
     source_amount: &str,
@@ -1676,9 +1636,6 @@ fn hyperunit_credit_amount_from_raw(asset: UnitAsset, raw: u128) -> String {
     )
 }
 
-fn scaled_raw_to_f64(raw: u128, decimals: u8) -> f64 {
-    raw as f64 / 10_f64.powi(i32::from(decimals))
-}
 
 fn parse_optional_raw_amount(value: Option<&str>, field: &'static str) -> Result<u128, String> {
     let Some(value) = value else {
@@ -2025,7 +1982,16 @@ mod tests {
 
     #[tokio::test]
     async fn unit_mock_generates_fresh_protocol_addresses_and_preserves_destination_history() {
-        let server = MockIntegratorServer::spawn().await.expect("spawn");
+        // Completing the deposit ops credits the user's spot on the node (the
+        // sole Hyperliquid), so the Unit mock is pointed at a node guardian.
+        let node = crate::hyperliquid_devnet::HyperliquidNode::spawn()
+            .await
+            .expect("spawn hyperliquid node");
+        let server = MockIntegratorServer::spawn_with_config(
+            MockIntegratorConfig::default().with_unit_node(node.url(), node.guardian_key()),
+        )
+        .await
+        .expect("spawn");
         let destination = "0x33f65788aca48d733c2c2444ac9f79b18206aa92";
         let gen_url = format!(
             "{}/gen/ethereum/hyperliquid/eth/{}",
@@ -2162,44 +2128,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mock_credit_amount_matches_sauron_expectation() {
-        let server = MockIntegratorServer::spawn().await.expect("spawn");
-        let user = Address::repeat_byte(0x33);
-        let generated: UnitGenerateAddressResponse = reqwest::get(format!(
-            "{}/gen/ethereum/hyperliquid/eth/{user:#x}",
-            server.hyperunit_url()
-        ))
-        .await
-        .expect("gen")
-        .error_for_status()
-        .expect("gen 200")
-        .json()
-        .await
-        .expect("gen json");
-
-        complete_mock_unit_operation_with_observation(
-            &server.state.unit,
-            &generated.address,
-            Some(UnitOperationObservation {
-                source_amount: "69613175000000000".to_string(),
-                source_tx_hash: Some("0xunitdepositprecision".to_string()),
-            }),
-        )
-        .await
-        .expect("complete unit deposit");
-
-        let hl = server.state.hyperliquid_core.lock().await;
-        let updates = hl.ledger_updates.get(&user).expect("ledger updates");
-        let amount = updates
-            .iter()
-            .find_map(|update| match &update.delta {
-                UserNonFundingLedgerDelta::Deposit { usdc } => Some(usdc.as_str()),
-                _ => None,
-            })
-            .expect("deposit ledger update");
-
-        assert_eq!(amount, "0.06961318");
+    /// The Unit deposit-credit amount computation (raw Unit source amount, less
+    /// fees, scaled to the HL spot ledger amount) must round to the 8-decimal
+    /// value sauron's deposit observer expects. This exercises
+    /// `net_hyperunit_credit_amount` directly — the precision guard survives
+    /// without an in-process Hyperliquid core.
+    #[test]
+    fn mock_credit_amount_matches_sauron_expectation() {
+        let ledger_amount =
+            net_hyperunit_credit_amount(UnitAsset::Eth, "69613175000000000", None, None)
+                .expect("credit amount");
+        assert_eq!(ledger_amount, "0.06961318");
     }
 
     #[tokio::test]
@@ -2397,7 +2336,14 @@ mod tests {
 
     #[tokio::test]
     async fn unit_bitcoin_indexer_completes_confirmed_block_outputs() {
-        let state = Arc::new(MockIntegratorState::new(&MockIntegratorConfig::default()));
+        // The deposit credit lands on the node (the sole Hyperliquid); point the
+        // Unit mock at a node guardian so completion's spot credit succeeds.
+        let node = crate::hyperliquid_devnet::HyperliquidNode::spawn()
+            .await
+            .expect("spawn hyperliquid node");
+        let state = Arc::new(MockIntegratorState::new(
+            &MockIntegratorConfig::default().with_unit_node(node.url(), node.guardian_key()),
+        ));
         let protocol_wallet =
             fresh_mock_protocol_wallet(UnitChain::Bitcoin, UnitChain::Hyperliquid);
         let protocol_address = protocol_wallet.address;

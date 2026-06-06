@@ -25,13 +25,13 @@ use alloy::{
 use crate::{
     get_new_temp_dir,
     manifest::{DEVNET_ETHEREUM_RPC_PORT, MOCK_SERVICE_NATIVE_BALANCE_WEI},
+    hyperliquid_devnet::contract::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
     mock_integrators::{
         across::contract::MockSpokePool::MockSpokePoolInstance,
         cctp::contract::{
             MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
             MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
         },
-        hyperliquid_bridge::contract::MockHyperliquidBridge2::MockHyperliquidBridge2Instance,
         velora::contract::MockVeloraSwap::MockVeloraSwapInstance,
         MockService, MockServicePaymaster,
     },

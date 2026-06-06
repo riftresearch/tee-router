@@ -6,7 +6,6 @@ use alloy::{
 };
 use axum::{http::StatusCode, response::IntoResponse, Json, Router};
 use chrono::{DateTime, Utc};
-use hyperliquid_client::{UserFill, UserFunding, UserNonFundingLedgerUpdate};
 use hyperunit_client::{UnitAsset, UnitChain, UnitOperation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,15 +30,13 @@ pub(crate) mod across;
 pub(crate) mod chainalysis;
 pub(crate) mod cctp;
 pub(crate) mod coinbase;
-pub(crate) mod hyperliquid_bridge;
-pub(crate) mod hyperliquid_spot;
 pub(crate) mod hyperunit;
 pub(crate) mod velora;
 
 pub use across::{MockAcrossChainConfig, MockAcrossDepositRecord};
 pub use chainalysis::{MockAddressRiskLevel, MockAddressScreeningRule};
 pub use cctp::{MockCctpBurnRecord, MockCctpChainConfig, MockCctpDelayReason};
-pub use hyperliquid_bridge::contract::MockHyperliquidBridge2;
+pub use crate::hyperliquid_devnet::contract::MockHyperliquidBridge2;
 pub use hyperunit::{
     MockUnitGenerateAddressRequest, MockUnitOperationKind, MockUnitOperationRecord,
 };
@@ -47,9 +44,6 @@ use across::{maybe_spawn_across_deposit_indexer, AcrossMockState};
 use chainalysis::{normalize_mock_screening_address, ChainalysisMockState};
 use cctp::{cctp_domain_for_chain_id, maybe_spawn_cctp_burn_indexer, CctpMockState};
 use coinbase::CoinbaseMockState;
-use hyperliquid_bridge::{maybe_spawn_hyperliquid_bridge_indexer, HyperliquidBridgeMockState};
-use hyperliquid_spot::HyperliquidSpotMockState;
-use crate::hyperliquid_core::HyperliquidCore;
 use hyperunit::{
     complete_mock_unit_operation, complete_mock_unit_operation_with_observation,
     fail_mock_unit_operation, maybe_spawn_unit_deposit_indexers, snapshot_unit_operations,
@@ -138,7 +132,6 @@ pub struct MockServicePaymaster {
 #[derive(Clone, Copy, Debug)]
 enum MockServicePaymasterTestBehavior {
     Hang(Duration),
-    Succeed(TxHash),
 }
 
 impl fmt::Debug for MockServicePaymaster {
@@ -185,16 +178,6 @@ impl MockServicePaymaster {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn successful(service: MockService, chain_id: u64, tx_hash: TxHash) -> Self {
-        Self {
-            service,
-            chain_id,
-            handle: None,
-            test_behavior: Some(MockServicePaymasterTestBehavior::Succeed(tx_hash)),
-        }
-    }
-
     pub fn service(&self) -> MockService {
         self.service
     }
@@ -213,7 +196,6 @@ impl MockServicePaymaster {
                         message: "test paymaster hang completed without submitting".to_string(),
                     })
                 }
-                MockServicePaymasterTestBehavior::Succeed(tx_hash) => Ok(tx_hash),
             };
         }
 
@@ -260,7 +242,6 @@ pub struct MockIntegratorLedgerSnapshot {
     pub recipient_balances: BTreeMap<String, String>,
     pub unit_operations: Vec<MockUnitOperationRecord>,
     pub cctp_burns: Vec<MockCctpBurnRecord>,
-    pub hyperliquid_exchange_submissions: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -319,12 +300,13 @@ pub struct MockIntegratorConfig {
     /// EVM RPC URLs used to detect native Unit deposits into generated
     /// protocol addresses.
     pub unit_evm_rpc_urls: BTreeMap<String, String>,
-    /// When `Some`, the Unit mock treats the standalone Hyperliquid node at
-    /// this base URL as the real HL guardian client target: deposits credit
-    /// the user's spot ON THE NODE via a guardian `spotSend`, and a background
-    /// poller watches the node for incoming spotSends that settle Unit
-    /// withdrawals. When `None`, the Unit mock keeps crediting/reading its own
-    /// in-process [`HyperliquidCore`] (the standalone venue-test path).
+    /// The base URL of the standalone Hyperliquid
+    /// [`HyperliquidNode`](crate::hyperliquid_devnet::HyperliquidNode) the Unit
+    /// mock settles against: deposits credit the user's spot ON THE NODE via a
+    /// guardian `spotSend`, and a background poller watches the node for
+    /// incoming spotSends that settle Unit withdrawals. This is **required** for
+    /// any Unit deposit/withdrawal — the Unit mock has no in-process Hyperliquid;
+    /// the node is the sole Hyperliquid.
     pub unit_node_api_url: Option<String>,
     /// Raw secp256k1 scalar of the node's HL guardian account
     /// (`HYPERLIQUID_GUARDIAN_PRIVATE_KEY`). Required alongside
@@ -541,8 +523,8 @@ impl MockIntegratorConfig {
     /// Point the Unit mock at the standalone Hyperliquid node. Deposits then
     /// credit the user's spot on the node via a guardian `spotSend` (signed by
     /// `guardian_key`), and a background poller settles Unit withdrawals by
-    /// watching the node for the router's incoming spotSends. Omit (leave
-    /// `None`) to keep the in-process [`HyperliquidCore`] path.
+    /// watching the node for the router's incoming spotSends. This is **required**
+    /// to exercise any Unit deposit/withdrawal — the node is the sole Hyperliquid.
     #[must_use]
     pub fn with_unit_node(
         mut self,
@@ -748,27 +730,17 @@ pub(crate) struct SharedMockState {
 
 /// Thin composition of the per-venue mock states. Each venue owns its own
 /// config/state behind an `Arc` (anticipating later axum substate threading),
-/// the Hyperliquid account ledger lives in its own `Arc<HyperliquidCore>`, and
-/// genuinely cross-cutting infra lives on [`SharedMockState`].
+/// and genuinely cross-cutting infra lives on [`SharedMockState`].
+///
+/// Hyperliquid is no longer a venue here: it lives entirely in the standalone
+/// [`HyperliquidNode`](crate::hyperliquid_devnet::HyperliquidNode). The Unit
+/// venue is the only HL consumer, and it talks to the node over HTTP (guardian
+/// `spotSend` deposits + the node-withdrawal poller).
 pub(crate) struct MockIntegratorState {
     pub(crate) across: Arc<AcrossMockState>,
     pub(crate) cctp: Arc<CctpMockState>,
     pub(crate) velora: Arc<VeloraMockState>,
     pub(crate) unit: Arc<UnitMockState>,
-    pub(crate) hyperliquid_spot: Arc<HyperliquidSpotMockState>,
-    pub(crate) hyperliquid_bridge: Arc<HyperliquidBridgeMockState>,
-    /// The Hyperliquid devnet "chain" state, shared by `Arc` across every
-    /// settlement path (spot/exchange handlers, the Bridge2 deposit indexer,
-    /// and HyperUnit deposit/withdrawal completion). A single instance is
-    /// constructed once in [`MockIntegratorState::new`] and handed to all three
-    /// venues via this `Arc` — no venue reaches into another's state.
-    // TODO(step: RiftDevnet ownership): the eventual target is for `RiftDevnet`
-    // to own `hyperliquid: Arc<HyperliquidCore>` as a devnet chain peer (like
-    // `bitcoin` / `ethereum`) and pass it into the mock spawn. That requires
-    // threading the Arc through `MockIntegratorServer::spawn_with_config` and
-    // every one of its ~58 call sites, so for this step the Arc is owned here
-    // and shared; the single-instance guarantee already holds.
-    pub(crate) hyperliquid_core: Arc<HyperliquidCore>,
     /// The Coinbase spot-price mock currently serves only static prices, so
     /// nothing reads this yet; it is held for uniformity with the other venue
     /// states and as the home for future Coinbase tunables.
@@ -794,8 +766,6 @@ pub struct MockIntegratorServer {
     handle: JoinHandle<()>,
     across_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
     across_indexer_handles: Vec<JoinHandle<()>>,
-    hyperliquid_indexer_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    hyperliquid_indexer_handle: Option<JoinHandle<()>>,
     unit_deposit_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
     unit_deposit_indexer_handles: Vec<JoinHandle<()>>,
     cctp_indexer_shutdowns: Vec<tokio::sync::oneshot::Sender<()>>,
@@ -830,8 +800,6 @@ impl MockIntegratorServer {
         // background is visible to the venue's HTTP handlers).
         let (across_indexer_shutdowns, across_indexer_handles) =
             maybe_spawn_across_deposit_indexer(&config, state.across.clone()).await?;
-        let (hyperliquid_indexer_shutdown, hyperliquid_indexer_handle) =
-            maybe_spawn_hyperliquid_bridge_indexer(&config, state.hyperliquid_bridge.clone()).await?;
         let (unit_deposit_indexer_shutdowns, unit_deposit_indexer_handles) =
             maybe_spawn_unit_deposit_indexers(&config, state.unit.clone()).await?;
         let (cctp_indexer_shutdowns, cctp_indexer_handles) =
@@ -850,10 +818,6 @@ impl MockIntegratorServer {
             .nest(
                 "/hyperunit",
                 hyperunit::router().with_state(state.unit.clone()),
-            )
-            .nest(
-                "/hyperliquid",
-                hyperliquid_spot::router().with_state(state.hyperliquid_spot.clone()),
             )
             .nest(
                 "/coinbase",
@@ -882,8 +846,6 @@ impl MockIntegratorServer {
             handle,
             across_indexer_shutdowns,
             across_indexer_handles,
-            hyperliquid_indexer_shutdown,
-            hyperliquid_indexer_handle,
             unit_deposit_indexer_shutdowns,
             unit_deposit_indexer_handles,
             cctp_indexer_shutdowns,
@@ -916,10 +878,6 @@ impl MockIntegratorServer {
         format!("{}/hyperunit", self.base_url)
     }
     #[must_use]
-    pub fn hyperliquid_url(&self) -> String {
-        format!("{}/hyperliquid", self.base_url)
-    }
-    #[must_use]
     pub fn coinbase_url(&self) -> String {
         format!("{}/coinbase", self.base_url)
     }
@@ -932,15 +890,6 @@ impl MockIntegratorServer {
         self.state
             .unit
             .generate_address_requests
-            .lock()
-            .await
-            .clone()
-    }
-
-    pub async fn hyperliquid_exchange_submissions(&self) -> Vec<Value> {
-        self.state
-            .hyperliquid_spot
-            .exchange_submissions
             .lock()
             .await
             .clone()
@@ -961,13 +910,6 @@ impl MockIntegratorServer {
     }
 
     pub async fn ledger_snapshot(&self) -> MockIntegratorLedgerSnapshot {
-        let exchange_submissions = self
-            .state
-            .hyperliquid_spot
-            .exchange_submissions
-            .lock()
-            .await
-            .clone();
         let unit_operations = snapshot_unit_operations(&*self.state.unit.operations.lock().await);
         let cctp_burns = self
             .state
@@ -983,7 +925,7 @@ impl MockIntegratorServer {
             .ledger
             .lock()
             .await
-            .snapshot(exchange_submissions, unit_operations, cctp_burns)
+            .snapshot(unit_operations, cctp_burns)
     }
 
     pub async fn fail_next_across_swap_approval(&self, error: impl Into<String>) {
@@ -1001,10 +943,6 @@ impl MockIntegratorServer {
             .next_withdrawal_completion_error
             .lock()
             .await = Some(error.into());
-    }
-
-    pub async fn fail_next_hyperliquid_exchange(&self, error: impl Into<String>) {
-        *self.state.hyperliquid_spot.next_exchange_error.lock().await = Some(error.into());
     }
 
     /// Advance a tracked unit operation to `done`. Tests use this to simulate
@@ -1143,107 +1081,6 @@ impl MockIntegratorServer {
             .collect()
     }
 
-    /// Credit `amount` of `coin` (e.g. "USDC", "UBTC") to `user`'s mock
-    /// Hyperliquid spot balance. Used by tests to fund an account before
-    /// placing orders, without going through a deposit flow.
-    pub async fn credit_hyperliquid_balance(&self, user: Address, coin: &str, amount: f64) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .credit_spot(user, coin, amount);
-    }
-
-    /// Credit `amount` of `coin` to the mock clearinghouse ledger. This is
-    /// the balance surface real Bridge2 deposits land on before a
-    /// `usdClassTransfer` moves funds into spot.
-    pub async fn credit_hyperliquid_clearinghouse_balance(
-        &self,
-        user: Address,
-        coin: &str,
-        amount: f64,
-    ) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .credit_clearinghouse(user, coin, amount);
-    }
-
-    /// Read the `total` balance for `user`/`coin`. Returns 0.0 when absent.
-    pub async fn hyperliquid_balance_of(&self, user: Address, coin: &str) -> f64 {
-        self.state.hyperliquid_core.lock().await.spot_total(user, coin)
-    }
-
-    /// Read the clearinghouse balance for `user`/`coin`. Returns 0.0 when
-    /// absent.
-    pub async fn hyperliquid_clearinghouse_balance_of(&self, user: Address, coin: &str) -> f64 {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .clearinghouse_total(user, coin)
-    }
-
-    /// Seed a historical Hyperliquid fill for `/info { type:
-    /// "userFillsByTime" }` and `/info { type: "userFills" }` shape tests.
-    pub async fn record_hyperliquid_fill(&self, user: Address, fill: UserFill) {
-        self.state.hyperliquid_core.lock().await.record_fill(user, fill);
-    }
-
-    /// Seed a non-funding ledger update for `/info { type:
-    /// "userNonFundingLedgerUpdates" }`.
-    pub async fn record_hyperliquid_ledger_update(
-        &self,
-        user: Address,
-        update: UserNonFundingLedgerUpdate,
-    ) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .record_ledger_update(user, update);
-    }
-
-    /// Seed a funding payment for `/info { type: "userFunding" }`.
-    pub async fn record_hyperliquid_funding(&self, user: Address, funding: UserFunding) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .record_funding(user, funding);
-    }
-
-    /// Install (or overwrite) the exchange rate for a spot pair. `rate` is the
-    /// price of one `base` unit in `quote` units (e.g. `set_hyperliquid_rate
-    /// ("UBTC", "USDC", 60_000.0)` means 1 UBTC = 60 000 USDC).
-    ///
-    /// An IoC buy of `sz` base at limit_px ≥ rate fills at exactly `rate`,
-    /// debiting `sz * rate` quote and crediting `sz` base. A sell mirrors the
-    /// direction.
-    pub async fn set_hyperliquid_rate(&self, base: &str, quote: &str, rate: f64) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .set_rate(base, quote, rate);
-    }
-
-    /// Override the synthesized top-of-book depth for both bid and ask sides
-    /// of a spot pair. Useful for testing partial-fill semantics.
-    pub async fn set_hyperliquid_book_depth(&self, base: &str, quote: &str, depth: f64) {
-        self.state
-            .hyperliquid_core
-            .lock()
-            .await
-            .set_book_depth(base, quote, depth);
-    }
-
-    /// Inspect the configured rate for a pair (returns `None` if none installed).
-    pub async fn hyperliquid_rate(&self, base: &str, quote: &str) -> Option<f64> {
-        self.state.hyperliquid_core.lock().await.rate_for(base, quote)
-    }
-
     /// Install (or overwrite) the mock Velora USD price in micro-dollars per
     /// whole token. Defaults are ETH=$3,000, BTC=$100,000, USDC=$1, USDT=$1.
     pub async fn set_velora_usd_price_micro(&self, symbol: &str, usd_micro: u128) {
@@ -1286,7 +1123,6 @@ impl MockIntegratorState {
             mock_service_paymasters: config.mock_service_paymasters.clone(),
             ledger: Mutex::default(),
         });
-        let hyperliquid_core = Arc::new(HyperliquidCore::new());
 
         let across = Arc::new(AcrossMockState {
             spoke_pool_address: config.across_spoke_pool_address.clone(),
@@ -1328,31 +1164,6 @@ impl MockIntegratorState {
             bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),
             next_generate_address_error: Mutex::default(),
             next_withdrawal_completion_error: Mutex::default(),
-            core: hyperliquid_core.clone(),
-            shared: shared.clone(),
-        });
-        // The Bridge2 venue is constructed before the spot venue: the spot
-        // `withdraw3` handler holds an `Arc` to it (to trigger the on-chain
-        // release after debiting the clearinghouse).
-        let hyperliquid_bridge = Arc::new(HyperliquidBridgeMockState {
-            bridge_address: config.hyperliquid_bridge_address.clone(),
-            evm_rpc_url: config.hyperliquid_evm_rpc_url.clone(),
-            usdc_token_address: config.hyperliquid_usdc_token_address.clone(),
-            bridge_deposit_latency: config.hyperliquid_bridge_deposit_latency,
-            bridge_deposit_failure_probability_bps: config
-                .hyperliquid_bridge_deposit_failure_probability_bps
-                .min(10_000),
-            core: hyperliquid_core.clone(),
-            shared: shared.clone(),
-        });
-        let hyperliquid_spot = Arc::new(HyperliquidSpotMockState {
-            exchange_submissions: Mutex::default(),
-            withdrawal_latency: config.hyperliquid_withdrawal_latency,
-            next_exchange_error: Mutex::default(),
-            mainnet: config.mainnet_hyperliquid,
-            core: hyperliquid_core.clone(),
-            unit: unit.clone(),
-            bridge: hyperliquid_bridge.clone(),
             shared: shared.clone(),
         });
 
@@ -1361,9 +1172,6 @@ impl MockIntegratorState {
             cctp,
             velora,
             unit,
-            hyperliquid_spot,
-            hyperliquid_bridge,
-            hyperliquid_core,
             coinbase: Arc::new(CoinbaseMockState),
             chainalysis: Arc::new(ChainalysisMockState {
                 address_screening_rules: config.address_screening_rules.clone(),
@@ -1371,7 +1179,6 @@ impl MockIntegratorState {
             shared,
         }
     }
-
 }
 
 impl SharedMockState {
@@ -1426,9 +1233,6 @@ impl Drop for MockIntegratorServer {
         for shutdown in self.across_indexer_shutdowns.drain(..) {
             let _ = shutdown.send(());
         }
-        if let Some(shutdown) = self.hyperliquid_indexer_shutdown.take() {
-            let _ = shutdown.send(());
-        }
         for shutdown in self.unit_deposit_indexer_shutdowns.drain(..) {
             let _ = shutdown.send(());
         }
@@ -1437,9 +1241,6 @@ impl Drop for MockIntegratorServer {
         }
         self.handle.abort();
         for handle in self.across_indexer_handles.drain(..) {
-            handle.abort();
-        }
-        if let Some(handle) = self.hyperliquid_indexer_handle.take() {
             handle.abort();
         }
         for handle in self.unit_deposit_indexer_handles.drain(..) {
@@ -1454,7 +1255,6 @@ impl Drop for MockIntegratorServer {
 impl MockIntegratorLedger {
     fn snapshot(
         &self,
-        hyperliquid_exchange_submissions: Vec<Value>,
         unit_operations: Vec<MockUnitOperationRecord>,
         cctp_burns: Vec<MockCctpBurnRecord>,
     ) -> MockIntegratorLedgerSnapshot {
@@ -1464,7 +1264,6 @@ impl MockIntegratorLedger {
             recipient_balances: stringify_balances(&self.recipient_balances),
             unit_operations,
             cctp_burns,
-            hyperliquid_exchange_submissions,
         }
     }
 }

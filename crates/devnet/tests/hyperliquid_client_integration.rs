@@ -1,13 +1,13 @@
-//! End-to-end tests for `hyperliquid-client` against the devnet mock
-//! integrator. Each test spins up `MockIntegratorServer`, points a real
-//! `HyperliquidClient` at it, and drives a spot-trading lifecycle. The mock
-//! speaks the real `/info` + `/exchange` wire shapes, so these tests
-//! exercise the same code path the router uses against live Hyperliquid.
+//! End-to-end tests for `hyperliquid-client` against the standalone Hyperliquid
+//! devnet **node** ([`HyperliquidNode`]). Each test spins up the node, points a
+//! real `HyperliquidClient` at it, and drives a spot-trading lifecycle. The node
+//! speaks the real `/info` + `/exchange` wire shapes, so these tests exercise
+//! the same code path the router uses against live Hyperliquid.
 //!
-//! The mock is deliberately scoped: a single configurable external price per
-//! pair, immediate fills for marketable orders, and lightweight resting-order
-//! semantics (`openOrders`, `hold`, cancel, and fill-on-price-move) without a
-//! full matching engine.
+//! The node is the SOLE Hyperliquid in the devnet (there is no longer a venue
+//! mock under `/hyperliquid`). The bridge tests wire the node to a freshly
+//! deployed Bridge2 on a local Anvil chain so its OWN Bridge2 deposit indexer +
+//! on-chain `withdraw3` release run against a real contract.
 
 use alloy::{
     hex,
@@ -20,7 +20,7 @@ use alloy::{
 use devnet::evm_devnet::ARBITRUM_USDC_ADDRESS;
 use devnet::mock_integrators::MockHyperliquidBridge2::MockHyperliquidBridge2Instance;
 use devnet::mock_integrators::{MockIntegratorConfig, MockIntegratorServer};
-use devnet::RiftDevnet;
+use devnet::{HyperliquidNode, HyperliquidNodeConfig, RiftDevnet};
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use serde_json::{json, Value};
 use hyperliquid_client::{
@@ -35,44 +35,31 @@ use url::Url;
 const UBTC_USDC: &str = "UBTC/USDC";
 const UETH_USDC: &str = "UETH/USDC";
 
-/// Spin up a fresh mock + a testnet-mode client whose wallet has the given
-/// initial balances pre-credited.
-async fn fixture(balances: &[(&str, f64)]) -> (MockIntegratorServer, HyperliquidClient, Address) {
-    let server = MockIntegratorServer::spawn()
-        .await
-        .expect("spawn mock integrator");
+/// Spin up a fresh node + a testnet-mode client whose wallet has the given
+/// initial spot balances pre-credited.
+async fn fixture(balances: &[(&str, f64)]) -> (HyperliquidNode, HyperliquidClient, Address) {
+    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let address = wallet.address();
     for (coin, amount) in balances {
-        server
-            .credit_hyperliquid_balance(address, coin, *amount)
-            .await;
+        node.seed_spot(address, coin, *amount).await;
     }
-    let mut client = HyperliquidClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
-        .expect("client construction");
+    let mut client =
+        HyperliquidClient::new(&node.url(), wallet, None, Network::Testnet).expect("client construction");
     client.refresh_spot_meta().await.expect("refresh spot meta");
-    (server, client, address)
+    (node, client, address)
 }
 
+/// Spin up a local Anvil chain, deploy a fresh USDC token + Bridge2 contract,
+/// mint `minted_usdc_raw` to the funded account-0, then spawn a
+/// [`HyperliquidNode`] wired to that bridge so its OWN deposit indexer +
+/// `withdraw3` release run against the real contract. The node uses Anvil
+/// account-0 (the token's deployer/minter) as its on-chain release signer.
 async fn bridge_fixture(
     minted_usdc_raw: U256,
 ) -> (
     AnvilInstance,
-    MockIntegratorServer,
-    HyperliquidClient,
-    Address,
-    GenericEIP3009ERC20Instance<DynProvider>,
-    Address,
-) {
-    bridge_fixture_with_config(minted_usdc_raw, |config| config).await
-}
-
-async fn bridge_fixture_with_config(
-    minted_usdc_raw: U256,
-    configure: impl FnOnce(MockIntegratorConfig) -> MockIntegratorConfig,
-) -> (
-    AnvilInstance,
-    MockIntegratorServer,
+    HyperliquidNode,
     HyperliquidClient,
     Address,
     GenericEIP3009ERC20Instance<DynProvider>,
@@ -111,22 +98,24 @@ async fn bridge_fixture_with_config(
         .expect("deploy bridge");
     let bridge_address = *bridge.address();
 
-    let config = MockIntegratorConfig::default()
-        .with_hyperliquid_bridge_address(format!("{bridge_address:#x}"))
-        .with_hyperliquid_evm_rpc_url(rpc_url.to_string())
-        .with_hyperliquid_usdc_token_address(format!("{:#x}", token.address()))
-        .with_mock_service_evm_chain(anvil.chain_id(), rpc_url.to_string());
-    let server = MockIntegratorServer::spawn_with_config(configure(config))
-        .await
-        .expect("spawn mock integrator");
+    let node = HyperliquidNode::spawn_with_config(HyperliquidNodeConfig {
+        port: None,
+        mainnet: false,
+        arbitrum_rpc_url: Some(rpc_url.to_string()),
+        bridge_address: Some(bridge_address),
+        usdc_token_address: Some(*token.address()),
+        release_signer_key: Some(private_key),
+    })
+    .await
+    .expect("spawn hyperliquid node");
 
     let wallet = format!("0x{}", hex::encode(private_key))
         .parse::<PrivateKeySigner>()
         .expect("client wallet");
-    let client = HyperliquidClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
+    let client = HyperliquidClient::new(&node.url(), wallet, None, Network::Testnet)
         .expect("client construction");
 
-    (anvil, server, client, user, token, bridge_address)
+    (anvil, node, client, user, token, bridge_address)
 }
 
 fn parse_total(state: &SpotClearinghouseState, coin: &str) -> f64 {
@@ -163,20 +152,16 @@ fn sample_indexer_fill(time: u64) -> UserFill {
 }
 
 #[tokio::test]
-async fn split_info_and_exchange_clients_work_against_mock() {
-    let server = MockIntegratorServer::spawn()
-        .await
-        .expect("spawn mock integrator");
+async fn split_info_and_exchange_clients_work_against_node() {
+    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let user = wallet.address();
-    server
-        .credit_hyperliquid_balance(user, "USDC", 10_000.0)
-        .await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    node.seed_spot(user, "USDC", 10_000.0).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
 
-    let mut info = HyperliquidInfoClient::new(&server.hyperliquid_url()).expect("info client");
+    let mut info = HyperliquidInfoClient::new(&node.url()).expect("info client");
     let exchange =
-        HyperliquidExchangeClient::new(&server.hyperliquid_url(), wallet, None, Network::Testnet)
+        HyperliquidExchangeClient::new(&node.url(), wallet, None, Network::Testnet)
             .expect("exchange client");
     let meta = info.refresh_spot_meta().await.expect("refresh spot meta");
     assert!(meta.base_token_for(UBTC_USDC).is_some());
@@ -209,17 +194,13 @@ async fn split_info_and_exchange_clients_work_against_mock() {
 }
 
 #[tokio::test]
-async fn info_client_decodes_indexer_info_endpoints_against_mock() {
-    let server = MockIntegratorServer::spawn()
-        .await
-        .expect("spawn mock integrator");
+async fn info_client_decodes_indexer_info_endpoints_against_node() {
+    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let user = wallet.address();
-    server
-        .record_hyperliquid_fill(user, sample_indexer_fill(1_700_000_000_000))
+    node.record_fill(user, sample_indexer_fill(1_700_000_000_000))
         .await;
-    server
-        .record_hyperliquid_ledger_update(
+    node.record_ledger_update(
             user,
             UserNonFundingLedgerUpdate {
                 time: 1_700_000_000_100,
@@ -237,8 +218,7 @@ async fn info_client_decodes_indexer_info_endpoints_against_mock() {
             },
         )
         .await;
-    server
-        .record_hyperliquid_funding(
+    node.record_funding(
             user,
             UserFunding {
                 time: 1_700_000_000_200,
@@ -250,7 +230,7 @@ async fn info_client_decodes_indexer_info_endpoints_against_mock() {
         )
         .await;
 
-    let info = HyperliquidInfoClient::new(&server.hyperliquid_url()).expect("info client");
+    let info = HyperliquidInfoClient::new(&node.url()).expect("info client");
     let meta = info.fetch_perp_meta().await.expect("perp meta");
     assert!(meta.universe.iter().any(|asset| asset.name == "BTC"));
 
@@ -283,16 +263,14 @@ async fn info_client_decodes_indexer_info_endpoints_against_mock() {
 }
 
 async fn wait_for_hyperliquid_clearinghouse_balance(
-    server: &MockIntegratorServer,
+    node: &HyperliquidNode,
     user: Address,
     coin: &str,
     expected: f64,
 ) -> f64 {
     let mut observed = 0.0;
     for _ in 0..50 {
-        observed = server
-            .hyperliquid_clearinghouse_balance_of(user, coin)
-            .await;
+        observed = node.clearinghouse_balance_of(user, coin).await;
         if (observed - expected).abs() < 1e-9 {
             return observed;
         }
@@ -327,8 +305,8 @@ async fn spot_meta_resolves_asset_indexes() {
 
 #[tokio::test]
 async fn l2_book_reflects_configured_rate() {
-    let (server, client, _addr) = fixture(&[]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    let (node, client, _addr) = fixture(&[]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
     let book = client.l2_book(UBTC_USDC).await.expect("fetch l2 book");
     // One-level synthetic book at the configured rate on both sides.
     let best_bid = book.best_bid().expect("has a bid");
@@ -343,8 +321,8 @@ async fn l2_book_reflects_configured_rate() {
 async fn ioc_buy_debits_quote_and_credits_base_at_rate() {
     // Rate: 30 000 USDC/UBTC. Buy 0.1 UBTC at limit 31 000 -> fills at 30 000,
     // debits 3 000 USDC, credits 0.1 UBTC.
-    let (server, client, user) = fixture(&[("USDC", 10_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     let response = client
         .place_orders(
@@ -381,8 +359,8 @@ async fn ioc_buy_debits_quote_and_credits_base_at_rate() {
 async fn ioc_sell_debits_base_and_credits_quote_at_rate() {
     // Rate: 32 000 USDC/UBTC. Sell 0.3 UBTC at limit 31 000 -> fills at
     // 32 000, debits 0.3 UBTC, credits 9 600 USDC.
-    let (server, client, user) = fixture(&[("UBTC", 1.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 32_000.0).await;
+    let (node, client, user) = fixture(&[("UBTC", 1.0)]).await;
+    node.set_rate("UBTC", "USDC", 32_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     let response = client
         .place_orders(
@@ -416,8 +394,8 @@ async fn ioc_sell_debits_base_and_credits_quote_at_rate() {
 
 #[tokio::test]
 async fn order_status_reflects_filled_state() {
-    let (server, client, user) = fixture(&[("USDC", 5_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 28_000.0).await;
+    let (node, client, user) = fixture(&[("USDC", 5_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 28_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     let response = client
         .place_orders(
@@ -450,10 +428,10 @@ async fn order_status_reflects_filled_state() {
 
 #[tokio::test]
 async fn ioc_buy_partially_fills_when_book_depth_is_smaller_than_order_size() {
-    let (server, client, user) = fixture(&[("USDC", 10_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
-    server
-        .set_hyperliquid_book_depth("UBTC", "USDC", 0.13)
+    let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
+    node
+        .set_book_depth("UBTC", "USDC", 0.13)
         .await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
 
@@ -497,10 +475,10 @@ async fn ioc_buy_partially_fills_when_book_depth_is_smaller_than_order_size() {
 
 #[tokio::test]
 async fn marketable_gtc_buy_partially_fills_and_rests_remainder() {
-    let (server, client, user) = fixture(&[("USDC", 10_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
-    server
-        .set_hyperliquid_book_depth("UBTC", "USDC", 0.05)
+    let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
+    node
+        .set_book_depth("UBTC", "USDC", 0.05)
         .await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
 
@@ -559,11 +537,11 @@ async fn marketable_gtc_buy_partially_fills_and_rests_remainder() {
 
 #[tokio::test]
 async fn resting_order_partially_fills_when_rate_moves_through_limited_book_depth() {
-    let (server, client, user) = fixture(&[("USDC", 10_000.0)]).await;
+    let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
-    server
-        .set_hyperliquid_book_depth("UBTC", "USDC", 0.01)
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
+    node
+        .set_book_depth("UBTC", "USDC", 0.01)
         .await;
 
     let place = client
@@ -587,7 +565,7 @@ async fn resting_order_partially_fills_when_rate_moves_through_limited_book_dept
         .as_u64()
         .expect("resting oid");
 
-    server.set_hyperliquid_rate("UBTC", "USDC", 29_000.0).await;
+    node.set_rate("UBTC", "USDC", 29_000.0).await;
 
     let open_orders = client.open_orders(user).await.expect("open orders");
     let order = open_orders
@@ -623,8 +601,8 @@ async fn resting_order_partially_fills_when_rate_moves_through_limited_book_dept
 
 #[tokio::test]
 async fn user_fills_reports_completed_trades() {
-    let (server, client, user) = fixture(&[("USDC", 10_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     client
         .place_orders(
@@ -655,7 +633,7 @@ async fn user_fills_reports_completed_trades() {
 
 #[tokio::test]
 async fn spot_send_transfers_balance_between_users() {
-    let (server, client, sender) = fixture(&[("UBTC", 0.5)]).await;
+    let (node, client, sender) = fixture(&[("UBTC", 0.5)]).await;
     let recipient = Address::from([0xAB; 20]);
 
     let response = client
@@ -669,8 +647,8 @@ async fn spot_send_transfers_balance_between_users() {
         .expect("spot send");
     assert_eq!(response["status"], "ok");
 
-    let sender_balance = server.hyperliquid_balance_of(sender, "UBTC").await;
-    let recipient_balance = server.hyperliquid_balance_of(recipient, "UBTC").await;
+    let sender_balance = node.spot_balance_of(sender, "UBTC").await;
+    let recipient_balance = node.spot_balance_of(recipient, "UBTC").await;
     assert!((sender_balance - 0.3).abs() < 1e-9);
     assert!((recipient_balance - 0.2).abs() < 1e-9);
 }
@@ -678,7 +656,7 @@ async fn spot_send_transfers_balance_between_users() {
 #[tokio::test]
 async fn native_bridge_deposit_transfer_credits_sender_withdrawable_usdc() {
     let amount_raw = U256::from(6_000_000u64);
-    let (_anvil, server, client, user, token, bridge_address) = bridge_fixture(amount_raw).await;
+    let (_anvil, node, client, user, token, bridge_address) = bridge_fixture(amount_raw).await;
 
     let deposit = client
         .build_usdc_bridge_deposit_to(bridge_address, *token.address(), amount_raw)
@@ -692,7 +670,7 @@ async fn native_bridge_deposit_transfer_credits_sender_withdrawable_usdc() {
         .expect("send deposit tx");
     pending.get_receipt().await.expect("deposit receipt");
 
-    let observed = wait_for_hyperliquid_clearinghouse_balance(&server, user, "USDC", 6.0).await;
+    let observed = wait_for_hyperliquid_clearinghouse_balance(&node, user, "USDC", 6.0).await;
     assert!(
         (observed - 6.0).abs() < 1e-9,
         "observed withdrawable USDC balance {observed}"
@@ -709,84 +687,12 @@ async fn native_bridge_deposit_transfer_credits_sender_withdrawable_usdc() {
         .await
         .expect("spot clearinghouse");
     assert!(parse_total(&spot, "USDC").abs() < 1e-9);
-    assert!(server.hyperliquid_exchange_submissions().await.is_empty());
-}
-
-#[tokio::test]
-async fn native_bridge_deposit_credit_can_be_delayed_by_mock() {
-    let amount_raw = U256::from(6_000_000u64);
-    let (_anvil, server, client, user, token, bridge_address) =
-        bridge_fixture_with_config(amount_raw, |config| {
-            config.with_hyperliquid_bridge_deposit_latency(Duration::from_millis(750))
-        })
-        .await;
-
-    let deposit = client
-        .build_usdc_bridge_deposit_to(bridge_address, *token.address(), amount_raw)
-        .expect("build bridge deposit");
-    token
-        .transfer(deposit.bridge, amount_raw)
-        .send()
-        .await
-        .expect("send deposit tx")
-        .get_receipt()
-        .await
-        .expect("deposit receipt");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let early = server
-        .hyperliquid_clearinghouse_balance_of(user, "USDC")
-        .await;
-    assert!(
-        early.abs() < 1e-9,
-        "bridge deposit credited before configured latency: {early}"
-    );
-
-    let observed = wait_for_hyperliquid_clearinghouse_balance(&server, user, "USDC", 6.0).await;
-    assert!(
-        (observed - 6.0).abs() < 1e-9,
-        "observed withdrawable USDC balance {observed}"
-    );
-}
-
-#[tokio::test]
-#[ignore = "integration: spawns devnet stack"]
-async fn native_bridge_deposit_credit_can_fail_deterministically() {
-    let amount_raw = U256::from(6_000_000u64);
-    let (_anvil, server, client, user, token, bridge_address) =
-        bridge_fixture_with_config(amount_raw, |config| {
-            config.with_hyperliquid_bridge_deposit_failure_probability_bps(10_000)
-        })
-        .await;
-
-    let deposit = client
-        .build_usdc_bridge_deposit_to(bridge_address, *token.address(), amount_raw)
-        .expect("build bridge deposit");
-    token
-        .transfer(deposit.bridge, amount_raw)
-        .send()
-        .await
-        .expect("send deposit tx")
-        .get_receipt()
-        .await
-        .expect("deposit receipt");
-
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
-    let observed = server
-        .hyperliquid_clearinghouse_balance_of(user, "USDC")
-        .await;
-    assert!(
-        observed.abs() < 1e-9,
-        "configured failed bridge deposit credited unexpectedly: {observed}"
-    );
 }
 
 #[tokio::test]
 async fn usd_class_transfer_moves_withdrawable_usdc_into_spot() {
-    let (server, client, user) = fixture(&[]).await;
-    server
-        .credit_hyperliquid_clearinghouse_balance(user, "USDC", 12.5)
-        .await;
+    let (node, client, user) = fixture(&[]).await;
+    node.seed_clearinghouse(user, 12.5).await;
 
     let response = client
         .usd_class_transfer("12.5".to_string(), false, 1_700_000_000_000)
@@ -811,7 +717,7 @@ async fn usd_class_transfer_moves_withdrawable_usdc_into_spot() {
 async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
     let minted_raw = U256::from(12_000_000u64);
     let deposit_raw = U256::from(6_000_000u64);
-    let (_anvil, server, client, user, token, bridge_address) = bridge_fixture(minted_raw).await;
+    let (_anvil, node, client, user, token, bridge_address) = bridge_fixture(minted_raw).await;
 
     let deposit = client
         .build_usdc_bridge_deposit_to(bridge_address, *token.address(), deposit_raw)
@@ -825,7 +731,7 @@ async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
         .await
         .expect("deposit receipt");
 
-    let observed = wait_for_hyperliquid_clearinghouse_balance(&server, user, "USDC", 6.0).await;
+    let observed = wait_for_hyperliquid_clearinghouse_balance(&node, user, "USDC", 6.0).await;
     assert!(
         (observed - 6.0).abs() < 1e-9,
         "observed withdrawable USDC balance {observed}"
@@ -860,9 +766,9 @@ async fn withdraw3_deducts_gross_amount_and_releases_net_usdc() {
 }
 
 #[tokio::test]
-async fn subminimum_native_bridge_transfer_is_ignored_by_mock_crediting() {
+async fn subminimum_native_bridge_transfer_is_ignored_by_node_crediting() {
     let amount_raw = U256::from(MINIMUM_BRIDGE_DEPOSIT_USDC - 1);
-    let (_anvil, server, _client, user, token, bridge_address) = bridge_fixture(amount_raw).await;
+    let (_anvil, node, _client, user, token, bridge_address) = bridge_fixture(amount_raw).await;
 
     token
         .transfer(bridge_address, amount_raw)
@@ -874,7 +780,7 @@ async fn subminimum_native_bridge_transfer_is_ignored_by_mock_crediting() {
         .expect("transfer receipt");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let observed = server.hyperliquid_balance_of(user, "USDC").await;
+    let observed = node.clearinghouse_balance_of(user, "USDC").await;
     assert!(observed.abs() < 1e-9, "observed USDC balance {observed}");
 }
 
@@ -882,8 +788,8 @@ async fn subminimum_native_bridge_transfer_is_ignored_by_mock_crediting() {
 async fn ioc_below_rate_returns_error_and_leaves_balances_untouched() {
     // Rate: 30 000. Buy limit 10 000 can't cross -> error status, USDC
     // balance unchanged.
-    let (server, client, user) = fixture(&[("USDC", 5_000.0)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    let (node, client, user) = fixture(&[("USDC", 5_000.0)]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     let response = client
         .place_orders(
@@ -909,14 +815,14 @@ async fn ioc_below_rate_returns_error_and_leaves_balances_untouched() {
     assert!(err.contains("does not cross"), "error: {err}");
 
     // Balance untouched because the order was rejected.
-    assert!((server.hyperliquid_balance_of(user, "USDC").await - 5_000.0).abs() < 1e-9);
+    assert!((node.spot_balance_of(user, "USDC").await - 5_000.0).abs() < 1e-9);
 }
 
 #[tokio::test]
 async fn gtc_non_marketable_orders_rest_and_reserve_hold() {
-    let (server, client, user) = fixture(&[("USDC", 5_000.0)]).await;
+    let (node, client, user) = fixture(&[("USDC", 5_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
     let response = client
         .place_orders(
             vec![OrderRequest {
@@ -956,9 +862,9 @@ async fn gtc_non_marketable_orders_rest_and_reserve_hold() {
 
 #[tokio::test]
 async fn alo_marketable_orders_are_rejected() {
-    let (server, client, _user) = fixture(&[("USDC", 5_000.0)]).await;
+    let (node, client, _user) = fixture(&[("USDC", 5_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
 
     let response = client
         .place_orders(
@@ -987,8 +893,8 @@ async fn alo_marketable_orders_are_rejected() {
 #[tokio::test]
 async fn insufficient_balance_rejects_order() {
     // Account with zero USDC can't place even a tiny buy.
-    let (server, client, _user) = fixture(&[]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 30_000.0).await;
+    let (node, client, _user) = fixture(&[]).await;
+    node.set_rate("UBTC", "USDC", 30_000.0).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     let response = client
         .place_orders(
@@ -1016,9 +922,9 @@ async fn insufficient_balance_rejects_order() {
 
 #[tokio::test]
 async fn cancel_orders_remove_resting_orders() {
-    let (server, client, user) = fixture(&[("USDC", 1_000.0)]).await;
+    let (node, client, user) = fixture(&[("USDC", 1_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
     let place = client
         .place_orders(
             vec![OrderRequest {
@@ -1057,9 +963,9 @@ async fn cancel_orders_remove_resting_orders() {
 
 #[tokio::test]
 async fn schedule_cancel_cancels_resting_orders_after_deadline() {
-    let (server, client, user) = fixture(&[("USDC", 1_000.0)]).await;
+    let (node, client, user) = fixture(&[("USDC", 1_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
 
     let place = client
         .place_orders(
@@ -1105,9 +1011,9 @@ async fn schedule_cancel_cancels_resting_orders_after_deadline() {
 
 #[tokio::test]
 async fn resting_orders_fill_when_rate_moves_through_them() {
-    let (server, client, user) = fixture(&[("USDC", 1_000.0)]).await;
+    let (node, client, user) = fixture(&[("USDC", 1_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
 
     let place = client
         .place_orders(
@@ -1130,7 +1036,7 @@ async fn resting_orders_fill_when_rate_moves_through_them() {
         .as_u64()
         .expect("resting oid");
 
-    server.set_hyperliquid_rate("UBTC", "USDC", 29_000.0).await;
+    node.set_rate("UBTC", "USDC", 29_000.0).await;
 
     let open = client.open_orders(user).await.expect("open orders");
     assert!(open.iter().all(|order| order.oid != oid));
@@ -1169,9 +1075,9 @@ async fn ubtc_to_ueth_round_trip_swaps_balances() {
     // IoC legs, simulating HL's lack of a direct UBTC/UETH pair. Rates:
     // 60 000 USDC/UBTC and 3 000 USDC/UETH. Selling 0.5 UBTC yields 30 000
     // USDC; buying UETH with 30 000 USDC at 3 000 yields 10 UETH.
-    let (server, client, user) = fixture(&[("UBTC", 0.5)]).await;
-    server.set_hyperliquid_rate("UBTC", "USDC", 60_000.0).await;
-    server.set_hyperliquid_rate("UETH", "USDC", 3_000.0).await;
+    let (node, client, user) = fixture(&[("UBTC", 0.5)]).await;
+    node.set_rate("UBTC", "USDC", 60_000.0).await;
+    node.set_rate("UETH", "USDC", 3_000.0).await;
 
     let ubtc_asset = client.asset_index(UBTC_USDC).unwrap();
     let sell_resp = client
@@ -1195,8 +1101,8 @@ async fn ubtc_to_ueth_round_trip_swaps_balances() {
         .get("filled")
         .is_some());
 
-    assert!((server.hyperliquid_balance_of(user, "UBTC").await).abs() < 1e-9);
-    assert!((server.hyperliquid_balance_of(user, "USDC").await - 30_000.0).abs() < 1e-6);
+    assert!((node.spot_balance_of(user, "UBTC").await).abs() < 1e-9);
+    assert!((node.spot_balance_of(user, "USDC").await - 30_000.0).abs() < 1e-6);
 
     let ueth_asset = client.asset_index(UETH_USDC).unwrap();
     let buy_resp = client
@@ -1220,8 +1126,8 @@ async fn ubtc_to_ueth_round_trip_swaps_balances() {
         .get("filled")
         .is_some());
 
-    assert!((server.hyperliquid_balance_of(user, "USDC").await).abs() < 1e-6);
-    assert!((server.hyperliquid_balance_of(user, "UETH").await - 10.0).abs() < 1e-9);
+    assert!((node.spot_balance_of(user, "USDC").await).abs() < 1e-6);
+    assert!((node.spot_balance_of(user, "UETH").await - 10.0).abs() < 1e-9);
 }
 
 /// Phase 2 — the standalone Hyperliquid **node**'s OWN Bridge2 deposit indexer.

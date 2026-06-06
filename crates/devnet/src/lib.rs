@@ -1138,45 +1138,31 @@ impl RiftDevnetBuilder {
             .await?;
         }
 
-        let mock_integrators = if self.using_mock_integrators {
-            Some(
-                self.setup_mock_integrators(
-                    &bitcoin_devnet,
-                    &ethereum_devnet,
-                    &base_devnet,
-                    &arbitrum_devnet,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-
-        // Spawn the standalone Hyperliquid node alongside the venue mocks. It is
-        // additive and dual: an independent, RiftDevnet-owned service with its
-        // own `HyperliquidCore`. As of Phase 2 it also owns its OWN Bridge2
-        // deposit indexer + on-chain `withdraw3` release, watching the SAME
-        // Bridge2 the venue mock watches on the Arbitrum Anvil chain and
-        // crediting/debiting its own core. The venue mock's bridge wiring is
-        // untouched; the live settlement path still uses the mock. Reuse the
-        // same gate as the venue mocks.
+        // Spawn the standalone Hyperliquid node FIRST: it is the sole
+        // Hyperliquid in the devnet (there is no longer a venue mock under
+        // `/hyperliquid`). It is an independent, RiftDevnet-owned service with
+        // its own `HyperliquidCore`; it owns its OWN Bridge2 deposit indexer +
+        // on-chain `withdraw3` release, watching the deterministic Bridge2 on the
+        // Arbitrum Anvil chain.
         //
-        // ORDERING: this runs after `setup_mock_integrators`, which itself runs
-        // after the Arbitrum chain is up and `evm_devnet` has deployed Bridge2
-        // (the deterministic `hyperliquid_bridge_address(Testnet)` is live), so
-        // the node's bridge indexer connects to an already-deployed contract.
-        // The node spawns when `using_hyperliquid_node` resolves true; that
-        // flag defaults to `using_mock_integrators` so existing callers are
-        // unchanged, but the e2e can enable the node on its own. The Arbitrum
-        // chain + Bridge2 are deployed unconditionally above, so the node's
-        // bridge wiring is always satisfiable whenever it is enabled.
+        // ORDERING: this runs after the Arbitrum chain is up and `evm_devnet`
+        // has deployed Bridge2 (the deterministic
+        // `hyperliquid_bridge_address(Testnet)` is live), so the node's bridge
+        // indexer connects to an already-deployed contract; and it runs BEFORE
+        // `setup_mock_integrators` because the Unit mock must be pointed at the
+        // node (`with_unit_node`) — the Unit deposit/withdrawal flows settle on
+        // the node via the guardian `spotSend` + the node-withdrawal poller.
+        //
+        // The node spawns when `using_hyperliquid_node` resolves true; that flag
+        // defaults to `using_mock_integrators` so existing callers are unchanged,
+        // but the e2e can enable the node on its own.
         let using_hyperliquid_node = self
             .using_hyperliquid_node
             .unwrap_or(self.using_mock_integrators);
         let hyperliquid = if using_hyperliquid_node {
             // Release signer: the Arbitrum Anvil account-0 — a known-funded key
-            // (pre-funded with ETH, the mock-USDC master minter). Mirrors how
-            // the venue mock obtains a funded signer for its on-chain release.
+            // (pre-funded with ETH, the mock-USDC master minter) used to mint
+            // the payout to the bridge and submit the Bridge2 `release` tx.
             let release_signer_key: [u8; 32] =
                 arbitrum_devnet.anvil.keys()[0].clone().to_bytes().into();
             let usdc_token_address = ARBITRUM_USDC_ADDRESS.parse().map_err(|error| {
@@ -1195,6 +1181,32 @@ impl RiftDevnetBuilder {
                 .map_err(|error| {
                     eyre::eyre!("[devnet builder] Failed to start Hyperliquid node: {error}")
                 })?,
+            )
+        } else {
+            None
+        };
+
+        let mock_integrators = if self.using_mock_integrators {
+            // The Unit mock settles deposits/withdrawals on the node, so it must
+            // be pointed at the node. The node is spawned whenever mock
+            // integrators are (both default off `using_mock_integrators`), so
+            // it is present here.
+            let node = hyperliquid.as_ref().ok_or_else(|| {
+                eyre::eyre!(
+                    "[devnet builder] mock integrators require the Hyperliquid node \
+                     (the sole Hyperliquid); enable it via using_hyperliquid_node"
+                )
+            })?;
+            Some(
+                self.setup_mock_integrators(
+                    &bitcoin_devnet,
+                    &ethereum_devnet,
+                    &base_devnet,
+                    &arbitrum_devnet,
+                    node.url(),
+                    node.guardian_key(),
+                )
+                .await?,
             )
         } else {
             None
@@ -1235,6 +1247,8 @@ impl RiftDevnetBuilder {
         ethereum_devnet: &EthDevnet,
         base_devnet: &EthDevnet,
         arbitrum_devnet: &EthDevnet,
+        hyperliquid_node_url: String,
+        hyperliquid_node_guardian_key: [u8; 32],
     ) -> Result<mock_integrators::MockIntegratorServer> {
         let bind_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1312,12 +1326,11 @@ impl RiftDevnetBuilder {
                 bitcoin_devnet.rpc_url.clone(),
                 bitcoin_devnet.cookie.clone(),
             )
-            .with_hyperliquid_bridge_address(format!(
-                "{:#x}",
-                hyperliquid_bridge_address(HyperliquidNetwork::Testnet)
-            ))
-            .with_hyperliquid_evm_rpc_url(arbitrum_devnet.anvil.endpoint())
-            .with_hyperliquid_usdc_token_address(ARBITRUM_USDC_ADDRESS);
+            // The Unit mock settles deposits/withdrawals against the standalone
+            // Hyperliquid node (the sole Hyperliquid): the guardian `spotSend`s
+            // deposit credits onto the node, and the node-withdrawal poller
+            // settles withdrawals from the node's spot transfers.
+            .with_unit_node(hyperliquid_node_url, hyperliquid_node_guardian_key);
 
         mock_integrators::MockIntegratorServer::spawn_with_config(config)
             .await

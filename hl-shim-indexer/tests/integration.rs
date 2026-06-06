@@ -7,7 +7,7 @@ use std::{
 };
 
 use alloy::primitives::Address;
-use devnet::mock_integrators::MockIntegratorServer;
+use devnet::HyperliquidNode;
 use futures_util::{SinkExt, StreamExt};
 use hl_shim_indexer::{
     build_router,
@@ -193,15 +193,13 @@ async fn build_test_app(
 async fn hl_shim_integration_edges_share_one_database() {
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
-    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
+    let hl = HyperliquidNode::spawn().await.expect("spawn HL node");
     let user = sample_user();
-    hl.record_hyperliquid_fill(user, sample_fill(1_700_000_000_000, 1))
-        .await;
-    hl.record_hyperliquid_fill(user, sample_fill(1_700_000_001_000, 2))
-        .await;
+    hl.record_fill(user, sample_fill(1_700_000_000_000, 1)).await;
+    hl.record_fill(user, sample_fill(1_700_000_001_000, 2)).await;
 
     let (base_url, poller, scheduler, storage, _pubsub) =
-        build_test_app(&database_url, hl.base_url()).await;
+        build_test_app(&database_url, &hl.url()).await;
     let client = reqwest::Client::new();
 
     poller
@@ -298,8 +296,7 @@ async fn hl_shim_integration_edges_share_one_database() {
         .expect("ack message");
     assert!(ack.into_text().expect("ack text").contains("subscribed"));
 
-    hl.record_hyperliquid_fill(user, sample_fill(1_700_000_003_000, 9))
-        .await;
+    hl.record_fill(user, sample_fill(1_700_000_003_000, 9)).await;
     poller
         .poll_once(ScheduledPoll {
             user,
@@ -406,9 +403,9 @@ async fn hl_shim_stress_20_hot_users_weight_budget_and_delivery() {
         .unwrap_or(600);
     let postgres = test_postgres().await;
     let database_url = create_test_database(&postgres.admin_database_url).await;
-    let hl = MockIntegratorServer::spawn().await.expect("spawn HL mock");
+    let hl = HyperliquidNode::spawn().await.expect("spawn HL node");
     let (base_url, poller, scheduler, storage, _pubsub) =
-        build_test_app(&database_url, hl.base_url()).await;
+        build_test_app(&database_url, &hl.url()).await;
 
     let users: Vec<Address> = (1_u8..=20).map(Address::repeat_byte).collect();
     let received_transfers = Arc::new(AtomicUsize::new(0));
@@ -457,15 +454,11 @@ async fn hl_shim_stress_20_hot_users_weight_budget_and_delivery() {
     let expected_transfers = users.len() * 3;
     for (index, user) in users.iter().copied().enumerate() {
         let base_time = 1_700_100_000_000_u64 + (index as u64 * 10_000);
-        hl.record_hyperliquid_fill(user, sample_fill(base_time, 10_000 + index as u64))
+        hl.record_fill(user, sample_fill(base_time, 10_000 + index as u64))
             .await;
-        hl.record_hyperliquid_ledger_update(
-            user,
-            sample_ledger_deposit(base_time + 1, index as u8 + 1),
-        )
-        .await;
-        hl.record_hyperliquid_funding(user, sample_funding(base_time + 2))
+        hl.record_ledger_update(user, sample_ledger_deposit(base_time + 1, index as u8 + 1))
             .await;
+        hl.record_funding(user, sample_funding(base_time + 2)).await;
     }
     for oid in 1..=5 {
         scheduler.register_pending_order(users[0], oid).await;

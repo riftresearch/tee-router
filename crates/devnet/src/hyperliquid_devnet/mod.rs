@@ -1,18 +1,18 @@
-//! `hyperliquid_devnet.rs` — the Hyperliquid devnet **node**: a standalone,
+//! `hyperliquid_devnet` — the Hyperliquid devnet **node**: the standalone,
 //! `RiftDevnet`-owned HTTP service that speaks Hyperliquid's `POST /info` and
 //! `POST /exchange` wire shapes, peer to [`bitcoin_devnet`](crate::bitcoin_devnet)
-//! and [`evm_devnet`](crate::evm_devnet).
+//! and [`evm_devnet`](crate::evm_devnet). This is the **sole** Hyperliquid in
+//! the devnet — there is no longer a venue mock under `/hyperliquid`.
 //!
-//! Unlike the venue mock in
-//! [`crate::mock_integrators::hyperliquid_spot`] — which is mounted under the
-//! shared venue mock server and is wired into the Unit / Bridge2 settlement
-//! flows — this node is **independent**. It owns its *own*
+//! The node is **independent**. It owns its *own*
 //! [`HyperliquidCore`](crate::hyperliquid_core::HyperliquidCore) instance and a
 //! dedicated axum server bound to its own [`TcpListener`]. The node knows
 //! nothing about Unit: its `spotSend` / `sendAsset` perform only the spot
 //! transfer (debit signer, credit destination) with no Unit-withdrawal
-//! trigger, and its `withdraw3` performs only the clearinghouse debit (the
-//! on-chain Bridge2 release moves into the node in a later phase).
+//! trigger (the Unit mock's node-withdrawal poller observes those transfers),
+//! and its `withdraw3` debits the clearinghouse and submits the on-chain
+//! Bridge2 release when the node is wired to a chain. It also owns its OWN
+//! Bridge2 deposit indexer, crediting its clearinghouse from on-chain deposits.
 //!
 //! The HTTP handlers here are *thin glue*: every matching / ledger operation
 //! goes through [`HyperliquidCore`](crate::hyperliquid_core::HyperliquidCore)'s
@@ -41,16 +41,19 @@ use axum::{
 use chrono::Utc;
 use hyperliquid_client::{
     recover_l1_signer, recover_typed_signer, Actions, SendAsset, SpotSend, UsdClassTransfer,
-    UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
+    UserFill, UserFunding, UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, Withdraw3,
+    MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, task::JoinHandle};
 
+pub(crate) mod contract;
+
 use crate::hyperliquid_core::{
     format_hl_amount, hyperliquid_has_sufficient_amount, HyperliquidCore,
 };
-use crate::mock_integrators::hyperliquid_bridge::contract::MockHyperliquidBridge2;
+use crate::hyperliquid_devnet::contract::MockHyperliquidBridge2;
 use crate::mock_integrators::{mock_evm_indexer_initial_last_scanned, IERC20, IMockMintableERC20};
 
 /// The Unit "guardian" HL account seeded at node genesis. This account is
@@ -308,12 +311,12 @@ impl HyperliquidNode {
 
     // --- Public test-helper accessors over the node's own HyperliquidCore. ---
     //
-    // These mirror the venue mock's `MockIntegratorServer` HL accessors
-    // byte-for-byte in unit/type semantics so external-crate test suites that
-    // migrate from the mock to the node translate 1:1 (only the receiver
-    // changes). All amounts/balances are NATURAL units (e.g. `1.0` UBTC,
-    // `100.0` USDC), matching `credit_spot` / `spot_total` /
-    // `credit_clearinghouse` / `clearinghouse_total` on `HyperliquidCore`.
+    // These are the seeding / inspection surface external-crate test suites use
+    // to drive the node directly (rates, book depth, balances, historical
+    // fills/funding/ledger updates) without going through a full settlement
+    // flow. All amounts/balances are NATURAL units (e.g. `1.0` UBTC, `100.0`
+    // USDC), matching `credit_spot` / `spot_total` / `credit_clearinghouse` /
+    // `clearinghouse_total` on `HyperliquidCore`.
 
     /// Seed `amount` of `coin` (e.g. "UETH", "UBTC", "USDC") into `user`'s spot
     /// balance. Mirrors `MockIntegratorServer::credit_hyperliquid_balance`.
@@ -346,6 +349,47 @@ impl HyperliquidNode {
     pub async fn clearinghouse_balance_of(&self, user: Address, coin: &str) -> f64 {
         self.core.lock().await.clearinghouse_total(user, coin)
     }
+
+    /// Install (or overwrite) the exchange rate for a spot pair. `rate` is the
+    /// price of one `base` unit in `quote` units (e.g.
+    /// `set_rate("UBTC", "USDC", 60_000.0)` means 1 UBTC = 60 000 USDC). An IoC
+    /// buy of `sz` base at limit_px ≥ rate fills at exactly `rate`. Mirrors the
+    /// former `MockIntegratorServer::set_hyperliquid_rate`.
+    pub async fn set_rate(&self, base: &str, quote: &str, rate: f64) {
+        self.core.lock().await.set_rate(base, quote, rate);
+    }
+
+    /// Inspect the configured rate for a pair (`None` if none installed).
+    pub async fn rate_for(&self, base: &str, quote: &str) -> Option<f64> {
+        self.core.lock().await.rate_for(base, quote)
+    }
+
+    /// Override the synthesized top-of-book depth for both sides of a spot pair.
+    /// Useful for partial-fill semantics. Mirrors the former
+    /// `MockIntegratorServer::set_hyperliquid_book_depth`.
+    pub async fn set_book_depth(&self, base: &str, quote: &str, depth: f64) {
+        self.core.lock().await.set_book_depth(base, quote, depth);
+    }
+
+    /// Seed a historical fill for `/info { type: "userFills" }` /
+    /// `userFillsByTime` shape tests. Mirrors the former
+    /// `MockIntegratorServer::record_hyperliquid_fill`.
+    pub async fn record_fill(&self, user: Address, fill: UserFill) {
+        self.core.lock().await.record_fill(user, fill);
+    }
+
+    /// Seed a non-funding ledger update for `/info { type:
+    /// "userNonFundingLedgerUpdates" }`. Mirrors the former
+    /// `MockIntegratorServer::record_hyperliquid_ledger_update`.
+    pub async fn record_ledger_update(&self, user: Address, update: UserNonFundingLedgerUpdate) {
+        self.core.lock().await.record_ledger_update(user, update);
+    }
+
+    /// Seed a funding payment for `/info { type: "userFunding" }`. Mirrors the
+    /// former `MockIntegratorServer::record_hyperliquid_funding`.
+    pub async fn record_funding(&self, user: Address, funding: UserFunding) {
+        self.core.lock().await.record_funding(user, funding);
+    }
 }
 
 impl Drop for HyperliquidNode {
@@ -370,13 +414,8 @@ fn guardian_address() -> Address {
 /// The node's OWN Bridge2 deposit indexer. Watches the USDC `Transfer` log on
 /// the Arbitrum Anvil chain, filters for transfers *into* the Bridge2 address,
 /// and credits THIS node's [`HyperliquidCore`] clearinghouse (plus a ledger
-/// update) — exactly the same observation the venue mock's
-/// [`run_hyperliquid_bridge_indexer`](crate::mock_integrators::hyperliquid_bridge)
-/// performs, but on the node's own core. The two are independent and dual: both
-/// observe the same Bridge2, each crediting its own ledger.
-///
-/// Unlike the venue mock, the node is a plain observer: no latency / failure
-/// injection (those are mock-server tunables). Returns on `shutdown`.
+/// update). The node is a plain observer: no latency / failure injection (real
+/// Hyperliquid has none either). Returns on `shutdown`.
 async fn run_node_bridge_deposit_indexer(
     provider: DynProvider,
     token_address: Address,
@@ -1185,12 +1224,10 @@ async fn handle_withdraw3(
 
 /// Submits the node's OWN on-chain Bridge2 withdrawal release: mints `payout_raw`
 /// USDC to the bridge (the bridge must hold the funds it `transfer`s out), then
-/// calls Bridge2 `release(destination, payout_raw)`. Mirrors the venue mock's
-/// [`send_mock_hyperliquid_withdrawal_release`](crate::mock_integrators::hyperliquid_bridge)
-/// — same two-step mint+release against the SAME bridge bindings
-/// ([`MockHyperliquidBridge2`]) — but signs with the node's known-funded release
-/// key (the Arbitrum Anvil account-0, the mock-USDC master minter) via a plain
-/// wallet provider, rather than the mock-server's EIP-7702 paymaster.
+/// calls Bridge2 `release(destination, payout_raw)` against the
+/// [`MockHyperliquidBridge2`] bindings, signing with the node's known-funded
+/// release key (the Arbitrum Anvil account-0, the mock-USDC master minter) via a
+/// plain wallet provider.
 async fn send_node_bridge_withdrawal_release(
     wiring: &NodeBridgeReleaseWiring,
     destination: Address,
@@ -1423,5 +1460,395 @@ mod tests {
             .and_then(|entry| entry["total"].as_str())
             .and_then(|total| total.parse::<f64>().ok())
             .unwrap_or(0.0)
+    }
+
+    // --- `/info` wire-shape + validation coverage (ported from the deleted
+    //     `hyperliquid_spot` venue tests; the node is now the sole Hyperliquid).
+    //     These assert the node's `/info` responses round-trip into the real
+    //     `hyperliquid_client` types and that the handler's required-field
+    //     validations reject malformed requests with UNPROCESSABLE_ENTITY. ---
+
+    async fn info_post(node: &HyperliquidNode, body: Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/info", node.url()))
+            .json(&body)
+            .send()
+            .await
+            .expect("POST /info")
+    }
+
+    async fn assert_info_error(node: &HyperliquidNode, body: Value, expected_error: &str) {
+        let response = info_post(node, body).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: Value = response.json().await.expect("error body");
+        assert_eq!(body["error"].as_str(), Some(expected_error));
+    }
+
+    fn shape_test_user() -> Address {
+        "0x1111111111111111111111111111111111111111"
+            .parse()
+            .expect("static address parses")
+    }
+
+    fn sample_user_fill(time: u64, tid: u64) -> UserFill {
+        UserFill {
+            coin: "UBTC/USDC".to_string(),
+            px: "60000".to_string(),
+            sz: "0.001".to_string(),
+            side: "B".to_string(),
+            time,
+            start_position: "0".to_string(),
+            dir: "Buy".to_string(),
+            closed_pnl: "0".to_string(),
+            hash: format!("0x{}", "ab".repeat(32)),
+            oid: 42,
+            crossed: true,
+            fee: "0.00001".to_string(),
+            tid,
+            fee_token: "UBTC".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn info_spot_meta_matches_real_shape() {
+        use hyperliquid_client::meta::SpotMeta;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let body: SpotMeta = info_post(&node, json!({ "type": "spotMeta" }))
+            .await
+            .json()
+            .await
+            .expect("deserialize SpotMeta");
+        let map = body
+            .coin_to_asset_map()
+            .expect("node spotMeta should produce valid wire asset ids");
+        assert_eq!(map.get("UBTC/USDC"), Some(&10_140));
+        assert_eq!(map.get("@140"), Some(&10_140));
+    }
+
+    #[tokio::test]
+    async fn info_meta_matches_real_shape() {
+        use hyperliquid_client::info::PerpMeta;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let raw: Value = info_post(&node, json!({ "type": "meta" }))
+            .await
+            .json()
+            .await
+            .expect("json");
+        assert!(raw["universe"][0]["szDecimals"].is_number());
+        assert!(raw["universe"][0]["maxLeverage"].is_number());
+        let body: PerpMeta = serde_json::from_value(raw).expect("deserialize PerpMeta");
+        assert!(body.universe.iter().any(|asset| asset.name == "BTC"));
+        assert!(body.universe.iter().any(|asset| asset.name == "ETH"));
+    }
+
+    #[tokio::test]
+    async fn info_user_fills_by_time_filters_and_matches_real_shape() {
+        use hyperliquid_client::info::UserFill as ClientUserFill;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let user = shape_test_user();
+        node.record_fill(user, sample_user_fill(1_700_000_000_000, 1)).await;
+        node.record_fill(user, sample_user_fill(1_700_000_010_000, 2)).await;
+        node.record_fill(user, sample_user_fill(1_700_000_020_000, 3)).await;
+
+        let raw: Value = info_post(
+            &node,
+            json!({
+                "type": "userFillsByTime",
+                "user": format!("{user:#x}"),
+                "startTime": 1_700_000_005_000_u64,
+                "endTime": 1_700_000_020_000_u64,
+                "aggregateByTime": false
+            }),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
+        assert_eq!(raw.as_array().expect("array").len(), 2);
+        assert!(raw[0]["startPosition"].is_string());
+        assert!(raw[0]["feeToken"].is_string());
+        let body: Vec<ClientUserFill> =
+            serde_json::from_value(raw).expect("deserialize UserFill");
+        assert_eq!(body.iter().map(|fill| fill.tid).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn info_user_fills_by_time_rejects_missing_start_time_and_bad_user() {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        assert_info_error(
+            &node,
+            json!({ "type": "userFillsByTime", "user": "0x1111111111111111111111111111111111111111" }),
+            "userFillsByTime requires a numeric `startTime` field",
+        )
+        .await;
+        assert_info_error(
+            &node,
+            json!({ "type": "userFillsByTime", "user": "1111111111111111111111111111111111111111", "startTime": 1_u64 }),
+            "userFillsByTime requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn info_user_non_funding_ledger_updates_matches_real_shape() {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let user = shape_test_user();
+        let hash = format!("0x{}", "cd".repeat(32));
+        for (time, delta) in [
+            (1_700_000_001_000, UserNonFundingLedgerDelta::Withdraw { usdc: "1.5".to_string(), nonce: 7, fee: "1".to_string() }),
+            (1_700_000_004_000, UserNonFundingLedgerDelta::SpotTransfer {
+                token: "UBTC:0x11111111111111111111111111111111".to_string(),
+                amount: "0.001".to_string(),
+                usdc_value: "60".to_string(),
+                user: format!("{user:#x}"),
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                fee: "0".to_string(),
+                native_token_fee: "0.00001".to_string(),
+                nonce: 8,
+            }),
+        ] {
+            node.record_ledger_update(user, UserNonFundingLedgerUpdate { time, hash: hash.clone(), delta }).await;
+        }
+        let raw: Value = info_post(
+            &node,
+            json!({
+                "type": "userNonFundingLedgerUpdates",
+                "user": format!("{user:#x}"),
+                "startTime": 1_700_000_001_000_u64,
+                "endTime": 1_700_000_004_000_u64
+            }),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
+        assert_eq!(raw.as_array().expect("array").len(), 2);
+        assert_eq!(raw[0]["delta"]["type"], "withdraw");
+        assert!(raw[1]["delta"]["usdcValue"].is_string());
+        let body: Vec<UserNonFundingLedgerUpdate> =
+            serde_json::from_value(raw).expect("deserialize ledger updates");
+        assert_eq!(body.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn info_user_funding_matches_real_shape_and_rejects_bad_input() {
+        use hyperliquid_client::info::UserFunding as ClientUserFunding;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let user = shape_test_user();
+        node.record_funding(
+            user,
+            UserFunding {
+                time: 1_700_000_000_000,
+                coin: "ETH".to_string(),
+                usdc: "-0.0123".to_string(),
+                szi: "1.25".to_string(),
+                funding_rate: "0.0000125".to_string(),
+            },
+        )
+        .await;
+        let raw: Value = info_post(
+            &node,
+            json!({ "type": "userFunding", "user": format!("{user:#x}"), "startTime": 1_699_999_999_999_u64 }),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
+        let body: Vec<ClientUserFunding> =
+            serde_json::from_value(raw).expect("deserialize funding");
+        assert_eq!(body[0].usdc, "-0.0123");
+
+        assert_info_error(
+            &node,
+            json!({ "type": "userFunding", "user": "0x1111111111111111111111111111111111111111" }),
+            "userFunding requires a numeric `startTime` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn info_user_rate_limit_matches_real_shape_and_rejects_bad_user() {
+        use hyperliquid_client::info::UserRateLimit;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let raw: Value = info_post(
+            &node,
+            json!({ "type": "userRateLimit", "user": format!("{:#x}", shape_test_user()) }),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
+        let body: UserRateLimit = serde_json::from_value(raw).expect("deserialize rate limit");
+        assert_eq!(body.n_requests_cap, 1200);
+
+        assert_info_error(
+            &node,
+            json!({ "type": "userRateLimit" }),
+            "userRateLimit requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_rejects_missing_coin() {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        assert_info_error(&node, json!({ "type": "l2Book" }), "l2Book requires a `coin` field").await;
+    }
+
+    #[tokio::test]
+    async fn info_order_status_rejects_missing_oid_and_user() {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        assert_info_error(
+            &node,
+            json!({ "type": "orderStatus", "user": "0x0000000000000000000000000000000000000000" }),
+            "orderStatus requires a numeric `oid` field",
+        )
+        .await;
+        assert_info_error(
+            &node,
+            json!({ "type": "orderStatus", "oid": 42 }),
+            "orderStatus requires a 0x-prefixed `user` field",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn info_order_status_unknown_oid_is_scoped_to_user() {
+        use hyperliquid_client::info::OrderStatusResponse;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        // An order placed by one user is `unknownOid` when queried for another.
+        let placer = PrivateKeySigner::from_bytes(&[0x42u8; 32].into()).expect("placer key");
+        let placer_address = placer.address();
+        node.seed_spot(placer_address, "USDC", 10_000.0).await;
+        node.set_rate("UBTC", "USDC", 60_000.0).await;
+        let mut client =
+            hyperliquid_client::HyperliquidClient::new(&node.url(), placer, None, Network::Testnet)
+                .expect("client");
+        client.refresh_spot_meta().await.expect("spot meta");
+        let place = client
+            .place_orders(
+                vec![hyperliquid_client::OrderRequest {
+                    asset: client.asset_index("UBTC/USDC").expect("asset"),
+                    is_buy: true,
+                    limit_px: "60000".to_string(),
+                    sz: "0.1".to_string(),
+                    reduce_only: false,
+                    order_type: hyperliquid_client::Order::Limit(hyperliquid_client::Limit {
+                        tif: "Ioc".to_string(),
+                    }),
+                    cloid: None,
+                }],
+                "na",
+            )
+            .await
+            .expect("place orders");
+        let oid = place["response"]["data"]["statuses"][0]["filled"]["oid"]
+            .as_u64()
+            .expect("oid");
+
+        // The placer sees the filled order; a different user gets unknownOid.
+        let other = Address::repeat_byte(0x77);
+        let response: OrderStatusResponse = info_post(
+            &node,
+            json!({ "type": "orderStatus", "user": format!("{other:#x}"), "oid": oid }),
+        )
+        .await
+        .json()
+        .await
+        .expect("order status");
+        assert_eq!(response.status, "unknownOid");
+        assert!(response.order.is_none());
+
+        let own: OrderStatusResponse = info_post(
+            &node,
+            json!({ "type": "orderStatus", "user": format!("{placer_address:#x}"), "oid": oid }),
+        )
+        .await
+        .json()
+        .await
+        .expect("order status");
+        assert_eq!(own.order.expect("envelope").status, "filled");
+    }
+
+    /// Ported from `hyperliquid_spot`'s `chained_sell_then_buy_credits_both_legs`:
+    /// a vault-scoped client whose buy is rejected (insufficient balance →
+    /// `rejected` status, no fill), then a funded sell→buy chain crediting both
+    /// legs. Exercises vault-address routing through the node's `/exchange`.
+    #[tokio::test]
+    async fn vault_scoped_chained_sell_then_buy_credits_both_legs() {
+        use hyperliquid_client::{HyperliquidClient, Limit, Order, OrderRequest};
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        let wallet = PrivateKeySigner::from_bytes(&[0x24u8; 32].into()).expect("wallet");
+        let vault = Address::repeat_byte(0xc2);
+        let mut client =
+            HyperliquidClient::new(&node.url(), wallet, Some(vault), Network::Testnet).expect("client");
+        client.refresh_spot_meta().await.expect("spot meta");
+        node.set_rate("UBTC", "USDC", 60_000.0).await;
+        node.set_rate("UETH", "USDC", 3_000.0).await;
+
+        let rejected = client
+            .place_orders(
+                vec![OrderRequest {
+                    asset: client.asset_index("UETH/USDC").expect("ueth asset"),
+                    is_buy: true,
+                    limit_px: "3000".to_string(),
+                    sz: "1".to_string(),
+                    reduce_only: false,
+                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    cloid: None,
+                }],
+                "na",
+            )
+            .await
+            .expect("prefundless buy");
+        let err = rejected["response"]["data"]["statuses"][0]["error"]
+            .as_str()
+            .expect("insufficient balance error");
+        assert!(err.contains("insufficient"), "unexpected rejection: {err}");
+        let rejected_status = client.order_status(vault, 1000).await.expect("rejected status");
+        assert_eq!(rejected_status.order.expect("rejected order").status, "rejected");
+
+        node.seed_spot(vault, "UBTC", 1.0).await;
+        let sell = client
+            .place_orders(
+                vec![OrderRequest {
+                    asset: client.asset_index("UBTC/USDC").expect("ubtc asset"),
+                    is_buy: false,
+                    limit_px: "60000".to_string(),
+                    sz: "0.1".to_string(),
+                    reduce_only: false,
+                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    cloid: None,
+                }],
+                "na",
+            )
+            .await
+            .expect("sell UBTC");
+        assert!(sell["response"]["data"]["statuses"][0].get("filled").is_some());
+
+        let buy = client
+            .place_orders(
+                vec![OrderRequest {
+                    asset: client.asset_index("UETH/USDC").expect("ueth asset"),
+                    is_buy: true,
+                    limit_px: "3000".to_string(),
+                    sz: "1".to_string(),
+                    reduce_only: false,
+                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    cloid: None,
+                }],
+                "na",
+            )
+            .await
+            .expect("buy UETH");
+        assert!(buy["response"]["data"]["statuses"][0].get("filled").is_some());
+
+        let state = client
+            .spot_clearinghouse_state(vault)
+            .await
+            .expect("post-buy spot state");
+        assert_eq!(state.balance_of("USDC"), "3000");
+        assert_eq!(state.balance_of("UETH"), "1");
+        assert_eq!(state.balance_of("UBTC"), "0.9");
     }
 }
