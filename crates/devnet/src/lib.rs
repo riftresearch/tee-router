@@ -5,6 +5,7 @@ pub mod bitcoin_devnet;
 pub mod cctp_mock;
 pub mod evm_devnet;
 pub mod hyperliquid_bridge_mock;
+pub mod hyperliquid_core;
 pub mod manifest;
 pub mod mock_integrators;
 pub mod token_indexerd;

@@ -57,8 +57,8 @@ use cctp::{
 use coinbase::mock_coinbase_spot_price;
 use hyperliquid::{
     maybe_spawn_hyperliquid_bridge_indexer, mock_hyperliquid_exchange, mock_hyperliquid_info,
-    HyperliquidMockState,
 };
+use crate::hyperliquid_core::HyperliquidCore;
 use hyperunit::{
     complete_mock_unit_operation, complete_mock_unit_operation_with_observation,
     complete_unit_withdrawal_after_hyperliquid_transfer, fail_mock_unit_operation,
@@ -744,7 +744,18 @@ pub(crate) struct MockIntegratorState {
     pub(crate) cctp_attestation_latency: Duration,
     pub(crate) cctp_attestation_delay_reason: Option<MockCctpDelayReason>,
     pub(crate) hyperliquid_exchange_submissions: Mutex<Vec<Value>>,
-    pub(crate) hyperliquid: Mutex<HyperliquidMockState>,
+    /// The Hyperliquid devnet "chain" state, shared by `Arc` across every
+    /// settlement path (spot/exchange handlers, the Bridge2 deposit indexer,
+    /// and HyperUnit deposit/withdrawal completion). A single instance is
+    /// constructed once in [`MockIntegratorState::from_config`] and handed to
+    /// all three venues via this `Arc` — no venue reaches into another's state.
+    // TODO(step: RiftDevnet ownership): the eventual target is for `RiftDevnet`
+    // to own `hyperliquid: Arc<HyperliquidCore>` as a devnet chain peer (like
+    // `bitcoin` / `ethereum`) and pass it into the mock spawn. That requires
+    // threading the Arc through `MockIntegratorServer::spawn_with_config` and
+    // every one of its ~58 call sites, so for this step the Arc is owned here
+    // and shared; the single-instance guarantee already holds.
+    pub(crate) hyperliquid_core: Arc<HyperliquidCore>,
     pub(crate) velora_usd_prices: Mutex<BTreeMap<String, u128>>,
     pub(crate) address_screening_rules: BTreeMap<String, MockAddressScreeningRule>,
     pub(crate) velora_swap_contract_addresses: BTreeMap<u64, String>,
@@ -1159,7 +1170,7 @@ impl MockIntegratorServer {
     /// placing orders, without going through a deposit flow.
     pub async fn credit_hyperliquid_balance(&self, user: Address, coin: &str, amount: f64) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .credit_spot(user, coin, amount);
@@ -1175,7 +1186,7 @@ impl MockIntegratorServer {
         amount: f64,
     ) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .credit_clearinghouse(user, coin, amount);
@@ -1183,14 +1194,14 @@ impl MockIntegratorServer {
 
     /// Read the `total` balance for `user`/`coin`. Returns 0.0 when absent.
     pub async fn hyperliquid_balance_of(&self, user: Address, coin: &str) -> f64 {
-        self.state.hyperliquid.lock().await.spot_total(user, coin)
+        self.state.hyperliquid_core.lock().await.spot_total(user, coin)
     }
 
     /// Read the clearinghouse balance for `user`/`coin`. Returns 0.0 when
     /// absent.
     pub async fn hyperliquid_clearinghouse_balance_of(&self, user: Address, coin: &str) -> f64 {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .clearinghouse_total(user, coin)
@@ -1199,7 +1210,7 @@ impl MockIntegratorServer {
     /// Seed a historical Hyperliquid fill for `/info { type:
     /// "userFillsByTime" }` and `/info { type: "userFills" }` shape tests.
     pub async fn record_hyperliquid_fill(&self, user: Address, fill: UserFill) {
-        self.state.hyperliquid.lock().await.record_fill(user, fill);
+        self.state.hyperliquid_core.lock().await.record_fill(user, fill);
     }
 
     /// Seed a non-funding ledger update for `/info { type:
@@ -1210,7 +1221,7 @@ impl MockIntegratorServer {
         update: UserNonFundingLedgerUpdate,
     ) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .record_ledger_update(user, update);
@@ -1219,7 +1230,7 @@ impl MockIntegratorServer {
     /// Seed a funding payment for `/info { type: "userFunding" }`.
     pub async fn record_hyperliquid_funding(&self, user: Address, funding: UserFunding) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .record_funding(user, funding);
@@ -1234,7 +1245,7 @@ impl MockIntegratorServer {
     /// direction.
     pub async fn set_hyperliquid_rate(&self, base: &str, quote: &str, rate: f64) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .set_rate(base, quote, rate);
@@ -1244,7 +1255,7 @@ impl MockIntegratorServer {
     /// of a spot pair. Useful for testing partial-fill semantics.
     pub async fn set_hyperliquid_book_depth(&self, base: &str, quote: &str, depth: f64) {
         self.state
-            .hyperliquid
+            .hyperliquid_core
             .lock()
             .await
             .set_book_depth(base, quote, depth);
@@ -1252,7 +1263,7 @@ impl MockIntegratorServer {
 
     /// Inspect the configured rate for a pair (returns `None` if none installed).
     pub async fn hyperliquid_rate(&self, base: &str, quote: &str) -> Option<f64> {
-        self.state.hyperliquid.lock().await.rate_for(base, quote)
+        self.state.hyperliquid_core.lock().await.rate_for(base, quote)
     }
 
     /// Install (or overwrite) the mock Velora USD price in micro-dollars per
@@ -1312,7 +1323,7 @@ impl MockIntegratorState {
             cctp_attestation_latency: config.cctp_attestation_latency,
             cctp_attestation_delay_reason: config.cctp_attestation_delay_reason,
             hyperliquid_exchange_submissions: Mutex::default(),
-            hyperliquid: Mutex::new(HyperliquidMockState::new()),
+            hyperliquid_core: Arc::new(HyperliquidCore::new()),
             velora_usd_prices: Mutex::new(default_velora_usd_prices()),
             address_screening_rules: config.address_screening_rules.clone(),
             velora_swap_contract_addresses: config.velora_swap_contract_addresses.clone(),

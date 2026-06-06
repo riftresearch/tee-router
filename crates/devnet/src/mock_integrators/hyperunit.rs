@@ -907,7 +907,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
 
     if let Some(credit) = maybe_deposit_credit {
         if credit.spot_amount > 0.0 {
-            let mut hl = state.hyperliquid.lock().await;
+            let mut hl = state.hyperliquid_core.lock().await;
             hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
             hl.record_ledger_update(
                 credit.user,
@@ -1910,7 +1910,7 @@ mod tests {
         .await
         .expect("complete unit deposit");
 
-        let hl = server.state.hyperliquid.lock().await;
+        let hl = server.state.hyperliquid_core.lock().await;
         let updates = hl.ledger_updates.get(&user).expect("ledger updates");
         let amount = updates
             .iter()
