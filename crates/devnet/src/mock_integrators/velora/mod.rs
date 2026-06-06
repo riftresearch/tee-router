@@ -7,7 +7,8 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,7 +18,7 @@ use tokio::sync::Mutex;
 pub(crate) mod contract;
 
 use crate::mock_integrators::velora::contract::MockVeloraSwap;
-use crate::mock_integrators::{parse_amount, MockIntegratorState};
+use crate::mock_integrators::parse_amount;
 
 /// Per-venue state for the Velora mock: the simulated USD price book, the
 /// per-network swap-contract addresses, and the two injectable
@@ -27,6 +28,14 @@ pub(crate) struct VeloraMockState {
     pub(crate) swap_contract_addresses: BTreeMap<u64, String>,
     pub(crate) transaction_failures_remaining: Mutex<usize>,
     pub(crate) transaction_stale_quote_failures_remaining: Mutex<usize>,
+}
+
+/// Builds the Velora mock router. Mounted under `/velora`; receives its own
+/// [`VeloraMockState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<VeloraMockState>> {
+    Router::new()
+        .route("/prices", get(mock_velora_prices))
+        .route("/transactions/:network", post(mock_velora_transaction))
 }
 
 const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
@@ -58,7 +67,7 @@ pub(crate) struct MockVeloraPricesQuery {
 }
 
 pub(crate) async fn mock_velora_prices(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<VeloraMockState>>,
     Query(query): Query<MockVeloraPricesQuery>,
 ) -> impl IntoResponse {
     // Mirror real Velora's pair constraint: if `receiver` is set, `userAddress`
@@ -108,7 +117,7 @@ pub(crate) async fn mock_velora_prices(
                 .into_response();
         }
     };
-    let Some(swap_contract) = state.velora.swap_contract_addresses.get(&query.network) else {
+    let Some(swap_contract) = state.swap_contract_addresses.get(&query.network) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({
@@ -141,13 +150,13 @@ pub(crate) async fn mock_velora_prices(
 }
 
 async fn mock_velora_quote_amounts(
-    state: &MockIntegratorState,
+    state: &VeloraMockState,
     query: &MockVeloraPricesQuery,
     amount: u128,
 ) -> Result<(u128, u128), String> {
     let src_symbol = mock_velora_token_symbol(&query.src_token);
     let dest_symbol = mock_velora_token_symbol(&query.dest_token);
-    let prices = state.velora.usd_prices.lock().await;
+    let prices = state.usd_prices.lock().await;
     let src_price = *prices
         .get(src_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {src_symbol}"))?;
@@ -277,12 +286,12 @@ fn pow10_u128(decimals: u8) -> Result<u128, String> {
 }
 
 pub(crate) async fn mock_velora_transaction(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<VeloraMockState>>,
     Path(network): Path<u64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let mut stale_quote_failures_remaining = state
-        .velora.transaction_stale_quote_failures_remaining
+        .transaction_stale_quote_failures_remaining
         .lock()
         .await;
     if *stale_quote_failures_remaining > 0 {
@@ -298,7 +307,7 @@ pub(crate) async fn mock_velora_transaction(
     }
     drop(stale_quote_failures_remaining);
 
-    let mut failures_remaining = state.velora.transaction_failures_remaining.lock().await;
+    let mut failures_remaining = state.transaction_failures_remaining.lock().await;
     if *failures_remaining > 0 {
         *failures_remaining -= 1;
         return (
@@ -381,7 +390,7 @@ pub(crate) async fn mock_velora_transaction(
                 .into_response();
         }
     };
-    let Some(swap_contract) = state.velora.swap_contract_addresses.get(&network) else {
+    let Some(swap_contract) = state.swap_contract_addresses.get(&network) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({

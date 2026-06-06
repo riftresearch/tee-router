@@ -4,12 +4,7 @@ use alloy::{
     sol,
     sol_types::SolCall,
 };
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{http::StatusCode, response::IntoResponse, Json, Router};
 use chrono::{DateTime, Utc};
 use hyperliquid_client::{UserFill, UserFunding, UserNonFundingLedgerUpdate};
 use hyperunit_client::{UnitAsset, UnitChain, UnitOperation};
@@ -33,11 +28,11 @@ use crate::{
 use eip7702_paymaster::{Execution, PaymasterError, PaymasterHandle};
 
 pub(crate) mod across;
-mod chainalysis;
+pub(crate) mod chainalysis;
 pub(crate) mod cctp;
-mod coinbase;
+pub(crate) mod coinbase;
 pub(crate) mod hyperliquid;
-mod hyperunit;
+pub(crate) mod hyperunit;
 pub(crate) mod velora;
 
 pub use across::{MockAcrossChainConfig, MockAcrossDepositRecord};
@@ -47,32 +42,18 @@ pub use hyperliquid::contract::MockHyperliquidBridge2;
 pub use hyperunit::{
     MockUnitGenerateAddressRequest, MockUnitOperationKind, MockUnitOperationRecord,
 };
-use across::{
-    maybe_spawn_across_deposit_indexer, mock_across_deposit_status, mock_across_real_swap_approval,
-    AcrossMockState, ResolvedMockAcrossChainConfig,
-};
-use chainalysis::{
-    mock_chainalysis_address_risk, normalize_mock_screening_address, ChainalysisMockState,
-};
-use cctp::{
-    cctp_domain_for_chain_id, maybe_spawn_cctp_burn_indexer, mock_cctp_burn_fees,
-    mock_cctp_messages, CctpMockState,
-};
-use coinbase::{mock_coinbase_spot_price, CoinbaseMockState};
-use hyperliquid::{
-    maybe_spawn_hyperliquid_bridge_indexer, mock_hyperliquid_exchange, mock_hyperliquid_info,
-    HyperliquidVenueState,
-};
+use across::{maybe_spawn_across_deposit_indexer, AcrossMockState};
+use chainalysis::{normalize_mock_screening_address, ChainalysisMockState};
+use cctp::{cctp_domain_for_chain_id, maybe_spawn_cctp_burn_indexer, CctpMockState};
+use coinbase::CoinbaseMockState;
+use hyperliquid::{maybe_spawn_hyperliquid_bridge_indexer, HyperliquidVenueState};
 use crate::hyperliquid_core::HyperliquidCore;
 use hyperunit::{
     complete_mock_unit_operation, complete_mock_unit_operation_with_observation,
-    complete_unit_withdrawal_after_hyperliquid_transfer, fail_mock_unit_operation,
-    maybe_spawn_unit_deposit_indexers, mock_unit_gen, mock_unit_operations, snapshot_unit_operations,
+    fail_mock_unit_operation, maybe_spawn_unit_deposit_indexers, snapshot_unit_operations,
     MockUnitOperationEntry, UnitMockState, UnitOperationObservation,
 };
-use velora::{
-    default_velora_usd_prices, mock_velora_prices, mock_velora_transaction, VeloraMockState,
-};
+use velora::{default_velora_usd_prices, VeloraMockState};
 
 sol! {
     #[sol(rpc)]
@@ -787,59 +768,6 @@ pub struct MockIntegratorServer {
     cctp_indexer_handles: Vec<JoinHandle<()>>,
 }
 
-// Per-venue routers. Each owns its endpoints relative to its mount prefix and
-// stays `Router<Arc<MockIntegratorState>>` (state-awaiting) so they can be
-// `nest`ed into the root, which provides the shared state exactly once.
-fn across_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new()
-        .route("/swap/approval", get(mock_across_real_swap_approval))
-        .route("/deposit/status", get(mock_across_deposit_status))
-}
-
-fn cctp_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new()
-        .route("/v2/messages/:source_domain", get(mock_cctp_messages))
-        .route(
-            "/v2/burn/USDC/fees/:source_domain/:destination_domain",
-            get(mock_cctp_burn_fees),
-        )
-}
-
-fn velora_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new()
-        .route("/prices", get(mock_velora_prices))
-        .route("/transactions/:network", post(mock_velora_transaction))
-}
-
-fn hyperunit_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new()
-        .route(
-            "/gen/:src_chain/:dst_chain/:asset/:dst_addr",
-            get(mock_unit_gen),
-        )
-        .route("/operations/:address", get(mock_unit_operations))
-}
-
-fn hyperliquid_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new()
-        .route("/info", post(mock_hyperliquid_info))
-        .route("/exchange", post(mock_hyperliquid_exchange))
-}
-
-fn coinbase_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new().route(
-        "/v2/prices/:currency_pair/spot",
-        get(mock_coinbase_spot_price),
-    )
-}
-
-fn chainalysis_router() -> Router<Arc<MockIntegratorState>> {
-    Router::new().route(
-        "/api/risk/v2/entities/:address",
-        get(mock_chainalysis_address_risk),
-    )
-}
-
 impl MockIntegratorServer {
     pub async fn spawn() -> eyre::Result<Self> {
         Self::spawn_with_config(MockIntegratorConfig::default()).await
@@ -863,28 +791,44 @@ impl MockIntegratorServer {
         };
         let state = Arc::new(MockIntegratorState::new(&config));
 
+        // Each indexer gets only the venue substate it mutates — the SAME `Arc`
+        // instance the corresponding handler sees (so a deposit indexed in the
+        // background is visible to the venue's HTTP handlers).
         let (across_indexer_shutdowns, across_indexer_handles) =
-            maybe_spawn_across_deposit_indexer(&config, state.clone()).await?;
+            maybe_spawn_across_deposit_indexer(&config, state.across.clone()).await?;
         let (hyperliquid_indexer_shutdown, hyperliquid_indexer_handle) =
-            maybe_spawn_hyperliquid_bridge_indexer(&config, state.clone()).await?;
+            maybe_spawn_hyperliquid_bridge_indexer(&config, state.hyperliquid.clone()).await?;
         let (unit_deposit_indexer_shutdowns, unit_deposit_indexer_handles) =
-            maybe_spawn_unit_deposit_indexers(&config, state.clone()).await?;
+            maybe_spawn_unit_deposit_indexers(&config, state.unit.clone()).await?;
         let (cctp_indexer_shutdowns, cctp_indexer_handles) =
-            maybe_spawn_cctp_burn_indexer(&config, state.clone()).await?;
+            maybe_spawn_cctp_burn_indexer(&config, state.cctp.clone()).await?;
 
         // Each venue mounts its own router under a dedicated path prefix, so the
         // namespaces can never collide (today the flat table only avoids
         // collisions by luck — e.g. CCTP's `/v2/messages` vs Coinbase's
-        // `/v2/prices`). State is provided once, at the root, after nesting.
+        // `/v2/prices`). State is provided PER VENUE at nest time: each venue
+        // router is `Router<Arc<VenueMockState>>` and receives only its own
+        // substate, so a handler can never reach another venue's state.
         let app = Router::new()
-            .nest("/across", across_router())
-            .nest("/cctp", cctp_router())
-            .nest("/velora", velora_router())
-            .nest("/hyperunit", hyperunit_router())
-            .nest("/hyperliquid", hyperliquid_router())
-            .nest("/coinbase", coinbase_router())
-            .nest("/chainalysis", chainalysis_router())
-            .with_state(state.clone());
+            .nest("/across", across::router().with_state(state.across.clone()))
+            .nest("/cctp", cctp::router().with_state(state.cctp.clone()))
+            .nest("/velora", velora::router().with_state(state.velora.clone()))
+            .nest(
+                "/hyperunit",
+                hyperunit::router().with_state(state.unit.clone()),
+            )
+            .nest(
+                "/hyperliquid",
+                hyperliquid::router().with_state(state.hyperliquid.clone()),
+            )
+            .nest(
+                "/coinbase",
+                coinbase::router().with_state(state.coinbase.clone()),
+            )
+            .nest(
+                "/chainalysis",
+                chainalysis::router().with_state(state.chainalysis.clone()),
+            );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app)
@@ -1033,7 +977,7 @@ impl MockIntegratorServer {
     /// HyperUnit finishing a deposit (funds credited to the HL protocol_address)
     /// or a withdrawal (tokens paid out to `dst_addr` after the spotSend).
     pub async fn complete_unit_operation(&self, protocol_address: &str) -> Result<(), String> {
-        complete_mock_unit_operation(&self.state, protocol_address).await
+        complete_mock_unit_operation(&self.state.unit, protocol_address).await
     }
 
     pub async fn complete_unit_operation_with_source_amount(
@@ -1042,7 +986,7 @@ impl MockIntegratorServer {
         source_amount: impl Into<String>,
     ) -> Result<(), String> {
         complete_mock_unit_operation_with_observation(
-            &self.state,
+            &self.state.unit,
             protocol_address,
             Some(UnitOperationObservation {
                 source_amount: source_amount.into(),
@@ -1058,7 +1002,7 @@ impl MockIntegratorServer {
         protocol_address: &str,
         error: impl Into<String>,
     ) -> Result<(), String> {
-        fail_mock_unit_operation(&self.state, protocol_address, error.into()).await
+        fail_mock_unit_operation(&self.state.unit, protocol_address, error.into()).await
     }
 
     /// Directly seed a completed Unit operation without going through `/gen`.
@@ -1298,83 +1242,103 @@ impl MockIntegratorServer {
 
 impl MockIntegratorState {
     pub(crate) fn new(config: &MockIntegratorConfig) -> Self {
+        // Construct the genuinely cross-cutting state FIRST, then hand each
+        // venue the `Arc` clones it needs. Every venue, the indexers, and this
+        // `MockIntegratorState` therefore observe the SAME shared/core
+        // instances — no venue reaches into another's state.
+        let shared = Arc::new(SharedMockState {
+            mock_service_evm_chains: config.mock_service_evm_chains.clone(),
+            mock_service_accounts: mock_service_accounts(),
+            mock_service_paymasters: config.mock_service_paymasters.clone(),
+            ledger: Mutex::default(),
+        });
+        let hyperliquid_core = Arc::new(HyperliquidCore::new());
+
+        let across = Arc::new(AcrossMockState {
+            spoke_pool_address: config.across_spoke_pool_address.clone(),
+            evm_rpc_url: config.across_evm_rpc_url.clone(),
+            chains: config.across_chains.clone(),
+            deposits: Mutex::default(),
+            destination_credit_tx_hashes: Mutex::default(),
+            api_key: config.across_api_key.clone(),
+            integrator_id: config.across_integrator_id.clone(),
+            quote_fee_bps: config.across_quote_fee_bps.min(9_999),
+            quote_jitter_bps: config.across_quote_jitter_bps.min(9_999),
+            status_latency: config.across_status_latency,
+            refund_probability_bps: config.across_refund_probability_bps.min(10_000),
+            next_swap_approval_error: Mutex::default(),
+            shared: shared.clone(),
+        });
+        let cctp = Arc::new(CctpMockState {
+            burns: Mutex::default(),
+            attestation_latency: config.cctp_attestation_latency,
+            attestation_delay_reason: config.cctp_attestation_delay_reason,
+        });
+        let velora = Arc::new(VeloraMockState {
+            usd_prices: Mutex::new(default_velora_usd_prices()),
+            swap_contract_addresses: config.velora_swap_contract_addresses.clone(),
+            transaction_failures_remaining: Mutex::new(config.velora_transaction_fail_next_n),
+            transaction_stale_quote_failures_remaining: Mutex::new(
+                config.velora_transaction_stale_quote_fail_next_n,
+            ),
+        });
+        let unit = Arc::new(UnitMockState {
+            generate_address_requests: Mutex::default(),
+            operations: Mutex::default(),
+            protocol_private_keys: Mutex::default(),
+            evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
+            withdrawal_release_timeout: config.unit_withdrawal_release_timeout,
+            bitcoin_rpc_url: config.unit_bitcoin_rpc_url.clone(),
+            bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),
+            next_generate_address_error: Mutex::default(),
+            next_withdrawal_completion_error: Mutex::default(),
+            core: hyperliquid_core.clone(),
+            shared: shared.clone(),
+        });
+        let hyperliquid = Arc::new(HyperliquidVenueState {
+            bridge_address: config.hyperliquid_bridge_address.clone(),
+            evm_rpc_url: config.hyperliquid_evm_rpc_url.clone(),
+            usdc_token_address: config.hyperliquid_usdc_token_address.clone(),
+            bridge_deposit_latency: config.hyperliquid_bridge_deposit_latency,
+            bridge_deposit_failure_probability_bps: config
+                .hyperliquid_bridge_deposit_failure_probability_bps
+                .min(10_000),
+            exchange_submissions: Mutex::default(),
+            withdrawal_latency: config.hyperliquid_withdrawal_latency,
+            next_exchange_error: Mutex::default(),
+            mainnet: config.mainnet_hyperliquid,
+            core: hyperliquid_core.clone(),
+            unit: unit.clone(),
+            shared: shared.clone(),
+        });
+
         Self {
-            across: Arc::new(AcrossMockState {
-                spoke_pool_address: config.across_spoke_pool_address.clone(),
-                evm_rpc_url: config.across_evm_rpc_url.clone(),
-                chains: config.across_chains.clone(),
-                deposits: Mutex::default(),
-                destination_credit_tx_hashes: Mutex::default(),
-                api_key: config.across_api_key.clone(),
-                integrator_id: config.across_integrator_id.clone(),
-                quote_fee_bps: config.across_quote_fee_bps.min(9_999),
-                quote_jitter_bps: config.across_quote_jitter_bps.min(9_999),
-                status_latency: config.across_status_latency,
-                refund_probability_bps: config.across_refund_probability_bps.min(10_000),
-                next_swap_approval_error: Mutex::default(),
-            }),
-            cctp: Arc::new(CctpMockState {
-                burns: Mutex::default(),
-                attestation_latency: config.cctp_attestation_latency,
-                attestation_delay_reason: config.cctp_attestation_delay_reason,
-            }),
-            velora: Arc::new(VeloraMockState {
-                usd_prices: Mutex::new(default_velora_usd_prices()),
-                swap_contract_addresses: config.velora_swap_contract_addresses.clone(),
-                transaction_failures_remaining: Mutex::new(config.velora_transaction_fail_next_n),
-                transaction_stale_quote_failures_remaining: Mutex::new(
-                    config.velora_transaction_stale_quote_fail_next_n,
-                ),
-            }),
-            unit: Arc::new(UnitMockState {
-                generate_address_requests: Mutex::default(),
-                operations: Mutex::default(),
-                protocol_private_keys: Mutex::default(),
-                evm_rpc_urls: config.unit_evm_rpc_urls.clone(),
-                withdrawal_release_timeout: config.unit_withdrawal_release_timeout,
-                bitcoin_rpc_url: config.unit_bitcoin_rpc_url.clone(),
-                bitcoin_cookie_path: config.unit_bitcoin_cookie_path.clone(),
-                next_generate_address_error: Mutex::default(),
-                next_withdrawal_completion_error: Mutex::default(),
-            }),
-            hyperliquid: Arc::new(HyperliquidVenueState {
-                bridge_address: config.hyperliquid_bridge_address.clone(),
-                evm_rpc_url: config.hyperliquid_evm_rpc_url.clone(),
-                usdc_token_address: config.hyperliquid_usdc_token_address.clone(),
-                bridge_deposit_latency: config.hyperliquid_bridge_deposit_latency,
-                bridge_deposit_failure_probability_bps: config
-                    .hyperliquid_bridge_deposit_failure_probability_bps
-                    .min(10_000),
-                exchange_submissions: Mutex::default(),
-                withdrawal_latency: config.hyperliquid_withdrawal_latency,
-                next_exchange_error: Mutex::default(),
-                mainnet: config.mainnet_hyperliquid,
-            }),
-            hyperliquid_core: Arc::new(HyperliquidCore::new()),
+            across,
+            cctp,
+            velora,
+            unit,
+            hyperliquid,
+            hyperliquid_core,
             coinbase: Arc::new(CoinbaseMockState),
             chainalysis: Arc::new(ChainalysisMockState {
                 address_screening_rules: config.address_screening_rules.clone(),
             }),
-            shared: Arc::new(SharedMockState {
-                mock_service_evm_chains: config.mock_service_evm_chains.clone(),
-                mock_service_accounts: mock_service_accounts(),
-                mock_service_paymasters: config.mock_service_paymasters.clone(),
-                ledger: Mutex::default(),
-            }),
+            shared,
         }
     }
 
+}
+
+impl SharedMockState {
     pub(crate) fn mock_service_paymaster(
         &self,
         service: MockService,
         chain_id: u64,
     ) -> Result<&MockServicePaymaster, String> {
-        self.shared
-            .mock_service_paymasters
+        self.mock_service_paymasters
             .get(&(service, chain_id))
             .ok_or_else(|| {
                 let evm_address = self
-                    .shared
                     .mock_service_accounts
                     .get(&service)
                     .map(|account| format!("{:#x}", account.ethereum_address))
@@ -1387,43 +1351,9 @@ impl MockIntegratorState {
     }
 
     pub(crate) fn mock_service_paymaster_rpc_url(&self, chain_id: u64) -> Option<&str> {
-        self.shared
-            .mock_service_evm_chains
+        self.mock_service_evm_chains
             .get(&chain_id)
             .map(String::as_str)
-    }
-
-    pub(crate) fn across_chain_config(
-        &self,
-        origin_chain_id: u64,
-    ) -> Option<ResolvedMockAcrossChainConfig> {
-        self.across
-            .chains
-            .get(&origin_chain_id)
-            .map(|config| ResolvedMockAcrossChainConfig {
-                spoke_pool_address: config.spoke_pool_address.clone(),
-                evm_rpc_url: Some(config.evm_rpc_url.clone()),
-            })
-            .or_else(|| {
-                Some(ResolvedMockAcrossChainConfig {
-                    spoke_pool_address: self.across.spoke_pool_address.clone()?,
-                    evm_rpc_url: self.across.evm_rpc_url.clone(),
-                })
-            })
-    }
-
-    pub(crate) fn across_chain_rpc_url(&self, chain_id: u64) -> Option<String> {
-        self.across
-            .chains
-            .get(&chain_id)
-            .map(|config| config.evm_rpc_url.clone())
-            .or_else(|| {
-                if self.across.chains.is_empty() {
-                    self.across.evm_rpc_url.clone()
-                } else {
-                    None
-                }
-            })
     }
 }
 
@@ -1510,13 +1440,13 @@ pub(crate) fn address_to_bytes32(address: Address) -> FixedBytes<32> {
 }
 
 pub(crate) async fn mock_credit_native_on_anvil(
-    state: &MockIntegratorState,
+    shared: &SharedMockState,
     chain_id: u64,
     service: MockService,
     recipient: Address,
     amount: U256,
 ) -> Result<(), String> {
-    let handle = state.mock_service_paymaster(service, chain_id)?;
+    let handle = shared.mock_service_paymaster(service, chain_id)?;
     let execution = Execution {
         target: recipient,
         value: amount,
@@ -1530,17 +1460,17 @@ pub(crate) async fn mock_credit_native_on_anvil(
 }
 
 pub(crate) async fn mock_mint_erc20_on_anvil(
-    state: &MockIntegratorState,
+    shared: &SharedMockState,
     chain_id: u64,
     service: MockService,
     token: Address,
     recipient: Address,
     amount: U256,
 ) -> Result<String, String> {
-    let handle = state.mock_service_paymaster(service, chain_id)?;
+    let handle = shared.mock_service_paymaster(service, chain_id)?;
     let provider = ProviderBuilder::new()
         .connect(
-            state
+            shared
                 .mock_service_paymaster_rpc_url(chain_id)
                 .ok_or_else(|| format!("mock service EVM chain {chain_id} has no RPC URL"))?,
         )
@@ -1698,9 +1628,11 @@ mod tests {
         );
 
         let hyperunit = state
+            .shared
             .mock_service_paymaster(MockService::Hyperunit, chain_id)
             .expect("hyperunit paymaster");
         let across = state
+            .shared
             .mock_service_paymaster(MockService::Across, chain_id)
             .expect("across paymaster");
 
@@ -1710,6 +1642,7 @@ mod tests {
         assert_eq!(across.chain_id(), chain_id);
         assert_ne!(hyperunit.service(), across.service());
         assert!(state
+            .shared
             .mock_service_paymaster(MockService::Hyperunit, 1)
             .is_err());
     }

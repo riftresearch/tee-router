@@ -9,7 +9,8 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    routing::get,
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ pub(crate) mod contract;
 use crate::mock_integrators::cctp::contract::MockCctpTokenMessengerV2::DepositForBurn;
 use crate::mock_integrators::{
     bytes32_to_evm_address, error_response, mock_evm_indexer_initial_last_scanned,
-    MockIntegratorConfig, MockIntegratorState,
+    MockIntegratorConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,17 @@ pub(crate) struct CctpMockState {
     pub(crate) attestation_delay_reason: Option<MockCctpDelayReason>,
 }
 
+/// Builds the CCTP (Iris) mock router. Mounted under `/cctp`; receives its own
+/// [`CctpMockState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<CctpMockState>> {
+    Router::new()
+        .route("/v2/messages/:source_domain", get(mock_cctp_messages))
+        .route(
+            "/v2/burn/USDC/fees/:source_domain/:destination_domain",
+            get(mock_cctp_burn_fees),
+        )
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct MockCctpMessagesQuery {
     #[serde(rename = "transactionHash")]
@@ -90,11 +102,11 @@ pub(crate) struct MockCctpMessagesQuery {
 }
 
 pub(crate) async fn mock_cctp_messages(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<CctpMockState>>,
     Path(source_domain): Path<u32>,
     Query(query): Query<MockCctpMessagesQuery>,
 ) -> impl IntoResponse {
-    let burns = state.cctp.burns.lock().await;
+    let burns = state.burns.lock().await;
     let record = if let Some(tx_hash) = query.transaction_hash.as_deref() {
         burns.get(tx_hash).cloned()
     } else if let Some(nonce) = query.nonce.as_deref() {
@@ -129,7 +141,7 @@ pub(crate) async fn mock_cctp_messages(
             "messageSender": format!("{:#x}", record.depositor)
         }
     });
-    if let Some(reason) = state.cctp.attestation_delay_reason {
+    if let Some(reason) = state.attestation_delay_reason {
         // Real Iris V2 leaves the status as `pending_confirmations` and signals
         // failure via `delayReason`. The only terminal reason is
         // `amount_above_max`; the others mean Iris is still waiting on fee
@@ -150,11 +162,11 @@ pub(crate) async fn mock_cctp_messages(
         )
             .into_response();
     }
-    let attestation_ready = state.cctp.attestation_latency.is_zero()
+    let attestation_ready = state.attestation_latency.is_zero()
         || Utc::now()
             .signed_duration_since(record.indexed_at)
             .to_std()
-            .is_ok_and(|age| age >= state.cctp.attestation_latency);
+            .is_ok_and(|age| age >= state.attestation_latency);
     if !attestation_ready {
         return (
             StatusCode::OK,
@@ -208,7 +220,7 @@ pub(crate) async fn mock_cctp_burn_fees(
 
 pub(crate) async fn maybe_spawn_cctp_burn_indexer(
     config: &MockIntegratorConfig,
-    state: Arc<MockIntegratorState>,
+    state: Arc<CctpMockState>,
 ) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
     let mut destination_tokens = BTreeMap::<u32, Address>::new();
     for (domain, token_str) in &config.cctp_destination_token_addresses {
@@ -300,7 +312,7 @@ async fn run_cctp_burn_indexer(
     token_messenger_address: Address,
     destination_token_addresses: BTreeMap<u32, Address>,
     source_domain: u32,
-    state: Arc<MockIntegratorState>,
+    state: Arc<CctpMockState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let signature: B256 = DepositForBurn::SIGNATURE_HASH;
@@ -374,7 +386,7 @@ async fn run_cctp_burn_indexer(
                 block_number,
                 indexed_at: Utc::now(),
             };
-            state.cctp.burns.lock().await.insert(burn_tx_hash, record);
+            state.burns.lock().await.insert(burn_tx_hash, record);
         }
         last_scanned = head;
     }
@@ -396,13 +408,22 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use serde_json::Value;
 
+    fn cctp_state(
+        attestation_latency: Duration,
+        attestation_delay_reason: Option<MockCctpDelayReason>,
+    ) -> Arc<CctpMockState> {
+        Arc::new(CctpMockState {
+            burns: Mutex::default(),
+            attestation_latency,
+            attestation_delay_reason,
+        })
+    }
+
     #[tokio::test]
     async fn mock_cctp_messages_honor_attestation_latency() {
-        let state = Arc::new(MockIntegratorState::new(
-            &MockIntegratorConfig::default().with_cctp_attestation_latency(Duration::from_secs(60)),
-        ));
+        let state = cctp_state(Duration::from_secs(60), None);
         state
-            .cctp.burns
+            .burns
             .lock()
             .await
             .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
@@ -411,7 +432,7 @@ mod tests {
         assert_eq!(pending["messages"][0]["status"], "pending_confirmations");
         assert!(pending["messages"][0]["attestation"].is_null());
 
-        state.cctp.burns.lock().await.insert(
+        state.burns.lock().await.insert(
             "0xburn".to_string(),
             mock_cctp_burn_record(Utc::now() - ChronoDuration::seconds(61)),
         );
@@ -424,12 +445,9 @@ mod tests {
 
     #[tokio::test]
     async fn mock_cctp_messages_can_return_amount_above_max_delay_reason() {
-        let state = Arc::new(MockIntegratorState::new(
-            &MockIntegratorConfig::default()
-                .with_cctp_attestation_delay_reason(MockCctpDelayReason::AmountAboveMax),
-        ));
+        let state = cctp_state(Duration::ZERO, Some(MockCctpDelayReason::AmountAboveMax));
         state
-            .cctp.burns
+            .burns
             .lock()
             .await
             .insert("0xburn".to_string(), mock_cctp_burn_record(Utc::now()));
@@ -444,7 +462,7 @@ mod tests {
         assert!(body["messages"][0].get("error").is_none());
     }
 
-    async fn mock_cctp_message_body(state: Arc<MockIntegratorState>, tx_hash: &str) -> Value {
+    async fn mock_cctp_message_body(state: Arc<CctpMockState>, tx_hash: &str) -> Value {
         let response = mock_cctp_messages(
             State(state),
             Path(0),

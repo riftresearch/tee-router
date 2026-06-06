@@ -9,7 +9,8 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    routing::post,
+    Json, Router,
 };
 use chrono::Utc;
 use hyperliquid_client::{
@@ -27,10 +28,10 @@ pub(crate) mod contract;
 
 use crate::hyperliquid_core::{format_hl_amount, hyperliquid_has_sufficient_amount};
 use crate::mock_integrators::hyperliquid::contract::MockHyperliquidBridge2;
+use crate::mock_integrators::hyperunit::complete_unit_withdrawal_after_hyperliquid_transfer;
 use crate::mock_integrators::{
-    complete_unit_withdrawal_after_hyperliquid_transfer, deterministic_bps, error_response,
-    mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, MockIntegratorConfig,
-    MockIntegratorErrorResponse, MockIntegratorState, MockService, IERC20,
+    deterministic_bps, error_response, mock_evm_indexer_initial_last_scanned,
+    mock_mint_erc20_on_anvil, MockIntegratorConfig, MockIntegratorErrorResponse, MockService, IERC20,
 };
 
 /// Per-venue config/state for the Hyperliquid mock that is **not** the core
@@ -52,11 +53,30 @@ pub(crate) struct HyperliquidVenueState {
     pub(crate) withdrawal_latency: Duration,
     pub(crate) next_exchange_error: Mutex<Option<String>>,
     pub(crate) mainnet: bool,
+    /// The Hyperliquid devnet "chain" ledger, shared by `Arc`. Every spot /
+    /// exchange / transfer handler mutates this; the same instance is held by
+    /// every venue and by [`crate::mock_integrators::MockIntegratorState`].
+    pub(crate) core: Arc<crate::hyperliquid_core::HyperliquidCore>,
+    /// The HyperUnit venue state, shared by `Arc`. spotSend / sendAsset settle
+    /// in-flight Unit withdrawals via
+    /// [`crate::mock_integrators::hyperunit::complete_unit_withdrawal_after_hyperliquid_transfer`].
+    pub(crate) unit: Arc<crate::mock_integrators::hyperunit::UnitMockState>,
+    /// Cross-cutting infra the Bridge2 withdrawal release needs (mock-service
+    /// paymasters / RPC URLs). Shared `Arc` instance.
+    pub(crate) shared: Arc<crate::mock_integrators::SharedMockState>,
+}
+
+/// Builds the Hyperliquid mock router. Mounted under `/hyperliquid`; receives
+/// its own [`HyperliquidVenueState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<HyperliquidVenueState>> {
+    Router::new()
+        .route("/info", post(mock_hyperliquid_info))
+        .route("/exchange", post(mock_hyperliquid_exchange))
 }
 
 pub(crate) async fn maybe_spawn_hyperliquid_bridge_indexer(
     config: &MockIntegratorConfig,
-    state: Arc<MockIntegratorState>,
+    state: Arc<HyperliquidVenueState>,
 ) -> eyre::Result<(
     Option<tokio::sync::oneshot::Sender<()>>,
     Option<JoinHandle<()>>,
@@ -92,7 +112,7 @@ async fn run_hyperliquid_bridge_indexer(
     provider: DynProvider,
     token_address: Address,
     bridge_address: Address,
-    state: Arc<MockIntegratorState>,
+    state: Arc<HyperliquidVenueState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let signature: B256 = IERC20::Transfer::SIGNATURE_HASH;
@@ -175,7 +195,7 @@ async fn run_hyperliquid_bridge_indexer(
                 );
                 continue;
             }
-            if state.hyperliquid.bridge_deposit_latency > Duration::ZERO {
+            if state.bridge_deposit_latency > Duration::ZERO {
                 schedule_mock_hyperliquid_bridge_deposit_credit(
                     &state, event.from, amount, tx_hash,
                 );
@@ -188,12 +208,12 @@ async fn run_hyperliquid_bridge_indexer(
 }
 
 fn mock_hyperliquid_bridge_deposit_should_fail(
-    state: &MockIntegratorState,
+    state: &HyperliquidVenueState,
     user: Address,
     amount_raw: U256,
     tx_hash: &str,
 ) -> bool {
-    let probability_bps = state.hyperliquid.bridge_deposit_failure_probability_bps;
+    let probability_bps = state.bridge_deposit_failure_probability_bps;
     deterministic_bps(
         &format!("hyperliquid-bridge-deposit:{user}:{tx_hash}:{amount_raw}"),
         9_999,
@@ -201,13 +221,13 @@ fn mock_hyperliquid_bridge_deposit_should_fail(
 }
 
 fn schedule_mock_hyperliquid_bridge_deposit_credit(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     user: Address,
     amount: f64,
     tx_hash: String,
 ) {
     let state = Arc::clone(state);
-    let latency = state.hyperliquid.bridge_deposit_latency;
+    let latency = state.bridge_deposit_latency;
     tokio::spawn(async move {
         tokio::time::sleep(latency).await;
         credit_mock_hyperliquid_bridge_deposit(&state, user, amount, &tx_hash).await;
@@ -215,12 +235,12 @@ fn schedule_mock_hyperliquid_bridge_deposit_credit(
 }
 
 async fn credit_mock_hyperliquid_bridge_deposit(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     user: Address,
     amount: f64,
     tx_hash: &str,
 ) {
-    let mut hl = state.hyperliquid_core.lock().await;
+    let mut hl = state.core.lock().await;
     hl.credit_clearinghouse(user, "USDC", amount);
     hl.record_ledger_update(
         user,
@@ -273,7 +293,7 @@ fn optional_hyperliquid_u64(request: &Value, field: &str) -> Option<u64> {
 /// the matching `hyperliquid_client` type so clients exercising this mock
 /// speak the real wire format.
 pub(crate) async fn mock_hyperliquid_info(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<HyperliquidVenueState>>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
     let Some(kind) = request.get("type").and_then(Value::as_str) else {
@@ -282,7 +302,7 @@ pub(crate) async fn mock_hyperliquid_info(
             "mock Hyperliquid /info requires a `type` field",
         );
     };
-    let mut hl = state.hyperliquid_core.lock().await;
+    let mut hl = state.core.lock().await;
     hl.run_due_scheduled_cancels();
     match kind {
         "spotMeta" => match hl.spot_meta_value() {
@@ -429,10 +449,10 @@ pub(crate) async fn mock_hyperliquid_info(
 /// open-orders list, cancels, or moves spot balances between users — then
 /// returns the real API's response shape.
 pub(crate) async fn mock_hyperliquid_exchange(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<HyperliquidVenueState>>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
-    if let Some(error) = state.hyperliquid.next_exchange_error.lock().await.take() {
+    if let Some(error) = state.next_exchange_error.lock().await.take() {
         return (
             StatusCode::BAD_GATEWAY,
             Json(MockIntegratorErrorResponse { error }),
@@ -441,7 +461,7 @@ pub(crate) async fn mock_hyperliquid_exchange(
     }
 
     state
-        .hyperliquid.exchange_submissions
+        .exchange_submissions
         .lock()
         .await
         .push(request.clone());
@@ -469,7 +489,7 @@ pub(crate) async fn mock_hyperliquid_exchange(
 }
 
 async fn handle_l1_action(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     request: &Value,
     action_type: &str,
 ) -> axum::response::Response {
@@ -514,7 +534,7 @@ async fn handle_l1_action(
             );
         }
     };
-    let signer = match recover_l1_signer(connection_id, state.hyperliquid.mainnet, &signature) {
+    let signer = match recover_l1_signer(connection_id, state.mainnet, &signature) {
         Ok(addr) => addr,
         Err(err) => {
             return error_response(
@@ -525,7 +545,7 @@ async fn handle_l1_action(
     };
     let user = vault_address.unwrap_or(signer);
 
-    let mut hl = state.hyperliquid_core.lock().await;
+    let mut hl = state.core.lock().await;
     hl.run_due_scheduled_cancels();
     match action {
         Actions::Order(bulk) => {
@@ -564,7 +584,7 @@ async fn handle_l1_action(
 }
 
 async fn handle_spot_send(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     request: &Value,
 ) -> axum::response::Response {
     let Some(action_value) = request.get("action").cloned() else {
@@ -625,7 +645,7 @@ async fn handle_spot_send(
     };
 
     {
-        let mut hl = state.hyperliquid_core.lock().await;
+        let mut hl = state.core.lock().await;
         let available = hl.available_spot(signer, &token_symbol);
         if !hyperliquid_has_sufficient_amount(available, amount) {
             return error_response(
@@ -644,7 +664,7 @@ async fn handle_spot_send(
         None => format!("{signer:#x}:0"),
     };
     if let Err(response) = complete_unit_withdrawal_after_hyperliquid_transfer(
-        state,
+        &state.unit,
         &payload.destination,
         format!("{signer:#x}"),
         &payload.amount,
@@ -663,7 +683,7 @@ async fn handle_spot_send(
 }
 
 async fn handle_send_asset(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     request: &Value,
 ) -> axum::response::Response {
     let Some(action_value) = request.get("action").cloned() else {
@@ -740,7 +760,7 @@ async fn handle_send_asset(
     };
 
     {
-        let mut hl = state.hyperliquid_core.lock().await;
+        let mut hl = state.core.lock().await;
         let available = hl.available_spot(source_user, &token_symbol);
         if !hyperliquid_has_sufficient_amount(available, amount) {
             return error_response(
@@ -758,7 +778,7 @@ async fn handle_send_asset(
 
     let source_tx_hash = format!("{source_user:#x}:{}", payload.nonce);
     if let Err(response) = complete_unit_withdrawal_after_hyperliquid_transfer(
-        state,
+        &state.unit,
         &payload.destination,
         format!("{source_user:#x}"),
         &payload.amount,
@@ -777,7 +797,7 @@ async fn handle_send_asset(
 }
 
 async fn handle_usd_class_transfer(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     request: &Value,
 ) -> axum::response::Response {
     let Some(action_value) = request.get("action") else {
@@ -818,12 +838,12 @@ async fn handle_usd_class_transfer(
         Err(msg) => return error_response(StatusCode::UNPROCESSABLE_ENTITY, msg),
     };
     let payload = UsdClassTransfer {
-        signature_chain_id: if state.hyperliquid.mainnet {
+        signature_chain_id: if state.mainnet {
             42_161
         } else {
             421_614
         },
-        hyperliquid_chain: if state.hyperliquid.mainnet {
+        hyperliquid_chain: if state.mainnet {
             "Mainnet".to_string()
         } else {
             "Testnet".to_string()
@@ -847,7 +867,7 @@ async fn handle_usd_class_transfer(
     };
     let user = maybe_subaccount.unwrap_or(signer);
 
-    let mut hl = state.hyperliquid_core.lock().await;
+    let mut hl = state.core.lock().await;
     let available = if to_perp {
         hl.available_spot(user, "USDC")
     } else {
@@ -877,7 +897,7 @@ async fn handle_usd_class_transfer(
 }
 
 async fn handle_withdraw3(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     request: &Value,
 ) -> axum::response::Response {
     let Some(action_value) = request.get("action").cloned() else {
@@ -941,7 +961,7 @@ async fn handle_withdraw3(
     }
     let gross_amount = amount_raw as f64 / 1_000_000.0;
     {
-        let mut hl = state.hyperliquid_core.lock().await;
+        let mut hl = state.core.lock().await;
         let available = hl.clearinghouse_total(user, "USDC");
         if !hyperliquid_has_sufficient_amount(available, gross_amount) {
             return error_response(
@@ -1038,20 +1058,20 @@ fn parse_usdc_decimal_to_raw_u64(value: &str) -> Result<u64, String> {
 }
 
 fn schedule_mock_hyperliquid_withdrawal_release(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<HyperliquidVenueState>,
     destination: Address,
     payout_raw: u64,
 ) {
-    let Some(rpc_url) = state.hyperliquid.evm_rpc_url.clone() else {
+    let Some(rpc_url) = state.evm_rpc_url.clone() else {
         return;
     };
-    let Some(bridge_address) = state.hyperliquid.bridge_address.clone() else {
+    let Some(bridge_address) = state.bridge_address.clone() else {
         return;
     };
-    let Some(usdc_token_address) = state.hyperliquid.usdc_token_address.clone() else {
+    let Some(usdc_token_address) = state.usdc_token_address.clone() else {
         return;
     };
-    let latency = state.hyperliquid.withdrawal_latency;
+    let latency = state.withdrawal_latency;
     let state = state.clone();
     tokio::spawn(async move {
         if latency > Duration::ZERO {
@@ -1073,7 +1093,7 @@ fn schedule_mock_hyperliquid_withdrawal_release(
 }
 
 async fn send_mock_hyperliquid_withdrawal_release(
-    state: Arc<MockIntegratorState>,
+    state: Arc<HyperliquidVenueState>,
     rpc_url: &str,
     bridge_address: &str,
     usdc_token_address: &str,
@@ -1095,7 +1115,7 @@ async fn send_mock_hyperliquid_withdrawal_release(
         .await
         .map_err(|err| format!("hyperliquid withdrawal release get_chain_id failed: {err}"))?;
     mock_mint_erc20_on_anvil(
-        &state,
+        &state.shared,
         chain_id,
         MockService::HyperliquidBridge,
         usdc_token_address,
@@ -1110,7 +1130,7 @@ async fn send_mock_hyperliquid_withdrawal_release(
         }
         .abi_encode(),
     );
-    let handle = state.mock_service_paymaster(MockService::HyperliquidBridge, chain_id)?;
+    let handle = state.shared.mock_service_paymaster(MockService::HyperliquidBridge, chain_id)?;
     let execution = Execution {
         target: bridge_address,
         value: U256::ZERO,

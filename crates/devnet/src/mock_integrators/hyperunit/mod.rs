@@ -8,7 +8,8 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    routing::get,
+    Json, Router,
 };
 use bitcoincore_rpc_async::{Auth as BitcoinRpcAuth, Client as BitcoinRpcClient, RpcApi};
 use chrono::Utc;
@@ -32,8 +33,8 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use eip7702_paymaster::Execution;
 
 use crate::mock_integrators::{
-    error_response, MockIntegratorConfig, MockIntegratorErrorResponse, MockIntegratorState,
-    MockService, MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS,
+    error_response, MockIntegratorConfig, MockIntegratorErrorResponse, MockService,
+    MOCK_UNIT_DESTINATION_TX_CONFIRMATIONS,
 };
 
 /// Path parameters captured when the router calls `GET /gen/{src}/{dst}/{asset}/{dst_addr}`.
@@ -122,11 +123,29 @@ pub(crate) struct UnitMockState {
     pub(crate) bitcoin_cookie_path: Option<PathBuf>,
     pub(crate) next_generate_address_error: Mutex<Option<String>>,
     pub(crate) next_withdrawal_completion_error: Mutex<Option<String>>,
+    /// The Hyperliquid devnet "chain" ledger, shared by `Arc`. Unit deposits
+    /// credit spot balances here; the same instance is held by every venue and
+    /// by [`crate::mock_integrators::MockIntegratorState`].
+    pub(crate) core: Arc<crate::hyperliquid_core::HyperliquidCore>,
+    /// Cross-cutting infra the EVM withdrawal release needs (mock-service
+    /// paymasters keyed by `(service, chain)`). Shared `Arc` instance.
+    pub(crate) shared: Arc<crate::mock_integrators::SharedMockState>,
+}
+
+/// Builds the HyperUnit mock router. Mounted under `/hyperunit`; receives its
+/// own [`UnitMockState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<UnitMockState>> {
+    Router::new()
+        .route(
+            "/gen/:src_chain/:dst_chain/:asset/:dst_addr",
+            get(mock_unit_gen),
+        )
+        .route("/operations/:address", get(mock_unit_operations))
 }
 
 pub(crate) async fn maybe_spawn_unit_deposit_indexers(
     config: &MockIntegratorConfig,
-    state: Arc<MockIntegratorState>,
+    state: Arc<UnitMockState>,
 ) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
     let mut shutdowns = Vec::new();
     let mut handles = Vec::new();
@@ -175,7 +194,7 @@ struct UnitDepositWatch {
 async fn run_unit_evm_deposit_indexer(
     provider: DynProvider,
     unit_chain: UnitChain,
-    state: Arc<MockIntegratorState>,
+    state: Arc<UnitMockState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let poll = Duration::from_millis(100);
@@ -228,7 +247,7 @@ async fn run_unit_evm_deposit_indexer(
 
 async fn run_unit_bitcoin_deposit_indexer(
     client: BitcoinRpcClient,
-    state: Arc<MockIntegratorState>,
+    state: Arc<UnitMockState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let poll = Duration::from_millis(100);
@@ -294,7 +313,7 @@ async fn run_unit_bitcoin_deposit_indexer(
 
 async fn scan_unit_bitcoin_mempool(
     client: &BitcoinRpcClient,
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     watches: &[UnitDepositWatch],
 ) {
     let mempool = match client.get_raw_mempool().await {
@@ -334,7 +353,7 @@ async fn scan_unit_bitcoin_mempool(
 }
 
 async fn process_unit_bitcoin_transaction_outputs<I>(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     watches: &[UnitDepositWatch],
     txid: &str,
     outputs: I,
@@ -381,10 +400,10 @@ async fn process_unit_bitcoin_transaction_outputs<I>(
 }
 
 async fn active_unit_deposit_watches(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     src_chain: UnitChain,
 ) -> Vec<UnitDepositWatch> {
-    let operations = state.unit.operations.lock().await;
+    let operations = state.operations.lock().await;
     operations
         .values()
         .flat_map(|entries| entries.iter())
@@ -427,10 +446,10 @@ fn bitcoin_script_pubkey_for_regtest_address(address: &str) -> Option<bitcoin::S
 /// seeded at `sourceTxDiscovered` — tests advance the state via
 /// `complete_unit_operation` / `fail_unit_operation`.
 pub(crate) async fn mock_unit_gen(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<UnitMockState>>,
     Path((src_chain, dst_chain, asset, dst_addr)): Path<(String, String, String, String)>,
 ) -> impl IntoResponse {
-    if let Some(error) = state.unit.next_generate_address_error.lock().await.take() {
+    if let Some(error) = state.next_generate_address_error.lock().await.take() {
         return (
             StatusCode::BAD_GATEWAY,
             Json(MockIntegratorErrorResponse { error }),
@@ -463,7 +482,7 @@ pub(crate) async fn mock_unit_gen(
         dst_addr: dst_addr.clone(),
     };
     state
-        .unit.generate_address_requests
+        .generate_address_requests
         .lock()
         .await
         .push(request);
@@ -484,7 +503,7 @@ pub(crate) async fn mock_unit_gen(
 
     let protocol_address = loop {
         let protocol_wallet = fresh_mock_protocol_wallet(src, dst);
-        let mut private_keys = state.unit.protocol_private_keys.lock().await;
+        let mut private_keys = state.protocol_private_keys.lock().await;
         if private_keys.contains_key(&protocol_wallet.address) {
             continue;
         }
@@ -493,7 +512,7 @@ pub(crate) async fn mock_unit_gen(
         break protocol_address;
     };
     {
-        let mut operations = state.unit.operations.lock().await;
+        let mut operations = state.operations.lock().await;
         operations
             .entry(protocol_address.clone())
             .or_default()
@@ -542,10 +561,10 @@ pub(crate) async fn mock_unit_gen(
 /// protocol address" endpoint. Returns the tracked operation (if any) in the
 /// exact `UnitOperationsResponse` shape production code parses.
 pub(crate) async fn mock_unit_operations(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<UnitMockState>>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let operations = state.unit.operations.lock().await;
+    let operations = state.operations.lock().await;
     let matched: Vec<_> = operations
         .values()
         .flat_map(|entries| entries.iter())
@@ -637,7 +656,7 @@ fn addresses_match(left: &str, right: &str) -> bool {
 }
 
 pub(crate) async fn complete_unit_withdrawal_after_hyperliquid_transfer(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     destination: &str,
     source_address: String,
     decimal_amount: &str,
@@ -645,7 +664,7 @@ pub(crate) async fn complete_unit_withdrawal_after_hyperliquid_transfer(
 ) -> Result<(), axum::response::Response> {
     let mut unit_withdrawal_to_complete = None;
     {
-        let mut operations = state.unit.operations.lock().await;
+        let mut operations = state.operations.lock().await;
         if let Some(entry) = operations
             .get_mut(destination)
             .and_then(|entries| latest_active_unit_operation_mut(entries))
@@ -686,14 +705,14 @@ pub(crate) async fn complete_unit_withdrawal_after_hyperliquid_transfer(
 }
 
 fn spawn_mock_unit_withdrawal_completion(
-    state: Arc<MockIntegratorState>,
+    state: Arc<UnitMockState>,
     protocol_address: String,
     source_amount: String,
     source_tx_hash: String,
 ) {
     tokio::spawn(async move {
         let completion_result = if let Some(error) = state
-            .unit.next_withdrawal_completion_error
+            .next_withdrawal_completion_error
             .lock()
             .await
             .take()
@@ -728,7 +747,7 @@ fn spawn_mock_unit_withdrawal_completion(
 /// so downstream balance/history assertions still work once the real router
 /// API no longer routes funds through `POST /unit/*` endpoints.
 pub(crate) async fn complete_mock_unit_operation(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     protocol_address: &str,
 ) -> Result<(), String> {
     complete_mock_unit_operation_with_observation(state, protocol_address, None).await
@@ -761,7 +780,7 @@ struct MockUnitBitcoinWithdrawalRelease {
 }
 
 pub(crate) async fn complete_mock_unit_operation_with_observation(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     protocol_address: &str,
     observation: Option<UnitOperationObservation>,
 ) -> Result<(), String> {
@@ -771,7 +790,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             %protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit.operations.lock().await;
+        let mut operations = state.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             %protocol_address,
@@ -929,7 +948,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
 
     if let Some(credit) = maybe_deposit_credit {
         if credit.spot_amount > 0.0 {
-            let mut hl = state.hyperliquid_core.lock().await;
+            let mut hl = state.core.lock().await;
             hl.credit_spot(credit.user, credit.coin, credit.spot_amount);
             hl.record_ledger_update(
                 credit.user,
@@ -944,7 +963,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
         }
     }
     if let Some(release) = maybe_evm_withdrawal_release {
-        let timeout = state.unit.withdrawal_release_timeout;
+        let timeout = state.withdrawal_release_timeout;
         let tx_hash = match tokio::time::timeout(
             timeout,
             send_mock_unit_evm_withdrawal_release(state, &release),
@@ -975,7 +994,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             protocol_address = %release.protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit.operations.lock().await;
+        let mut operations = state.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             protocol_address = %release.protocol_address,
@@ -995,7 +1014,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
         );
     }
     if let Some(release) = maybe_bitcoin_withdrawal_release {
-        let timeout = state.unit.withdrawal_release_timeout;
+        let timeout = state.withdrawal_release_timeout;
         let tx_hash = match tokio::time::timeout(
             timeout,
             send_mock_unit_bitcoin_withdrawal_release(state, &release),
@@ -1026,7 +1045,7 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
             protocol_address = %release.protocol_address,
             "acquiring unit_operations lock"
         );
-        let mut operations = state.unit.operations.lock().await;
+        let mut operations = state.operations.lock().await;
         tracing::info!(
             target: "mock_hu",
             protocol_address = %release.protocol_address,
@@ -1057,8 +1076,8 @@ fn format_duration_for_log(duration: Duration) -> String {
     }
 }
 
-async fn mark_mock_unit_operation_failed(state: &Arc<MockIntegratorState>, protocol_address: &str) {
-    let mut operations = state.unit.operations.lock().await;
+async fn mark_mock_unit_operation_failed(state: &Arc<UnitMockState>, protocol_address: &str) {
+    let mut operations = state.operations.lock().await;
     if let Some(entry) = operations
         .get_mut(protocol_address)
         .and_then(|entries| entries.last_mut())
@@ -1072,7 +1091,7 @@ async fn mark_mock_unit_operation_failed(state: &Arc<MockIntegratorState>, proto
 }
 
 async fn send_mock_unit_evm_withdrawal_release(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     release: &MockUnitEvmWithdrawalRelease,
 ) -> Result<String, String> {
     tracing::info!(
@@ -1084,7 +1103,7 @@ async fn send_mock_unit_evm_withdrawal_release(
         "submitting mock Unit EVM withdrawal release"
     );
     let Some(rpc_url) = state
-        .unit.evm_rpc_urls
+        .evm_rpc_urls
         .get(release.dst_chain.as_wire_str())
         .cloned()
     else {
@@ -1121,7 +1140,7 @@ async fn send_mock_unit_evm_withdrawal_release(
         .get_chain_id()
         .await
         .map_err(|err| format!("mock Unit withdrawal release get_chain_id failed: {err}"))?;
-    let handle = state.mock_service_paymaster(MockService::Hyperunit, chain_id)?;
+    let handle = state.shared.mock_service_paymaster(MockService::Hyperunit, chain_id)?;
     let execution = Execution {
         target: destination,
         value: amount,
@@ -1134,7 +1153,7 @@ async fn send_mock_unit_evm_withdrawal_release(
         "calling paymaster.submit"
     );
     let submit_result = tokio::time::timeout(
-        state.unit.withdrawal_release_timeout,
+        state.withdrawal_release_timeout,
         handle.submit(execution),
     )
     .await;
@@ -1161,12 +1180,12 @@ async fn send_mock_unit_evm_withdrawal_release(
             tracing::info!(
                 target: "mock_hu",
                 protocol_address = %release.protocol_address,
-                timeout = %format_duration_for_log(state.unit.withdrawal_release_timeout),
+                timeout = %format_duration_for_log(state.withdrawal_release_timeout),
                 "paymaster.submit returned: err"
             );
             return Err(format!(
                 "mock Unit withdrawal release paymaster.submit timed out after {}",
-                format_duration_for_log(state.unit.withdrawal_release_timeout)
+                format_duration_for_log(state.withdrawal_release_timeout)
             ));
         }
     };
@@ -1183,7 +1202,7 @@ async fn send_mock_unit_evm_withdrawal_release(
 }
 
 async fn send_mock_unit_bitcoin_withdrawal_release(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     release: &MockUnitBitcoinWithdrawalRelease,
 ) -> Result<String, String> {
     tracing::info!(
@@ -1194,8 +1213,8 @@ async fn send_mock_unit_bitcoin_withdrawal_release(
         "submitting mock Unit Bitcoin withdrawal release"
     );
     let (Some(rpc_url), Some(cookie_path)) = (
-        state.unit.bitcoin_rpc_url.clone(),
-        state.unit.bitcoin_cookie_path.clone(),
+        state.bitcoin_rpc_url.clone(),
+        state.bitcoin_cookie_path.clone(),
     ) else {
         return Err(
             "mock Unit Bitcoin withdrawal release has no Bitcoin RPC configuration".to_string(),
@@ -1557,11 +1576,11 @@ fn hyperliquid_coin_for_unit_asset(asset: UnitAsset) -> &'static str {
 /// in place so tests can still observe its final state via
 /// `/operations/{protocol_address}`.
 pub(crate) async fn fail_mock_unit_operation(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<UnitMockState>,
     protocol_address: &str,
     error: String,
 ) -> Result<(), String> {
-    let mut operations = state.unit.operations.lock().await;
+    let mut operations = state.operations.lock().await;
     let entries = operations
         .get_mut(protocol_address)
         .ok_or_else(|| format!("mock unit operation {protocol_address} was not found"))?;
@@ -1664,7 +1683,9 @@ fn fresh_mock_regtest_bitcoin_wallet() -> MockUnitProtocolWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_integrators::{MockIntegratorConfig, MockIntegratorServer, MockServicePaymaster};
+    use crate::mock_integrators::{
+        MockIntegratorConfig, MockIntegratorServer, MockIntegratorState, MockServicePaymaster,
+    };
     use alloy::primitives::B256;
 
     #[test]
@@ -1785,7 +1806,7 @@ mod tests {
             .await
             .expect("first gen json");
         complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &first.address,
             Some(UnitOperationObservation {
                 source_amount: "1000000000000000000".to_string(),
@@ -1829,7 +1850,7 @@ mod tests {
         assert_eq!(by_protocol_before.operations.len(), 1);
 
         complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &second.address,
             Some(UnitOperationObservation {
                 source_amount: "2000000000000000000".to_string(),
@@ -1922,7 +1943,7 @@ mod tests {
         .expect("gen json");
 
         complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &generated.address,
             Some(UnitOperationObservation {
                 source_amount: "69613175000000000".to_string(),
@@ -1973,7 +1994,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &generated.address,
             Some(UnitOperationObservation {
                 source_amount: "1250000000000000000".to_string(),
@@ -2046,7 +2067,7 @@ mod tests {
         .expect("gen json");
 
         let error = complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &generated.address,
             Some(UnitOperationObservation {
                 source_amount: "1250000000000000000".to_string(),
@@ -2114,7 +2135,7 @@ mod tests {
 
         let started_at = std::time::Instant::now();
         let error = complete_mock_unit_operation_with_observation(
-            &server.state,
+            &server.state.unit,
             &generated.address,
             Some(UnitOperationObservation {
                 source_amount: "1250000000000000000".to_string(),
@@ -2193,8 +2214,13 @@ mod tests {
             min_amount_raw: Some(U256::from(50_000)),
         }];
 
-        process_unit_bitcoin_transaction_outputs(&state, &watches, "1234", vec![(2usize, tx_out)])
-            .await;
+        process_unit_bitcoin_transaction_outputs(
+            &state.unit,
+            &watches,
+            "1234",
+            vec![(2usize, tx_out)],
+        )
+        .await;
 
         let operations = state.unit.operations.lock().await;
         let entry = operations

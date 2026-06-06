@@ -1,10 +1,6 @@
-use axum::{
-    extract::Path,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::Path, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde_json::json;
+use std::sync::Arc;
 
 use crate::mock_integrators::error_response;
 
@@ -14,6 +10,15 @@ use crate::mock_integrators::error_response;
 /// for future Coinbase tunables.
 #[derive(Default)]
 pub(crate) struct CoinbaseMockState;
+
+/// Builds the Coinbase mock router. Mounted under `/coinbase`; receives its own
+/// [`CoinbaseMockState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<CoinbaseMockState>> {
+    Router::new().route(
+        "/v2/prices/:currency_pair/spot",
+        get(mock_coinbase_spot_price),
+    )
+}
 
 pub(crate) async fn mock_coinbase_spot_price(
     Path(currency_pair): Path<String>,

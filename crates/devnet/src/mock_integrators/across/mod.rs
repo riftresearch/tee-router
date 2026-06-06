@@ -9,7 +9,8 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    Json,
+    routing::get,
+    Json, Router,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ use crate::mock_integrators::across::contract::MockSpokePool::{depositCall, Fund
 use crate::mock_integrators::{
     address_to_bytes32, bytes32_to_evm_address, deterministic_bps, mock_credit_native_on_anvil,
     mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, parse_amount, AcrossDepositKey,
-    MockIntegratorConfig, MockIntegratorState, MockService, IERC20,
+    MockIntegratorConfig, MockService, IERC20,
 };
 
 #[derive(Debug, Clone)]
@@ -80,6 +81,53 @@ pub(crate) struct AcrossMockState {
     pub(crate) status_latency: Duration,
     pub(crate) refund_probability_bps: u16,
     pub(crate) next_swap_approval_error: Mutex<Option<String>>,
+    /// Cross-cutting infra the destination-credit path needs: the mock-service
+    /// paymasters/RPC URLs used to mint/transfer the bridged output on the
+    /// destination Anvil. The same `Arc` instance is shared with
+    /// [`crate::mock_integrators::MockIntegratorState`] so every venue and the
+    /// coordinator observe one ledger/paymaster set.
+    pub(crate) shared: Arc<crate::mock_integrators::SharedMockState>,
+}
+
+impl AcrossMockState {
+    pub(crate) fn across_chain_config(
+        &self,
+        origin_chain_id: u64,
+    ) -> Option<ResolvedMockAcrossChainConfig> {
+        self.chains
+            .get(&origin_chain_id)
+            .map(|config| ResolvedMockAcrossChainConfig {
+                spoke_pool_address: config.spoke_pool_address.clone(),
+                evm_rpc_url: Some(config.evm_rpc_url.clone()),
+            })
+            .or_else(|| {
+                Some(ResolvedMockAcrossChainConfig {
+                    spoke_pool_address: self.spoke_pool_address.clone()?,
+                    evm_rpc_url: self.evm_rpc_url.clone(),
+                })
+            })
+    }
+
+    pub(crate) fn across_chain_rpc_url(&self, chain_id: u64) -> Option<String> {
+        self.chains
+            .get(&chain_id)
+            .map(|config| config.evm_rpc_url.clone())
+            .or_else(|| {
+                if self.chains.is_empty() {
+                    self.evm_rpc_url.clone()
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// Builds the Across mock router. Mounted under `/across`; receives its own
+/// [`AcrossMockState`] substate at nest time.
+pub(crate) fn router() -> Router<Arc<AcrossMockState>> {
+    Router::new()
+        .route("/swap/approval", get(mock_across_real_swap_approval))
+        .route("/deposit/status", get(mock_across_deposit_status))
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,7 +202,7 @@ struct MockAcrossRealSwapApprovalResponse {
 }
 
 pub(crate) async fn mock_across_real_swap_approval(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<AcrossMockState>>,
     headers: HeaderMap,
     Query(query): Query<MockAcrossRealSwapApprovalQuery>,
 ) -> impl IntoResponse {
@@ -163,7 +211,7 @@ pub(crate) async fn mock_across_real_swap_approval(
     {
         return *response;
     }
-    if let Some(error) = state.across.next_swap_approval_error.lock().await.take() {
+    if let Some(error) = state.next_swap_approval_error.lock().await.take() {
         return mock_across_error_response(
             StatusCode::BAD_GATEWAY,
             "bad_gateway",
@@ -780,7 +828,7 @@ struct MockAcrossQuoteAmounts {
 }
 
 fn mock_across_quote_amounts(
-    state: &MockIntegratorState,
+    state: &AcrossMockState,
     query: &MockAcrossRealSwapApprovalQuery,
     amount: u128,
 ) -> Result<MockAcrossQuoteAmounts, String> {
@@ -811,11 +859,8 @@ fn mock_across_quote_amounts(
     Ok(amounts)
 }
 
-fn mock_across_quote_fee_bps(
-    state: &MockIntegratorState,
-    query: &MockAcrossRealSwapApprovalQuery,
-) -> u16 {
-    let base = state.across.quote_fee_bps;
+fn mock_across_quote_fee_bps(state: &AcrossMockState, query: &MockAcrossRealSwapApprovalQuery) -> u16 {
+    let base = state.quote_fee_bps;
     let jitter = deterministic_bps(
         &format!(
             "across-quote:{}:{}:{}:{}:{}:{}",
@@ -826,7 +871,7 @@ fn mock_across_quote_fee_bps(
             query.output_token,
             query.amount
         ),
-        state.across.quote_jitter_bps,
+        state.quote_jitter_bps,
     );
     base.saturating_add(jitter).min(9_999)
 }
@@ -852,17 +897,14 @@ fn gross_up_mock_across_input(amount: u128, fee_bps: u16) -> Result<u128, String
         .ok_or_else(|| "mock Across exact-output quote amount overflow".to_string())
 }
 
-fn mock_across_should_refund(
-    state: &MockIntegratorState,
-    record: &MockAcrossDepositRecord,
-) -> bool {
+fn mock_across_should_refund(state: &AcrossMockState, record: &MockAcrossDepositRecord) -> bool {
     deterministic_bps(
         &format!(
             "across-status:{}:{}:{}",
             record.origin_chain_id, record.deposit_id, record.deposit_tx_hash
         ),
         9_999,
-    ) < state.across.refund_probability_bps
+    ) < state.refund_probability_bps
 }
 
 fn mock_across_destination_chain_id(destination_chain_id: U256) -> Result<u64, String> {
@@ -906,7 +948,7 @@ struct MockAcrossDepositStatusResponse {
 }
 
 pub(crate) async fn mock_across_deposit_status(
-    State(state): State<Arc<MockIntegratorState>>,
+    State(state): State<Arc<AcrossMockState>>,
     headers: HeaderMap,
     Query(query): Query<MockAcrossDepositStatusQuery>,
 ) -> impl IntoResponse {
@@ -914,7 +956,7 @@ pub(crate) async fn mock_across_deposit_status(
         return *response;
     }
     let record = {
-        let deposits = state.across.deposits.lock().await;
+        let deposits = state.deposits.lock().await;
         if let (Some(origin_chain_id), Some(deposit_id)) =
             (query.origin_chain_id, query.deposit_id.as_deref())
         {
@@ -976,7 +1018,7 @@ pub(crate) async fn mock_across_deposit_status(
         .signed_duration_since(record.indexed_at)
         .to_std()
         .unwrap_or_default()
-        < state.across.status_latency
+        < state.status_latency
     {
         return Json(MockAcrossDepositStatusResponse {
             status: "pending".to_string(),
@@ -1030,14 +1072,14 @@ pub(crate) async fn mock_across_deposit_status(
 }
 
 async fn ensure_mock_across_destination_credit(
-    state: &Arc<MockIntegratorState>,
+    state: &Arc<AcrossMockState>,
     key: AcrossDepositKey,
     record: &MockAcrossDepositRecord,
 ) -> Result<String, String> {
     const PENDING_CREDIT: &str = "__pending__";
 
     {
-        let mut credits = state.across.destination_credit_tx_hashes.lock().await;
+        let mut credits = state.destination_credit_tx_hashes.lock().await;
         match credits.get(&key).map(String::as_str) {
             Some(PENDING_CREDIT) => {
                 return Err("destination credit is still being applied".to_string());
@@ -1050,7 +1092,7 @@ async fn ensure_mock_across_destination_credit(
     }
 
     let credit_result = mock_across_credit_destination(state, record).await;
-    let mut credits = state.across.destination_credit_tx_hashes.lock().await;
+    let mut credits = state.destination_credit_tx_hashes.lock().await;
     match credit_result {
         Ok(tx_hash) => {
             credits.insert(key, tx_hash.clone());
@@ -1064,7 +1106,7 @@ async fn ensure_mock_across_destination_credit(
 }
 
 async fn mock_across_credit_destination(
-    state: &MockIntegratorState,
+    state: &AcrossMockState,
     record: &MockAcrossDepositRecord,
 ) -> Result<String, String> {
     if record.output_amount.is_zero() {
@@ -1080,7 +1122,7 @@ async fn mock_across_credit_destination(
     let output_token = bytes32_to_evm_address(record.output_token);
     if output_token == Address::ZERO {
         mock_credit_native_on_anvil(
-            state,
+            &state.shared,
             destination_chain_id,
             MockService::Across,
             recipient,
@@ -1090,7 +1132,7 @@ async fn mock_across_credit_destination(
         return Ok(mock_across_pending_fill_tx_ref(record));
     }
     mock_mint_erc20_on_anvil(
-        state,
+        &state.shared,
         destination_chain_id,
         MockService::Across,
         output_token,
@@ -1117,7 +1159,7 @@ fn mock_across_pagination() -> Value {
 
 pub(crate) async fn maybe_spawn_across_deposit_indexer(
     config: &MockIntegratorConfig,
-    state: Arc<MockIntegratorState>,
+    state: Arc<AcrossMockState>,
 ) -> eyre::Result<(Vec<tokio::sync::oneshot::Sender<()>>, Vec<JoinHandle<()>>)> {
     let mut chain_configs = config.across_chains.values().cloned().collect::<Vec<_>>();
     if let (Some(spoke_pool_address), Some(evm_rpc_url)) = (
@@ -1171,7 +1213,7 @@ async fn run_across_deposit_indexer(
     provider: DynProvider,
     spoke_pool_address: Address,
     chain_id: u64,
-    state: Arc<MockIntegratorState>,
+    state: Arc<AcrossMockState>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let signature: B256 = FundsDeposited::SIGNATURE_HASH;
@@ -1237,7 +1279,7 @@ async fn run_across_deposit_indexer(
                 indexed_at: Utc::now(),
             };
             let key = (chain_id, record.deposit_id.to_string());
-            state.across.deposits.lock().await.insert(key, record);
+            state.deposits.lock().await.insert(key, record);
         }
         last_scanned = head;
     }
@@ -1256,12 +1298,12 @@ struct MockAcrossErrorResponse {
 }
 
 fn validate_across_request(
-    state: &MockIntegratorState,
+    state: &AcrossMockState,
     headers: &HeaderMap,
     integrator_id: Option<&str>,
     require_integrator_id: bool,
 ) -> Result<(), Box<axum::response::Response>> {
-    if let Some(expected_api_key) = state.across.api_key.as_deref() {
+    if let Some(expected_api_key) = state.api_key.as_deref() {
         let expected = format!("Bearer {expected_api_key}");
         let actual = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -1278,7 +1320,7 @@ fn validate_across_request(
     }
 
     if require_integrator_id {
-        if let Some(expected_integrator_id) = state.across.integrator_id.as_deref() {
+        if let Some(expected_integrator_id) = state.integrator_id.as_deref() {
             if integrator_id != Some(expected_integrator_id) {
                 return Err(Box::new(mock_across_error_response(
                     StatusCode::UNPROCESSABLE_ENTITY,
