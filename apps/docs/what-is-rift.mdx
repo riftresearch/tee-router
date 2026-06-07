@@ -2,16 +2,20 @@
 title: "What is Rift?"
 ---
 
-Rift is a multichain execution environment that lets you plug into liquidity on any chain.
+Rift is a zero-fee router for DeFi. We let you do any action in DeFi, in one click. We currently support market orders and vault deposits from any asset / chain. Our team is actively adding new flows.
 
 Unlike other protocols that are secured by multisigs or staking, Rift uses hardware (cloud based TEEs) to automatically move funds between chains based on pre defined rules.
 
-This unlocks previously impossible DeFi use cases, such as:
+What makes Rift unique?
 
-- Trade 100m+ for majors like BTC, ETH, USDC, USDT, HYPE. Non custodial, 0 fees.
-- Earn yield from anywhere. Deposit 100m+ into bluechip vaults from anywhere.
-- Advanced multichain orders. Limit orders, DCA, Stop loss/entry.
-- Borrow any asset. Start with collateral on any chain.
+- **Enforceably best rate:**
+No fees. We aggregate all the routes, and don't pass on any fees. We only make money by saving you money.
+
+- **Deepest liquidity:**
+We aggregate routes nobody else can (because of our multichain smart contracts), so you can trade 100m+ for majors like BTC, ETH, USDC, USDT
+
+- **"One click" UX:**
+Any operation is just a transfer of a native asset to a Rift contract address. Rift handles the rest and the destination asset magically appears in your wallet.
 
 Rift's [protocol code](https://github.com/riftresearch/tee-router) is 100% open source for anyone to verify, audit, or contribute to.
 
@@ -31,6 +35,11 @@ Rift's [protocol code](https://github.com/riftresearch/tee-router) is 100% open 
 | Rift | OTC |
 | Hyperliquid | Orderbook |
 | Across | Intent + solver |
+| Relay | Intent + solver |
+| Near | Intent + solver |
+| Mayan | Intent + solver |
+| Garden | Intent + solver |
 | CCTP | Mint + burn |
 | Velora | AMM |
+| Chainflip | JIT AMM |
 | Unit | Lock + mint |
