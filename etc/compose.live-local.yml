@@ -178,7 +178,6 @@ services:
       TOKEN_INDEXER_API_KEY: ${TOKEN_INDEXER_API_KEY:?TOKEN_INDEXER_API_KEY is required}
       HL_SHIM_INDEXER_URL: http://hl-shim-indexer:8080
       HYPERUNIT_API_URL: ${HYPERUNIT_API_URL:?HYPERUNIT_API_URL is required}
-      HYPERUNIT_PROXY_URL: ${HYPERUNIT_PROXY_URL:?HYPERUNIT_PROXY_URL is required}
 
   hl-shim-indexer:
     <<: *live-host-gateway

@@ -534,8 +534,9 @@ if ! svc_exists hyperunit-socks5-proxy-v3; then
   remember_svc hyperunit-socks5-proxy-v3
 fi
 # PROXY_USER/PROXY_PASSWORD from railway/env/hyperunit-socks5-proxy.env;
-# REQUIRE_AUTH enforces username/password as the access boundary. Phala and
-# sauron-worker-v3 consume this service as HYPERUNIT_PROXY_URL.
+# REQUIRE_AUTH enforces username/password as the access boundary. Phala router
+# services consume this service as HYPERUNIT_PROXY_URL; Sauron calls HyperUnit
+# status endpoints directly.
 set_var hyperunit-socks5-proxy-v3 "REQUIRE_AUTH=true"
 set_var hyperunit-socks5-proxy-v3 "PROXY_PORT=1080"
 # Pin to Railway Europe (Netherlands / EU-West).  VERIFY: region id current.
@@ -635,7 +636,6 @@ set_shared_ref sauron-worker-v3 ROUTER_CDC_PUBLICATION_NAME ROUTER_CDC_PUBLICATI
 set_shared_ref sauron-worker-v3 ROUTER_CDC_MESSAGE_PREFIX ROUTER_CDC_MESSAGE_PREFIX
 set_shared_ref sauron-worker-v3 ROUTER_INTERNAL_BASE_URL ROUTER_INTERNAL_BASE_URL
 set_shared_ref sauron-worker-v3 HYPERUNIT_API_URL HYPERUNIT_API_URL
-set_var sauron-worker-v3      "HYPERUNIT_PROXY_URL=socks5://\${{hyperunit-socks5-proxy-v3.PROXY_USER}}:\${{hyperunit-socks5-proxy-v3.PROXY_PASSWORD}}@\${{hyperunit-socks5-proxy-v3.RAILWAY_PRIVATE_DOMAIN}}:1080"
 set_var hl-shim-indexer-v3    "HL_SHIM_DATABASE_URL=\${{hl-shim-db-v3.DATABASE_URL}}"
 set_var router-gateway-v3     "ROUTER_GATEWAY_DATABASE_URL=\${{router-gateway-db-v3.DATABASE_URL}}"
 set_var router-gateway-v3     "REDIS_URL=redis://\${{redis-v3.RAILWAY_PRIVATE_DOMAIN}}:6379"

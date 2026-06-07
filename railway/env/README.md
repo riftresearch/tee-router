@@ -47,8 +47,8 @@ reference vars it wires automatically.
 `ROUTER_GATEWAY_DATABASE_URL`, token-indexer `DATABASE_URL`,
 `ADMIN_DASHBOARD_{AUTH,ANALYTICS}_DATABASE_URL`,
 `router-physical-standby-v3.DATABASE_URL`,
-`(ADMIN_DASHBOARD_)?ROUTER_REPLICA_DATABASE_URL`, `HYPERUNIT_PROXY_URL`, and
-every inter-service `*_INDEXER_URL` / `*_RECEIPT_WATCHER_URL` /
+`(ADMIN_DASHBOARD_)?ROUTER_REPLICA_DATABASE_URL`, and every inter-service
+`*_INDEXER_URL` / `*_RECEIPT_WATCHER_URL` /
 `HL_SHIM_INDEXER_URL`.
 
 ## Per-service files

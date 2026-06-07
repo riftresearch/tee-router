@@ -752,8 +752,9 @@ HyperUnit; it must point at `hyperunit-socks5-proxy-v3`, not
 proxy URLs must include host and port and must not include path, query, or
 fragment components.
 
-Sauron still has its own HyperUnit client path; set `HYPERUNIT_PROXY_URL` for
-`sauron-worker-v3` to `hyperunit-socks5-proxy-v3`.
+Sauron's HyperUnit observer only calls read/status endpoints (`/operations/{address}`)
+and does not require `HYPERUNIT_PROXY_URL`; `sauron-worker-v3` should use
+`HYPERUNIT_API_URL=https://api.hyperunit.xyz` directly.
 
 ## Bitcoin RPC/ZMQ Transport
 
@@ -1206,7 +1207,7 @@ Still to do:
       `UPSTREAM_PROXY_URL` from its public TCP proxy.
 - [ ] Set `hyperunit-socks5-proxy-v3` `PROXY_USER`/`PROXY_PASSWORD`
       (railway/env), confirm Europe region pin + auth-only access boundary,
-      and wire Phala/Sauron `HYPERUNIT_PROXY_URL` from this dedicated service.
+      and wire Phala router `HYPERUNIT_PROXY_URL` from this dedicated service.
 - [ ] Deploy `sauron-bitcoin-rathole-broker-v3`; set its 4 `RATHOLE_*`
       tokens (railway/env) and run the matching rathole client on the
       isolated Bitcoin host with identical tokens.

@@ -140,7 +140,7 @@ pub struct SauronArgs {
     #[arg(long, env = "HYPERUNIT_API_URL")]
     pub hyperunit_api_url: Option<String>,
 
-    /// Optional HyperUnit SOCKS5 proxy URL
+    /// Optional HyperUnit SOCKS5 proxy URL override for status polling.
     #[arg(long, env = "HYPERUNIT_PROXY_URL")]
     pub hyperunit_proxy_url: Option<String>,
 
