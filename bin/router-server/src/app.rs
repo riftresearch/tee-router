@@ -1012,7 +1012,7 @@ mod tests {
             worker_id: None,
             worker_refund_poll_seconds: 60,
             worker_order_execution_poll_seconds: 5,
-            worker_route_cost_refresh_seconds: 300,
+            worker_route_cost_refresh_seconds: 1800,
             worker_provider_health_poll_seconds: 120,
             provider_health_timeout_seconds: 10,
             worker_order_maintenance_pass_limit: 100,

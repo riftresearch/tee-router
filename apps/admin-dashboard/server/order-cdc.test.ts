@@ -1877,6 +1877,8 @@ const testConfig: AdminDashboardConfig = {
   cdcMessagePrefix: 'rift.router.change',
   allowInsecureDevAuthBypass: false,
   serveStatic: false,
+  routeCostWindowSeconds: 1800,
+  routerInternalBaseUrl: 'http://router-api:4522',
   version: 'test',
   missingAuthConfig: [],
   supabaseChatsUrl:

@@ -72,3 +72,6 @@ rift-api/
 .worktrees/
 incoming
 artifacts/
+
+# Local-only audit notes
+t-audit.md

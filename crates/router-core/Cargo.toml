@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 bitcoin = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 chrono = { workspace = true }
+futures-util = "0.3"
 getrandom = { workspace = true }
 metrics = { workspace = true }
 reqwest = { workspace = true, features = ["socks"] }

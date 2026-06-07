@@ -17,6 +17,7 @@ export type AdminDashboardConfig = {
   analyticsDatabaseUrl?: string
   routerInternalBaseUrl?: string
   routerAdminApiKey?: string
+  routerInternalBaseUrl: string
   googleClientId?: string
   googleClientSecret?: string
   betterAuthSecret: string
@@ -27,6 +28,7 @@ export type AdminDashboardConfig = {
   cdcMessagePrefix: string
   allowInsecureDevAuthBypass: boolean
   serveStatic: boolean
+  routeCostWindowSeconds: number
   version: string
   missingAuthConfig: string[]
   supabaseChatsUrl: string
@@ -41,6 +43,7 @@ const DEFAULT_DEV_API_HOST = '127.0.0.1'
 const DEFAULT_PRODUCTION_API_HOST = '0.0.0.0'
 const DEFAULT_WEB_ORIGIN = 'http://localhost:5173'
 const DEFAULT_ORDER_LIMIT = 100
+const DEFAULT_ROUTE_COST_WINDOW_SECONDS = 1800
 const DEFAULT_CDC_SLOT_NAME = 'admin_dashboard_orders_cdc'
 const DEFAULT_CDC_PUBLICATION_NAME = 'router_cdc_publication'
 const DEFAULT_CDC_MESSAGE_PREFIX = 'rift.router.change'
@@ -49,6 +52,7 @@ const MIN_PRODUCTION_AUTH_SECRET_LENGTH = 32
 const MIN_ROUTER_ADMIN_API_KEY_LENGTH = 32
 const DEFAULT_SUPABASE_CHATS_URL =
   'https://ookzpviwfhzfarouusah.supabase.co/functions/v1/chats'
+const DEFAULT_ROUTER_INTERNAL_BASE_URL = 'http://router-api:4522'
 const MAX_POSTGRES_IDENTIFIER_BYTES = 63
 const POSTGRES_IDENTIFIER_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 const POSITIVE_DECIMAL_INTEGER_PATTERN = /^[1-9][0-9]{0,14}$/
@@ -130,6 +134,10 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
       env.ROUTER_ADMIN_API_KEY,
       MIN_ROUTER_ADMIN_API_KEY_LENGTH
     ),
+    routerInternalBaseUrl: normalizeRouterInternalBaseUrl(
+      normalizeOptionalSecret(env.ROUTER_INTERNAL_BASE_URL) ??
+        DEFAULT_ROUTER_INTERNAL_BASE_URL
+    ),
     googleClientId,
     googleClientSecret,
     betterAuthSecret,
@@ -155,6 +163,11 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
       'ADMIN_DASHBOARD_ALLOW_INSECURE_DEV_AUTH_BYPASS'
     ),
     serveStatic: env.ADMIN_DASHBOARD_SERVE_STATIC !== 'false',
+    routeCostWindowSeconds: parsePositiveInteger(
+      env.ROUTE_COST_WINDOW_SECONDS,
+      DEFAULT_ROUTE_COST_WINDOW_SECONDS,
+      'ROUTE_COST_WINDOW_SECONDS'
+    ),
     version: env.npm_package_version ?? '0.1.0',
     missingAuthConfig,
     supabaseChatsUrl: normalizeSupabaseChatsUrl(
@@ -164,6 +177,26 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     supabaseChatAdminSecret: normalizeOptionalSecret(
       env.SUPABASE_CHAT_ADMIN_SECRET
     )
+  }
+}
+
+function normalizeRouterInternalBaseUrl(value: string): string {
+  const trimmed = value.trim().replace(/\/+$/, '')
+  try {
+    const parsed = new URL(trimmed)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('expected http or https')
+    }
+    if (parsed.username || parsed.password) {
+      throw new Error('URL credentials are not allowed')
+    }
+    if (parsed.search || parsed.hash) {
+      throw new Error('query strings and fragments are not allowed')
+    }
+    return parsed.toString().replace(/\/+$/, '')
+  } catch (error) {
+    const reason = error instanceof Error ? `: ${error.message}` : ''
+    throw new Error(`Invalid ROUTER_INTERNAL_BASE_URL${reason}`)
   }
 }
 

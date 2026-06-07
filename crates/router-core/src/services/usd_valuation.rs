@@ -1022,6 +1022,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn usd_valuation_prices_wrapped_bitcoin_with_btc_reference_price() {
         let pricing = PricingSnapshot {
             source: "test_live_pricing".to_string(),
@@ -1048,6 +1049,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> 92d1922 (graph quoting system overhaul)
     fn usd_valuation_omits_amounts_that_overflow_value_math() {
         let pricing = PricingSnapshot {
             source: "test_live_pricing".to_string(),

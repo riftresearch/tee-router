@@ -1035,8 +1035,13 @@ fn test_router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
+<<<<<<< HEAD
         coinbase_price_api_base_url: Some("http://127.0.0.1:9".to_string()),
         coinbase_proxy_url: None,
+=======
+        coinbase_price_api_base_url: "http://127.0.0.1:9".to_string(),
+        cctp_transfer_mode: None,
+>>>>>>> 92d1922 (graph quoting system overhaul)
     }
 }
 
@@ -4554,30 +4559,16 @@ async fn route_cost_refresh_persists_anchor_snapshots() {
         .list_active("usd_1000", Utc::now())
         .await
         .unwrap();
-    let base_usdt = DepositAsset {
-        chain: ChainId::parse("evm:8453").unwrap(),
-        asset: AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
-    };
-    let arbitrum_cbbtc = DepositAsset {
-        chain: ChainId::parse("evm:42161").unwrap(),
-        asset: AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-    };
 
+    // With no providers wired and structural seeds removed, the refresher has
+    // a non-empty curated candidate set but cannot live-sample any of it, so
+    // it writes no rows: every cell is legitimately absent rather than seeded.
     assert!(summary.candidate_edges > 0);
     assert_eq!(summary.provider_quotes_attempted, 0);
     assert_eq!(summary.provider_quotes_succeeded, 0);
     assert_eq!(summary.provider_quotes_failed, 0);
-    assert_eq!(snapshots.len(), summary.snapshots_upserted);
-    assert!(snapshots
-        .iter()
-        .any(|snapshot| snapshot.source_asset == base_usdt
-            || snapshot.destination_asset == base_usdt));
-    assert!(snapshots.iter().any(|snapshot| {
-        snapshot.source_asset == arbitrum_cbbtc || snapshot.destination_asset == arbitrum_cbbtc
-    }));
-    assert!(snapshots
-        .iter()
-        .all(|snapshot| snapshot.effective_cost_bps() < u64::MAX));
+    assert_eq!(summary.snapshots_upserted, 0);
+    assert!(snapshots.is_empty());
 }
 
 fn fresh_test_pricing() -> PricingSnapshot {

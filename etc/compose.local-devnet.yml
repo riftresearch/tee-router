@@ -60,6 +60,12 @@ services:
       - postgres://postgres:postgres@token-indexer-db:5432/token_indexer
     environment:
       EVM_TOKEN_INDEXER_API_KEY: local-token-indexer-api-key-000000000
+      # Realistic mock provider fees so the route-cost dashboard shows non-zero,
+      # tier-varying bps instead of 1:1 quotes. Tweak and `just devnet up -d
+      # devnet` to apply without recompiling. 0 = 1:1 (the test default).
+      MOCK_ACROSS_QUOTE_FEE_BPS: "8"
+      MOCK_ACROSS_QUOTE_JITTER_BPS: "6"
+      MOCK_VELORA_QUOTE_FEE_BPS: "4"
     depends_on:
       token-indexer-db:
         condition: service_healthy
@@ -112,6 +118,9 @@ services:
       CCTP_API_URL: http://devnet:50107
       CCTP_TOKEN_MESSENGER_V2_ADDRESS: "0xcccccccccccccccccccccccccccccccccccc0001"
       CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS: "0xcccccccccccccccccccccccccccccccccccc0002"
+      # Fast-transfer mode so curated CCTP routes quote a realistic ~1.3 bps
+      # fee instead of standard mode's free (0 bps) lane.
+      CCTP_TRANSFER_MODE: fast
       HYPERUNIT_API_URL: http://devnet:50107
       HYPERLIQUID_API_URL: http://devnet:50107
       HYPERLIQUID_NETWORK: testnet

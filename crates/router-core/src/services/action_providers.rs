@@ -395,12 +395,37 @@ pub trait BridgeProvider: Send + Sync {
     }
 }
 
+/// Which side of a Unit transfer a fee estimate is for. Deposits move an
+/// external-chain asset into Hyperliquid; withdrawals move it back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitFeeDirection {
+    Deposit,
+    Withdrawal,
+}
+
 pub trait UnitProvider: Send + Sync {
     fn id(&self) -> &str;
 
     fn supports_deposit(&self, asset: &DepositAsset) -> bool;
 
     fn supports_withdrawal(&self, asset: &DepositAsset) -> bool;
+
+    /// Absolute Unit protocol fee for a single deposit/withdrawal of
+    /// `external_asset`, expressed in that asset's native base units (sats
+    /// for BTC, wei for ETH). Unit charges only network costs, so this is the
+    /// source/destination/sweep transaction cost Unit currently estimates.
+    ///
+    /// Returns `Ok(None)` when the provider cannot estimate a fee for the
+    /// asset (the default for mock providers); the route-cost refresher then
+    /// writes no cache row rather than fabricating one.
+    fn estimate_unit_fee<'a>(
+        &'a self,
+        external_asset: &'a DepositAsset,
+        direction: UnitFeeDirection,
+    ) -> ProviderFuture<'a, Option<U256>> {
+        let _ = (external_asset, direction);
+        Box::pin(async { Ok(None) })
+    }
 
     fn execute_deposit<'a>(
         &'a self,
@@ -1738,6 +1763,51 @@ impl HyperUnitProvider {
     }
 }
 
+/// Map a router chain to the top-level key Hyperunit's `/v2/estimate-fees`
+/// response uses for its native-asset fee schedule. Only the curated Unit
+/// external chains (Ethereum mainnet ETH, Bitcoin) are mapped today.
+fn hyperunit_fee_network_key(chain: &ChainId) -> Option<&'static str> {
+    match chain.as_str() {
+        "evm:1" => Some("ethereum"),
+        "bitcoin" => Some("bitcoin"),
+        _ => None,
+    }
+}
+
+/// Extract the native-unit fee for `network`/`direction` from a Hyperunit
+/// `/v2/estimate-fees` response. The schema has drifted across doc versions
+/// (`depositFee` vs `bitcoin-depositFee`), so we probe both the bare and the
+/// network-prefixed field names. Values are native base units (sats / wei)
+/// and may be encoded as integers or floats; both are accepted.
+pub(crate) fn hyperunit_native_fee(
+    schedule: &Value,
+    network: &str,
+    direction: UnitFeeDirection,
+) -> Option<U256> {
+    let entry = schedule.get(network)?;
+    let bare = match direction {
+        UnitFeeDirection::Deposit => "depositFee",
+        UnitFeeDirection::Withdrawal => "withdrawalFee",
+    };
+    let prefixed = format!("{network}-{bare}");
+    let value = entry.get(bare).or_else(|| entry.get(prefixed.as_str()))?;
+    json_number_to_u256(value)
+}
+
+/// Convert a JSON number (integer or float, e.g. `715` or `3.37e+18`) into a
+/// `U256`, truncating any fractional part. Returns `None` for negatives,
+/// non-finite floats, or non-numeric values.
+fn json_number_to_u256(value: &Value) -> Option<U256> {
+    if let Some(integer) = value.as_u64() {
+        return Some(U256::from(integer));
+    }
+    let float = value.as_f64()?;
+    if !float.is_finite() || float < 0.0 {
+        return None;
+    }
+    U256::from_str_radix(&format!("{:.0}", float.trunc()), 10).ok()
+}
+
 impl UnitProvider for HyperUnitProvider {
     fn id(&self) -> &str {
         "unit"
@@ -1757,6 +1827,24 @@ impl UnitProvider for HyperUnitProvider {
             asset,
             ProviderAssetCapability::UnitWithdrawal,
         )
+    }
+
+    fn estimate_unit_fee<'a>(
+        &'a self,
+        external_asset: &'a DepositAsset,
+        direction: UnitFeeDirection,
+    ) -> ProviderFuture<'a, Option<U256>> {
+        Box::pin(async move {
+            let Some(network) = hyperunit_fee_network_key(&external_asset.chain) else {
+                return Ok(None);
+            };
+            let schedule = self
+                .client
+                .estimate_fees()
+                .await
+                .map_err(|err| format!("hyperunit estimate-fees failed: {err}"))?;
+            Ok(hyperunit_native_fee(&schedule, network, direction))
+        })
     }
 
     fn execute_deposit<'a>(

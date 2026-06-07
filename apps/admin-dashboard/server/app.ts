@@ -42,6 +42,13 @@ import {
   type OrderTypeFilter
 } from './orders'
 import { fetchSwapTimeAverages } from './swap-times'
+import { fetchRouteCostSnapshots } from './route-costs'
+import { fetchRouteCostSampleEvents } from './route-cost-events'
+import {
+  explainRoute,
+  fetchRouteGraph,
+  RouteGraphProxyError
+} from './route-graph'
 
 type AppBindings = {
   Variables: {
@@ -413,6 +420,74 @@ export function createApp(
     const order = await fetchOrderById(replicaRuntime.pool, id)
     if (!order) return c.json({ error: 'order_not_found' }, 404)
     return c.json({ order })
+  })
+
+  app.get('/api/route-costs', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    if (!replicaRuntime) {
+      return c.json({ error: 'replica_database_not_configured' }, 503)
+    }
+
+    const snapshots = await fetchRouteCostSnapshots(replicaRuntime.pool)
+    return c.json({
+      snapshots,
+      fetchedAt: new Date().toISOString()
+    })
+  })
+
+  app.get('/api/route-cost-events', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    if (!replicaRuntime) {
+      return c.json({ error: 'replica_database_not_configured' }, 503)
+    }
+
+    const windowSeconds = config.routeCostWindowSeconds
+    // Pull a little more than one full window so the timeline always has a
+    // complete window of history to render.
+    const sinceMs = Date.now() - windowSeconds * 1000 * 1.2
+    const events = await fetchRouteCostSampleEvents(replicaRuntime.pool, {
+      sinceMs
+    })
+    return c.json({
+      events,
+      windowSeconds,
+      fetchedAt: new Date().toISOString()
+    })
+  })
+
+  app.get('/api/route-graph', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    try {
+      const graph = await fetchRouteGraph(config)
+      return c.json(graph as Record<string, unknown>)
+    } catch (error) {
+      return routeGraphErrorResponse(c, error, 'route_graph_failed')
+    }
+  })
+
+  app.post('/api/route-explain', async (c) => {
+    const admin = await requireAdmin(c, config, authRuntime)
+    if (admin instanceof Response) return admin
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch (_error) {
+      return c.json({ error: 'invalid_json_body' }, 400)
+    }
+
+    try {
+      const explain = await explainRoute(config, body)
+      return c.json(explain as Record<string, unknown>)
+    } catch (error) {
+      return routeGraphErrorResponse(c, error, 'route_explain_failed')
+    }
   })
 
   app.get('/api/analytics/volume', async (c) => {
@@ -834,6 +909,23 @@ function chatErrorResponse(
     return c.json(payload, error.status as never)
   }
   logError(`admin dashboard chat proxy ${fallbackCode}`, error)
+  return c.json({ error: fallbackCode }, 502)
+}
+
+function routeGraphErrorResponse(
+  c: Context<AppBindings>,
+  error: unknown,
+  fallbackCode: string
+): Response {
+  if (error instanceof RouteGraphProxyError) {
+    logError(`admin dashboard route graph proxy ${fallbackCode}`, error)
+    const payload: Record<string, unknown> = { error: error.message }
+    if (error.upstreamStatus !== undefined) {
+      payload.upstreamStatus = error.upstreamStatus
+    }
+    return c.json(payload, error.status as never)
+  }
+  logError(`admin dashboard route graph proxy ${fallbackCode}`, error)
   return c.json({ error: fallbackCode }, 502)
 }
 

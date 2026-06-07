@@ -484,6 +484,10 @@ pub struct MockIntegratorConfig {
     /// Deterministic per-quote jitter added on top of `across_quote_fee_bps`,
     /// in basis points. The actual jitter is derived from the request.
     pub across_quote_jitter_bps: u16,
+    /// Flat fee applied to mock Velora swap quotes, in basis points. Reduces
+    /// the `SELL` output (and grosses up the `BUY` input) so curated USDC/USDT
+    /// swaps show a realistic non-zero value loss instead of a 1:1 conversion.
+    pub velora_quote_fee_bps: u16,
     /// Artificial delay after a mock Across deposit is indexed before
     /// `/deposit/status` can leave `pending`.
     pub across_status_latency: Duration,
@@ -528,6 +532,7 @@ impl Default for MockIntegratorConfig {
             hyperliquid_withdrawal_latency: Duration::ZERO,
             across_quote_fee_bps: 0,
             across_quote_jitter_bps: 0,
+            velora_quote_fee_bps: 0,
             across_status_latency: Duration::ZERO,
             across_refund_probability_bps: 0,
         }
@@ -801,6 +806,12 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
+    pub fn with_velora_quote_fee_bps(mut self, fee_bps: u16) -> Self {
+        self.velora_quote_fee_bps = fee_bps.min(9_999);
+        self
+    }
+
+    #[must_use]
     pub fn with_across_status_latency(mut self, latency: Duration) -> Self {
         self.across_status_latency = latency;
         self
@@ -859,6 +870,7 @@ struct MockIntegratorState {
     across_integrator_id: Option<String>,
     across_quote_fee_bps: u16,
     across_quote_jitter_bps: u16,
+    velora_quote_fee_bps: u16,
     hyperliquid_withdrawal_latency: Duration,
     across_status_latency: Duration,
     across_refund_probability_bps: u16,
@@ -1524,6 +1536,7 @@ impl MockIntegratorState {
             across_integrator_id: config.across_integrator_id.clone(),
             across_quote_fee_bps: config.across_quote_fee_bps.min(9_999),
             across_quote_jitter_bps: config.across_quote_jitter_bps.min(9_999),
+            velora_quote_fee_bps: config.velora_quote_fee_bps.min(9_999),
             hyperliquid_withdrawal_latency: config.hyperliquid_withdrawal_latency,
             across_status_latency: config.across_status_latency,
             across_refund_probability_bps: config.across_refund_probability_bps.min(10_000),
@@ -1886,27 +1899,33 @@ async fn mock_velora_quote_amounts(
         .get(dest_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {dest_symbol}"))?;
 
+    let fee_bps = state.velora_quote_fee_bps;
     match query.side.as_str() {
-        "SELL" => Ok((
-            amount,
-            convert_raw_amount_floor(
+        "SELL" => {
+            let gross_output = convert_raw_amount_floor(
                 amount,
                 src_price,
                 query.src_decimals,
                 dest_price,
                 query.dest_decimals,
-            )?,
-        )),
-        "BUY" => Ok((
-            convert_raw_amount_ceil(
+            )?;
+            // Haircut the output so the swap shows a realistic value loss
+            // instead of a perfect price conversion.
+            let net_output = apply_mock_across_discount(gross_output, fee_bps)?;
+            Ok((amount, net_output))
+        }
+        "BUY" => {
+            let gross_input = convert_raw_amount_ceil(
                 amount,
                 dest_price,
                 query.dest_decimals,
                 src_price,
                 query.src_decimals,
-            )?,
-            amount,
-        )),
+            )?;
+            // Gross up the input the caller must supply to net `amount` out.
+            let net_input = gross_up_mock_across_input(gross_input, fee_bps)?;
+            Ok((net_input, amount))
+        }
         other => Err(format!("unsupported side: {other}")),
     }
 }
