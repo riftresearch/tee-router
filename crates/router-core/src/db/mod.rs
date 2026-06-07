@@ -104,12 +104,12 @@ impl Database {
     }
 
     #[must_use]
-<<<<<<< HEAD
     pub fn swap_times(&self) -> SwapTimeRepository {
         SwapTimeRepository::new(self.pool.clone())
-=======
+    }
+
+    #[must_use]
     pub fn route_cost_events(&self) -> RouteCostEventRepository {
         RouteCostEventRepository::new(self.pool.clone())
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
 }

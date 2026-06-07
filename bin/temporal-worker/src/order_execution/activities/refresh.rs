@@ -675,8 +675,6 @@ pub(super) fn set_json_value(target: &mut Value, key: &'static str, value: Value
     }
 }
 
-<<<<<<< HEAD
-=======
 #[derive(Debug, Clone)]
 struct BoundaryComposedMarketOrderQuote {
     provider_id: String,
@@ -1713,7 +1711,6 @@ async fn boundary_requote_context(
     Ok((start_node, context))
 }
 
->>>>>>> 92d1922 (graph quoting system overhaul)
 #[derive(Clone, Default)]
 pub struct QuoteRefreshActivities {
     deps: Option<Arc<OrderActivityDeps>>,

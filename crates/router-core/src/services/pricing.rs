@@ -194,14 +194,7 @@ mod tests {
             pricing.canonical_asset_usd_micro(CanonicalAsset::Btc),
             Some(100_000 * USD_MICRO)
         );
-<<<<<<< HEAD
-        assert_eq!(
-            pricing.canonical_asset_usd_micro(CanonicalAsset::Hype),
-            None
-        );
-=======
         assert!(!pricing.supports_chain_gas_pricing(&ChainId::parse("evm:999").unwrap()));
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
 
     #[test]

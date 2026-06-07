@@ -1043,7 +1043,7 @@ impl OrderManager {
             amount_in: request.amount_in.clone(),
         };
 
-        paths.retain(|path| is_executable_transition_path(self.asset_registry.as_ref(), path));
+        paths.retain(|path| is_executable_transition_path(path));
         let paths_after_executable = paths.len();
         paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
         let paths_after_provider = paths.len();
@@ -2916,11 +2916,6 @@ fn provider_allowed_for_new_routes(
     true
 }
 
-<<<<<<< HEAD
-fn validate_hyperliquid_spot_asset(asset: &DepositAsset) -> Result<DepositAsset, String> {
-    if asset.chain.as_str() != "hyperliquid" {
-        return Err("expected hyperliquid chain".to_string());
-=======
 /// Returns `(chosen_out - leader_out) / leader_out` in bps, clamped to
 /// `i64`. Positive means fanout chose a better-output peer than the cached
 /// leader predicted; zero means the leader won; negative is unreachable
@@ -2948,10 +2943,9 @@ fn compute_route_select_delta_bps(leader_out: U256, chosen_out: U256) -> i64 {
     sign.saturating_mul(magnitude)
 }
 
-fn is_executable_transition_path(registry: &AssetRegistry, path: &TransitionPath) -> bool {
-    if path.transitions.is_empty() {
-        return false;
->>>>>>> 92d1922 (graph quoting system overhaul)
+fn validate_hyperliquid_spot_asset(asset: &DepositAsset) -> Result<DepositAsset, String> {
+    if asset.chain.as_str() != "hyperliquid" {
+        return Err("expected hyperliquid chain".to_string());
     }
     match asset.asset.as_str() {
         "native" | "UBTC" | "USDT" | "UETH" | "HYPE" => Ok(asset.clone()),

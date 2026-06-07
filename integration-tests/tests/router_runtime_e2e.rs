@@ -1309,13 +1309,8 @@ fn router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-<<<<<<< HEAD
         coinbase_price_api_base_url: Some(mocks.base_url().to_string()),
         coinbase_proxy_url: None,
-=======
-        coinbase_price_api_base_url: mocks.base_url().to_string(),
-        cctp_transfer_mode: None,
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
 }
 

@@ -53,11 +53,8 @@ bitcoin = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 reqwest = { workspace = true, features = ["socks"] }
 async-trait = { workspace = true }
-<<<<<<< HEAD
 arc-swap = { workspace = true }
-=======
 futures-util = "0.3"
->>>>>>> 92d1922 (graph quoting system overhaul)
 sha2 = { workspace = true }
 
 [dev-dependencies]

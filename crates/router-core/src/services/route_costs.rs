@@ -43,7 +43,6 @@ pub const DEFAULT_AMOUNT_BUCKET: &str = "usd_1000";
 /// `request.amount_in` via `raw_amount_to_usd_micros`.
 pub const DEFAULT_SAMPLE_AMOUNT_USD_MICROS: u64 = 1_000 * USD_MICRO;
 const ROUTE_COST_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_STORED_ROUTE_COST_USD_MICROS: u64 = i64::MAX as u64;
 const DUMMY_EVM_DEPOSITOR: &str = "0x1111111111111111111111111111111111111111";
 const DUMMY_EVM_RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 
@@ -609,6 +608,7 @@ impl RouteCostService {
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
@@ -742,10 +742,6 @@ impl RouteCostService {
                 ))
             }
         };
-<<<<<<< HEAD
-        let estimated_fee_bps = quoted_fee_bps.max(estimate.estimated_fee_bps);
-        let estimated_fee_usd_micros = quoted_fee_usd_micros.max(estimate.estimated_fee_usd_micros);
-=======
         measured_value_loss_snapshot(
             transition,
             refreshed_at,
@@ -759,7 +755,6 @@ impl RouteCostService {
             &format!("provider_quote:{}", quote.provider_id),
         )
     }
->>>>>>> 92d1922 (graph quoting system overhaul)
 
     /// Live-sample a curated Unit deposit/withdrawal. Unit charges only a
     /// network fee in the external asset's native units (sats / wei); the
@@ -1271,80 +1266,6 @@ pub fn confidence_band(
     if ranked.is_empty() || top_k == 0 {
         return 0;
     }
-<<<<<<< HEAD
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StructuralCostEstimate {
-    estimated_fee_bps: u64,
-    estimated_fee_usd_micros: u64,
-    estimated_gas_usd_micros: u64,
-    estimated_latency_ms: u64,
-    quote_source: &'static str,
-}
-
-fn structural_cost_estimate(
-    transition: &TransitionDecl,
-    pricing: &PricingSnapshot,
-) -> StructuralCostEstimate {
-    match transition.kind {
-        MarketOrderTransitionKind::AcrossBridge => StructuralCostEstimate {
-            estimated_fee_bps: 6,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(6, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
-            estimated_gas_usd_micros: structural_gas_usd_micros(
-                pricing,
-                &transition.input.asset.chain,
-                450_000,
-            ),
-            estimated_latency_ms: 120_000,
-            quote_source: "static_across_anchor_seed",
-        },
-        MarketOrderTransitionKind::CctpBridge => StructuralCostEstimate {
-            estimated_fee_bps: 0,
-            estimated_fee_usd_micros: 0,
-            estimated_gas_usd_micros: capped_add_stored_route_cost_usd_micros(
-                structural_gas_usd_micros(pricing, &transition.input.asset.chain, 300_000),
-                structural_gas_usd_micros(pricing, &transition.output.asset.chain, 300_000),
-            ),
-            estimated_latency_ms: 60_000,
-            quote_source: "static_cctp_standard_seed",
-        },
-        MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
-            StructuralCostEstimate {
-                estimated_fee_bps: 0,
-                estimated_fee_usd_micros: 0,
-                estimated_gas_usd_micros: 0,
-                estimated_latency_ms: 60_000,
-                quote_source: "static_unit_anchor_seed",
-            }
-        }
-        MarketOrderTransitionKind::HyperliquidBridgeDeposit
-        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => StructuralCostEstimate {
-            estimated_fee_bps: 0,
-            estimated_fee_usd_micros: 0,
-            estimated_gas_usd_micros: 0,
-            estimated_latency_ms: 30_000,
-            quote_source: "static_hyperliquid_bridge_seed",
-        },
-        MarketOrderTransitionKind::HyperliquidTrade => StructuralCostEstimate {
-            estimated_fee_bps: 4,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(4, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
-            estimated_gas_usd_micros: 0,
-            estimated_latency_ms: 1_500,
-            quote_source: "static_hyperliquid_spot_seed",
-        },
-        MarketOrderTransitionKind::UniversalRouterSwap => StructuralCostEstimate {
-            estimated_fee_bps: 25,
-            estimated_fee_usd_micros: fee_usd_micros_from_bps(25, DEFAULT_SAMPLE_AMOUNT_USD_MICROS),
-            estimated_gas_usd_micros: structural_gas_usd_micros(
-                pricing,
-                &transition.input.asset.chain,
-                360_000,
-            ),
-            estimated_latency_ms: 12_000,
-            quote_source: "static_velora_universal_router_seed",
-        },
-=======
     let cap = top_k.min(ranked.len());
     let leader_cost = ranked[0].score.total_effective_cost_usd_micros;
     let band_extension = U512::from(leader_cost)
@@ -1366,7 +1287,6 @@ fn structural_cost_estimate(
         } else {
             break;
         }
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
     included
 }
@@ -1444,28 +1364,6 @@ fn sample_amount_for_chain_asset_at_usd_micros(
         .map(|amount| amount.max(U256::from(1_u64)))
 }
 
-<<<<<<< HEAD
-fn structural_gas_usd_micros(
-    pricing: &PricingSnapshot,
-    chain: &crate::protocol::ChainId,
-    gas_units: u64,
-) -> u64 {
-    let Some(gas_price_wei) = pricing.try_chain_gas_price_wei(chain) else {
-        return MAX_STORED_ROUTE_COST_USD_MICROS;
-    };
-    pricing
-        .checked_native_gas_wei_to_usd_micro(
-            chain,
-            U256::from(gas_units)
-                .checked_mul(gas_price_wei)
-                .unwrap_or(U256::MAX),
-        )
-        .and_then(|value| value.try_into().ok())
-        .unwrap_or(MAX_STORED_ROUTE_COST_USD_MICROS)
-}
-
-=======
->>>>>>> 92d1922 (graph quoting system overhaul)
 fn quote_value_loss_bps(
     amount_in: U256,
     input_asset: &ChainAsset,
@@ -1578,11 +1476,6 @@ fn capped_add_u64(left: u64, right: u64) -> u64 {
     left.saturating_add(right)
 }
 
-fn capped_add_stored_route_cost_usd_micros(left: u64, right: u64) -> u64 {
-    left.saturating_add(right)
-        .min(MAX_STORED_ROUTE_COST_USD_MICROS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1603,11 +1496,16 @@ mod tests {
             id: id.to_string(),
             kind,
             provider: match kind {
-                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::HyperliquidSpot,
+                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
                 MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    ProviderId::HyperliquidBridge
+                    if kind == MarketOrderTransitionKind::HypercoreBridgeDeposit {
+                        ProviderId::HypercoreBridge
+                    } else {
+                        ProviderId::HyperliquidBridge
+                    }
                 }
                 MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
@@ -1832,21 +1730,6 @@ mod tests {
 
         assert_eq!(snapshot.effective_cost_bps(), u64::MAX);
     }
-    #[test]
-    fn structural_gas_cost_for_unpriced_chain_fits_persisted_range() {
-        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
-        let cost = structural_gas_usd_micros(&pricing, &ChainId::parse("bitcoin").unwrap(), 1);
-
-        assert_eq!(cost, MAX_STORED_ROUTE_COST_USD_MICROS);
-        assert!(i64::try_from(cost).is_ok());
-    }
-    #[test]
-    fn stored_route_cost_add_caps_to_persisted_range() {
-        let cost = capped_add_stored_route_cost_usd_micros(MAX_STORED_ROUTE_COST_USD_MICROS, 1);
-
-        assert_eq!(cost, MAX_STORED_ROUTE_COST_USD_MICROS);
-        assert!(i64::try_from(cost).is_ok());
-    }
 
     #[test]
     fn path_score_prefers_known_lower_cost_edges() {
@@ -1880,7 +1763,7 @@ mod tests {
                 RouteCostSnapshot {
                     transition_id: transition.id.clone(),
                     amount_bucket: DEFAULT_AMOUNT_BUCKET.to_string(),
-                    provider: "hyperliquid_spot".to_string(),
+                    provider: "hyperliquid".to_string(),
                     edge_kind: "fixed_pair_swap".to_string(),
                     source_asset: transition.input.asset.clone(),
                     destination_asset: transition.output.asset.clone(),
@@ -1905,95 +1788,6 @@ mod tests {
         );
     }
     #[test]
-<<<<<<< HEAD
-    fn structural_route_ranking_prefers_cctp_for_base_usdc_to_bitcoin() {
-        let registry = AssetRegistry::default();
-        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
-        let base_usdc = DepositAsset {
-            chain: ChainId::parse("evm:8453").unwrap(),
-            asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-        };
-        let btc = DepositAsset {
-            chain: ChainId::parse("bitcoin").unwrap(),
-            asset: AssetId::Native,
-        };
-        let paths = registry.select_transition_paths(&base_usdc, &btc, 5);
-        let cctp_path = paths
-            .iter()
-            .find(|path| {
-                path.transitions
-                    .iter()
-                    .any(|transition| transition.kind == MarketOrderTransitionKind::CctpBridge)
-            })
-            .expect("CCTP route should exist");
-        let across_path = paths
-            .iter()
-            .find(|path| {
-                path.transitions
-                    .iter()
-                    .any(|transition| transition.kind == MarketOrderTransitionKind::AcrossBridge)
-            })
-            .expect("Across route should exist");
-
-        assert!(
-            structural_path_score(cctp_path, &pricing).total_effective_cost_usd_micros
-                < structural_path_score(across_path, &pricing).total_effective_cost_usd_micros
-        );
-    }
-
-    #[test]
-    fn structural_usdc_bridge_costs_choose_cctp_for_l2_l2_and_across_for_eth_destination() {
-        let registry = AssetRegistry::default();
-        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
-        let base_usdc = usdc("evm:8453", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913");
-        let arbitrum_usdc = usdc("evm:42161", "0xaf88d065e77c8cc2239327c5edb3a432268e5831");
-        let ethereum_usdc = usdc("evm:1", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
-
-        assert!(
-            direct_bridge_cost(
-                &registry,
-                &pricing,
-                &base_usdc,
-                &arbitrum_usdc,
-                MarketOrderTransitionKind::CctpBridge
-            ) < direct_bridge_cost(
-                &registry,
-                &pricing,
-                &base_usdc,
-                &arbitrum_usdc,
-                MarketOrderTransitionKind::AcrossBridge
-            )
-        );
-        assert!(
-            direct_bridge_cost(
-                &registry,
-                &pricing,
-                &arbitrum_usdc,
-                &ethereum_usdc,
-                MarketOrderTransitionKind::AcrossBridge
-            ) < direct_bridge_cost(
-                &registry,
-                &pricing,
-                &arbitrum_usdc,
-                &ethereum_usdc,
-                MarketOrderTransitionKind::CctpBridge
-            )
-        );
-        assert!(
-            direct_bridge_cost(
-                &registry,
-                &pricing,
-                &base_usdc,
-                &ethereum_usdc,
-                MarketOrderTransitionKind::AcrossBridge
-            ) < direct_bridge_cost(
-                &registry,
-                &pricing,
-                &base_usdc,
-                &ethereum_usdc,
-                MarketOrderTransitionKind::CctpBridge
-            )
-=======
     fn path_score_prefers_hyperevm_route_when_micro_usd_costs_are_lower() {
         let cctp_arb = transition("cctp_to_arb", MarketOrderTransitionKind::CctpBridge);
         let hl_bridge = transition(
@@ -2137,7 +1931,6 @@ mod tests {
         assert!(
             path_score(&hyperevm_path, &snapshots).total_effective_cost_usd_micros
                 < path_score(&arb_path, &snapshots).total_effective_cost_usd_micros
->>>>>>> 92d1922 (graph quoting system overhaul)
         );
     }
 

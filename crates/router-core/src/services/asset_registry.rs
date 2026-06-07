@@ -1209,21 +1209,9 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
             6,
         ),
-<<<<<<< HEAD
-        chain_asset(
-            CanonicalAsset::Cbbtc,
-            "evm:8453",
-            AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-            8,
-        ),
-        // Hyperliquid spot assets. These may be user funding sources: users
-        // deposit by transferring the spot asset into a router-derived HL
-        // account, then the route executes from the corresponding HL venue node.
-=======
         // Hyperliquid spot assets. These are venue balances, not public
         // user-facing start/end assets; Unit deposits/withdrawals bridge
         // between these venue assets and their external chain representations.
->>>>>>> 92d1922 (graph quoting system overhaul)
         chain_asset(
             CanonicalAsset::Btc,
             "hyperliquid",

@@ -3,16 +3,11 @@ use crate::{
         CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest, DetectorHintEnvelope,
         DetectorHintRequest, DetectorHintTarget, OrderRefundEnvelope, OrderRefundOutcome,
         ProviderHealthEnvelope, ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-<<<<<<< HEAD
-        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, RouterSwitchEnvelope,
-        RouterSwitchListEnvelope, UpdateProviderPolicyRequest, UpdateRouterSwitchRequest,
-        VaultFundingHintEnvelope, VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
-=======
         ProviderPolicyEnvelope, ProviderPolicyListEnvelope, RouteExplainEnvelope,
         RouteExplainRequest, RouteGraphEdge, RouteGraphEnvelope, RouteGraphNode,
-        UpdateProviderPolicyRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
+        RouterSwitchEnvelope, RouterSwitchListEnvelope, UpdateProviderPolicyRequest,
+        UpdateRouterSwitchRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
         MAX_HINT_IDEMPOTENCY_KEY_LEN,
->>>>>>> 92d1922 (graph quoting system overhaul)
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},

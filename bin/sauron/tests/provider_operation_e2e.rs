@@ -978,12 +978,8 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
         coinbase_price_api_base_url: args.coinbase_price_api_base_url.clone(),
-<<<<<<< HEAD
         coinbase_proxy_url: args.coinbase_proxy_url.clone(),
     }
-=======
-        cctp_transfer_mode: args.cctp_transfer_mode.clone(),
->>>>>>> 92d1922 (graph quoting system overhaul)
 }
 
 async fn reserve_local_port() -> u16 {
@@ -1082,13 +1078,8 @@ fn router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-<<<<<<< HEAD
         coinbase_price_api_base_url: Some(mocks.base_url().to_string()),
         coinbase_proxy_url: None,
-=======
-        coinbase_price_api_base_url: mocks.base_url().to_string(),
-        cctp_transfer_mode: None,
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
 }
 
@@ -1167,13 +1158,8 @@ fn live_router_args(
         worker_order_execution_pass_limit: 25,
         worker_order_execution_concurrency: 64,
         worker_vault_funding_hint_pass_limit: 100,
-<<<<<<< HEAD
         coinbase_price_api_base_url: None,
         coinbase_proxy_url: None,
-=======
-        coinbase_price_api_base_url: "https://api.coinbase.com".to_string(),
-        cctp_transfer_mode: None,
->>>>>>> 92d1922 (graph quoting system overhaul)
     }
 }
 
