@@ -74,6 +74,7 @@ impl PricingSnapshot {
             CanonicalAsset::Usdc | CanonicalAsset::Usdt => Some(self.stable_usd_micro),
             CanonicalAsset::Eth => Some(self.eth_usd_micro),
             CanonicalAsset::Btc => Some(self.btc_usd_micro),
+            CanonicalAsset::Hype => self.hype_usd_micro,
         }
     }
 

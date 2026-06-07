@@ -608,7 +608,6 @@ impl RouteCostService {
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
@@ -1496,16 +1495,11 @@ mod tests {
             id: id.to_string(),
             kind,
             provider: match kind {
-                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::Hyperliquid,
+                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::HyperliquidSpot,
                 MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
                 MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                 | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    if kind == MarketOrderTransitionKind::HypercoreBridgeDeposit {
-                        ProviderId::HypercoreBridge
-                    } else {
-                        ProviderId::HyperliquidBridge
-                    }
+                    ProviderId::HyperliquidBridge
                 }
                 MarketOrderTransitionKind::UnitDeposit
                 | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
@@ -1797,7 +1791,7 @@ mod tests {
         let cctp_hyperevm = transition("cctp_to_hyperevm", MarketOrderTransitionKind::CctpBridge);
         let hypercore_bridge = transition(
             "hyperevm_hypercore_bridge",
-            MarketOrderTransitionKind::HypercoreBridgeDeposit,
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit,
         );
         let trade = transition("trade", MarketOrderTransitionKind::HyperliquidTrade);
         let withdraw = transition("withdraw", MarketOrderTransitionKind::UnitWithdrawal);

@@ -14,6 +14,10 @@ pub enum CanonicalAsset {
     Eth,
     Usdc,
     Usdt,
+    /// Hyperliquid-native HYPE. Not part of the curated bridge swap list; it is
+    /// reachable only as a Hyperliquid spot venue asset (HyperliquidTrade /
+    /// HyperliquidSpot) and surfaces in Hyperliquid balance/refund discovery.
+    Hype,
 }
 
 impl CanonicalAsset {
@@ -24,6 +28,7 @@ impl CanonicalAsset {
             Self::Eth => "eth",
             Self::Usdc => "usdc",
             Self::Usdt => "usdt",
+            Self::Hype => "hype",
         }
     }
 }
@@ -1594,7 +1599,6 @@ mod tests {
         assert!(curated.iter().all(|decl| {
             decl.kind != MarketOrderTransitionKind::HyperliquidTrade
                 && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                && decl.kind != MarketOrderTransitionKind::HypercoreBridgeDeposit
                 && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
         }));
     }

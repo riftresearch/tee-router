@@ -1037,7 +1037,6 @@ fn test_router_args(
         worker_vault_funding_hint_pass_limit: 100,
         coinbase_price_api_base_url: Some("http://127.0.0.1:9".to_string()),
         coinbase_proxy_url: None,
-        cctp_transfer_mode: None,
     }
 }
 

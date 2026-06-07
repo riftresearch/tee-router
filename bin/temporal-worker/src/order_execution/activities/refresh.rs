@@ -1,6 +1,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::*;
+use router_core::services::action_providers::UnitProvider;
+use router_core::services::asset_registry::{AssetRegistry, RequiredCustodyRole};
+use router_core::services::gas_reimbursement::{
+    optimized_paymaster_reimbursement_plan, optimized_paymaster_reimbursement_plan_with_pricing,
+    try_transition_retention_amount, GasReimbursementError, GasReimbursementPlan,
+};
+use router_core::services::market_order_planner::MarketOrderInitialHyperliquidCustody;
+use super::super::types::{LegBoundaryRequoteAttemptOutcome, LegBoundaryRequoteAttemptShape};
 
 pub(super) fn refreshed_market_order_quote_exact_in(
     order: &RouterOrder,
@@ -744,12 +752,13 @@ fn boundary_requoted_market_order_quote_exact_in(
         order_id: Some(order.id),
         source_asset,
         destination_asset: order.destination_asset.clone(),
-        recipient_address: order.recipient_address.clone(),
+        recipient_address: Some(order.recipient_address.clone()),
         provider_id: quote.provider_id,
         amount_in: quote.amount_in,
         estimated_amount_out: quote.estimated_amount_out,
         provider_quote: quote.provider_quote,
         usd_valuation: json!({}),
+        expected_swap_time_ms: None,
         expires_at: quote.expires_at,
         created_at,
     }
@@ -875,7 +884,6 @@ fn boundary_path_has_configured_provider_set(
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => action_providers
                 .bridge(transition.provider.as_str())
                 .is_some(),
@@ -1220,7 +1228,6 @@ async fn boundary_compose_transition_path_quote(
             MarketOrderTransitionKind::AcrossBridge
             | MarketOrderTransitionKind::CctpBridge
             | MarketOrderTransitionKind::HyperliquidBridgeDeposit
-            | MarketOrderTransitionKind::HypercoreBridgeDeposit
             | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
                 let bridge = deps
                     .action_providers
@@ -1303,7 +1310,6 @@ async fn boundary_compose_transition_path_quote(
                         && matches!(
                             path.transitions[index - 1].kind,
                             MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                                | MarketOrderTransitionKind::HypercoreBridgeDeposit
                         ))
                 {
                     quote_amount_in = refresh_reserve_hyperliquid_spot_send_quote_gas(
@@ -1499,7 +1505,7 @@ fn boundary_start_node(
             ))
         })?;
         return Ok(MarketOrderNode::Venue {
-            provider: ProviderId::Hyperliquid,
+            provider: ProviderId::HyperliquidSpot,
             canonical,
         });
     }

@@ -1834,6 +1834,26 @@ fn required_role_to_custody(role: RequiredCustodyRole) -> Option<CustodyVaultRol
     }
 }
 
+/// Initial Hyperliquid custody context captured when re-quoting at a leg
+/// boundary. Mirrors [`DerivedHyperliquidCustody`] but is part of the public
+/// planner API so the temporal worker can thread it back into a re-quote.
+#[derive(Debug, Clone)]
+pub struct MarketOrderInitialHyperliquidCustody {
+    pub role: CustodyVaultRole,
+    pub asset: Option<DepositAsset>,
+    pub prefund_first_trade: bool,
+}
+
+impl From<MarketOrderInitialHyperliquidCustody> for DerivedHyperliquidCustody {
+    fn from(value: MarketOrderInitialHyperliquidCustody) -> Self {
+        Self {
+            role: value.role,
+            asset: value.asset,
+            prefund_first_trade: value.prefund_first_trade,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DerivedHyperliquidCustody {
     role: CustodyVaultRole,

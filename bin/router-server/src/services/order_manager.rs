@@ -252,6 +252,27 @@ impl OrderManager {
         self
     }
 
+    /// Drop paths that traverse HyperEVM when we cannot currently price its
+    /// gas. Without a live HyperEVM gas price these routes can't be costed, so
+    /// surfacing them would be misleading. Returns `true` if any path was
+    /// removed.
+    async fn filter_unpriceable_hyperevm_paths(&self, paths: &mut Vec<TransitionPath>) -> bool {
+        if !paths.iter().any(path_uses_hyperevm) {
+            return false;
+        }
+        let Some(route_costs) = self.route_costs.as_ref() else {
+            paths.retain(|path| !path_uses_hyperevm(path));
+            return true;
+        };
+        let pricing = route_costs.force_refresh_pricing_snapshot().await;
+        let hyperevm_chain = ChainId::parse("evm:999").expect("static HyperEVM chain id");
+        if pricing.supports_chain_gas_pricing(&hyperevm_chain) {
+            return false;
+        }
+        paths.retain(|path| !path_uses_hyperevm(path));
+        true
+    }
+
     #[must_use]
     pub fn with_provider_policies(
         mut self,
@@ -1039,8 +1060,10 @@ impl OrderManager {
         let mut normalized_request = NormalizedMarketOrderQuoteRequest {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
-            recipient_address: String::new(),
             amount_in: request.amount_in.clone(),
+            routing: NormalizedMarketOrderRouting {
+                provider_sequence: None,
+            },
         };
 
         paths.retain(|path| is_executable_transition_path(path));
@@ -1357,16 +1380,6 @@ impl OrderManager {
             &request.source_asset.chain,
         )
         .map_err(MarketOrderError::deposit_address)?;
-        // A chain-appropriate recipient is required by several provider legs;
-        // derive one on the destination chain for this synthetic quote.
-        let (recipient_address, _) = derive_deposit_address_for_quote(
-            self.chain_registry.as_ref(),
-            &self.settings.master_key_bytes(),
-            quote_id,
-            &request.destination_asset.chain,
-        )
-        .map_err(MarketOrderError::deposit_address)?;
-        request.recipient_address = recipient_address;
 
         let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
             Some(service.snapshot().await.map_err(MarketOrderError::database)?)
@@ -3054,6 +3067,13 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
         })
 }
 
+fn path_uses_hyperevm(path: &TransitionPath) -> bool {
+    path.transitions.iter().any(|transition| {
+        transition.input.asset.chain.as_str() == "evm:999"
+            || transition.output.asset.chain.as_str() == "evm:999"
+    })
+}
+
 fn path_has_configured_provider_set(
     action_providers: &ActionProviderRegistry,
     path: &TransitionPath,
@@ -3934,6 +3954,7 @@ fn route_output_floor(registry: &AssetRegistry, destination_asset: &DepositAsset
         CanonicalAsset::Usdc | CanonicalAsset::Usdt => {
             Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))
         }
+        CanonicalAsset::Hype => None,
     }
 }
 

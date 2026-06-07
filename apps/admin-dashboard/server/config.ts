@@ -15,7 +15,6 @@ export type AdminDashboardConfig = {
   authDatabaseUrl?: string
   replicaDatabaseUrl?: string
   analyticsDatabaseUrl?: string
-  routerInternalBaseUrl?: string
   routerAdminApiKey?: string
   routerInternalBaseUrl: string
   googleClientId?: string
@@ -125,10 +124,6 @@ export function loadConfig(env: Env = Bun.env as Env): AdminDashboardConfig {
     ),
     analyticsDatabaseUrl: normalizeOptionalSecret(
       env.ADMIN_DASHBOARD_ANALYTICS_DATABASE_URL
-    ),
-    routerInternalBaseUrl: normalizeOptionalUrl(
-      env.ADMIN_DASHBOARD_ROUTER_INTERNAL_BASE_URL ?? env.ROUTER_INTERNAL_BASE_URL,
-      'ROUTER_INTERNAL_BASE_URL'
     ),
     routerAdminApiKey: normalizeOptionalSecret(
       env.ROUTER_ADMIN_API_KEY,
