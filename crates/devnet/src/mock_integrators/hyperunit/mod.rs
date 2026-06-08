@@ -187,8 +187,11 @@ pub(crate) async fn maybe_spawn_unit_deposit_indexers(
                 eyre::eyre!("mock Unit bitcoin indexer: RPC client init failed: {err}")
             })?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let handle =
-            tokio::spawn(run_unit_bitcoin_deposit_indexer(client, state.clone(), shutdown_rx));
+        let handle = tokio::spawn(run_unit_bitcoin_deposit_indexer(
+            client,
+            state.clone(),
+            shutdown_rx,
+        ));
         shutdowns.push(shutdown_tx);
         handles.push(handle);
     }
@@ -592,7 +595,6 @@ fn bitcoin_script_pubkey_for_regtest_address(address: &str) -> Option<bitcoin::S
         .map(|address| address.script_pubkey())
 }
 
-
 /// Handles `GET /gen/{src_chain}/{dst_chain}/{asset}/{dst_addr}` — HyperUnit's
 /// "generate protocol address" endpoint. The response mirrors
 /// `hyperunit_client::UnitGenerateAddressResponse` byte-for-byte so production
@@ -638,11 +640,7 @@ pub(crate) async fn mock_unit_gen(
         asset: asset.clone(),
         dst_addr: dst_addr.clone(),
     };
-    state
-        .generate_address_requests
-        .lock()
-        .await
-        .push(request);
+    state.generate_address_requests.lock().await.push(request);
 
     // A deposit operation has the user's on-chain funds flowing INTO Hyperliquid:
     // src_chain is the external chain (bitcoin/ethereum), dst_chain is hyperliquid.
@@ -868,24 +866,20 @@ fn spawn_mock_unit_withdrawal_completion(
     source_tx_hash: String,
 ) {
     tokio::spawn(async move {
-        let completion_result = if let Some(error) = state
-            .next_withdrawal_completion_error
-            .lock()
-            .await
-            .take()
-        {
-            fail_mock_unit_operation(&state, &protocol_address, error).await
-        } else {
-            complete_mock_unit_operation_with_observation(
-                &state,
-                &protocol_address,
-                Some(UnitOperationObservation {
-                    source_amount: source_amount.clone(),
-                    source_tx_hash: Some(source_tx_hash),
-                }),
-            )
-            .await
-        };
+        let completion_result =
+            if let Some(error) = state.next_withdrawal_completion_error.lock().await.take() {
+                fail_mock_unit_operation(&state, &protocol_address, error).await
+            } else {
+                complete_mock_unit_operation_with_observation(
+                    &state,
+                    &protocol_address,
+                    Some(UnitOperationObservation {
+                        source_amount: source_amount.clone(),
+                        source_tx_hash: Some(source_tx_hash),
+                    }),
+                )
+                .await
+            };
         if let Err(err) = completion_result {
             mark_mock_unit_operation_failed(&state, &protocol_address).await;
             tracing::warn!(
@@ -1123,7 +1117,11 @@ pub(crate) async fn complete_mock_unit_operation_with_observation(
     };
 
     if let Some(credit) = maybe_deposit_credit {
-        let positive = credit.amount.parse::<f64>().map(|v| v > 0.0).unwrap_or(false);
+        let positive = credit
+            .amount
+            .parse::<f64>()
+            .map(|v| v > 0.0)
+            .unwrap_or(false);
         if positive {
             // The deposit credit lands on the standalone Hyperliquid node (the
             // sole Hyperliquid): the guardian — seeded `u32::MAX` UBTC/UETH at
@@ -1361,7 +1359,9 @@ async fn send_mock_unit_evm_withdrawal_release(
         .get_chain_id()
         .await
         .map_err(|err| format!("mock Unit withdrawal release get_chain_id failed: {err}"))?;
-    let handle = state.shared.mock_service_paymaster(MockService::Hyperunit, chain_id)?;
+    let handle = state
+        .shared
+        .mock_service_paymaster(MockService::Hyperunit, chain_id)?;
     let execution = Execution {
         target: destination,
         value: amount,
@@ -1373,11 +1373,8 @@ async fn send_mock_unit_evm_withdrawal_release(
         chain_id,
         "calling paymaster.submit"
     );
-    let submit_result = tokio::time::timeout(
-        state.withdrawal_release_timeout,
-        handle.submit(execution),
-    )
-    .await;
+    let submit_result =
+        tokio::time::timeout(state.withdrawal_release_timeout, handle.submit(execution)).await;
     let tx_hash = match submit_result {
         Ok(Ok(tx_hash)) => {
             tracing::info!(
@@ -1636,7 +1633,6 @@ fn hyperunit_credit_amount_from_raw(asset: UnitAsset, raw: u128) -> String {
     )
 }
 
-
 fn parse_optional_raw_amount(value: Option<&str>, field: &'static str) -> Result<u128, String> {
     let Some(value) = value else {
         return Ok(0);
@@ -1872,7 +1868,6 @@ fn fresh_mock_regtest_bitcoin_wallet() -> MockUnitProtocolWallet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2081,15 +2076,18 @@ mod tests {
             .iter()
             .all(|op| op.matches_protocol_address(&first.address)));
 
-        let by_destination: UnitOperationsResponse =
-            reqwest::get(format!("{}/operations/{}", server.hyperunit_url(), destination))
-                .await
-                .expect("destination ops")
-                .error_for_status()
-                .expect("destination ops 200")
-                .json()
-                .await
-                .expect("destination ops json");
+        let by_destination: UnitOperationsResponse = reqwest::get(format!(
+            "{}/operations/{}",
+            server.hyperunit_url(),
+            destination
+        ))
+        .await
+        .expect("destination ops")
+        .error_for_status()
+        .expect("destination ops 200")
+        .json()
+        .await
+        .expect("destination ops json");
         assert_eq!(by_destination.addresses.len(), 2);
         assert_eq!(by_destination.operations.len(), 2);
         let addresses = by_destination

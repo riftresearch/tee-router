@@ -17,8 +17,8 @@ use tokio::sync::Mutex;
 
 pub(crate) mod contract;
 
-use crate::mock_integrators::velora::contract::MockVeloraSwap;
 use crate::mock_integrators::parse_amount;
+use crate::mock_integrators::velora::contract::MockVeloraSwap;
 
 /// Per-venue state for the Velora mock: the simulated USD price book, the
 /// per-network swap-contract addresses, and the two injectable

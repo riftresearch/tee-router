@@ -382,7 +382,11 @@ impl HyperliquidCoreState {
         fills.sort_by(|left, right| right.time.cmp(&left.time));
     }
 
-    pub(crate) fn record_ledger_update(&mut self, user: Address, update: UserNonFundingLedgerUpdate) {
+    pub(crate) fn record_ledger_update(
+        &mut self,
+        user: Address,
+        update: UserNonFundingLedgerUpdate,
+    ) {
         let updates = self.ledger_updates.entry(user).or_default();
         updates.push(update);
         updates.sort_by(|left, right| right.time.cmp(&left.time));

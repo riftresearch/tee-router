@@ -30,8 +30,8 @@ pub(crate) mod contract;
 use crate::mock_integrators::across::contract::MockSpokePool::{depositCall, FundsDeposited};
 use crate::mock_integrators::{
     address_to_bytes32, bytes32_to_evm_address, deterministic_bps, mock_credit_native_on_anvil,
-    mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, parse_amount, AcrossDepositKey,
-    MockIntegratorConfig, MockService, IERC20,
+    mock_evm_indexer_initial_last_scanned, mock_mint_erc20_on_anvil, parse_amount,
+    AcrossDepositKey, MockIntegratorConfig, MockService, IERC20,
 };
 
 #[derive(Debug, Clone)]
@@ -40,13 +40,11 @@ pub struct MockAcrossChainConfig {
     pub evm_rpc_url: String,
 }
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMockAcrossChainConfig {
     pub(crate) spoke_pool_address: String,
     pub(crate) evm_rpc_url: Option<String>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct MockAcrossDepositRecord {
@@ -859,7 +857,10 @@ fn mock_across_quote_amounts(
     Ok(amounts)
 }
 
-fn mock_across_quote_fee_bps(state: &AcrossMockState, query: &MockAcrossRealSwapApprovalQuery) -> u16 {
+fn mock_across_quote_fee_bps(
+    state: &AcrossMockState,
+    query: &MockAcrossRealSwapApprovalQuery,
+) -> u16 {
     let base = state.quote_fee_bps;
     let jitter = deterministic_bps(
         &format!(
@@ -1355,7 +1356,6 @@ fn mock_across_error_response(
     )
         .into_response()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2087,7 +2087,8 @@ mod tests {
         };
         server
             .state
-            .across.deposits
+            .across
+            .deposits
             .lock()
             .await
             .insert((1, "7".to_string()), record);
@@ -2146,7 +2147,8 @@ mod tests {
         };
         server
             .state
-            .across.deposits
+            .across
+            .deposits
             .lock()
             .await
             .insert((origin_chain_id, "9".to_string()), record);
@@ -2270,7 +2272,8 @@ mod tests {
         };
         server
             .state
-            .across.deposits
+            .across
+            .deposits
             .lock()
             .await
             .insert((1, deposit_id.to_string()), record);

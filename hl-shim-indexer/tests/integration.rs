@@ -195,8 +195,10 @@ async fn hl_shim_integration_edges_share_one_database() {
     let database_url = create_test_database(&postgres.admin_database_url).await;
     let hl = HyperliquidNode::spawn().await.expect("spawn HL node");
     let user = sample_user();
-    hl.record_fill(user, sample_fill(1_700_000_000_000, 1)).await;
-    hl.record_fill(user, sample_fill(1_700_000_001_000, 2)).await;
+    hl.record_fill(user, sample_fill(1_700_000_000_000, 1))
+        .await;
+    hl.record_fill(user, sample_fill(1_700_000_001_000, 2))
+        .await;
 
     let (base_url, poller, scheduler, storage, _pubsub) =
         build_test_app(&database_url, &hl.url()).await;
@@ -296,7 +298,8 @@ async fn hl_shim_integration_edges_share_one_database() {
         .expect("ack message");
     assert!(ack.into_text().expect("ack text").contains("subscribed"));
 
-    hl.record_fill(user, sample_fill(1_700_000_003_000, 9)).await;
+    hl.record_fill(user, sample_fill(1_700_000_003_000, 9))
+        .await;
     poller
         .poll_once(ScheduledPoll {
             user,
