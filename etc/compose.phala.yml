@@ -283,6 +283,9 @@ configs:
 x-router-environment: &router-environment
   - RUST_LOG=${RUST_LOG:-info}
   - DEPLOYMENT_ENVIRONMENT=${DEPLOYMENT_ENVIRONMENT:-alpha}
+  # Strict upstream/proxy + Chainalysis enforcement. Binary defaults true; pinned
+  # here so the production posture is explicit/auditable in-file.
+  - PRODUCTION=${PRODUCTION:-true}
   - SERVICE_NAMESPACE=tee-router
   - SERVICE_VERSION=${SERVICE_VERSION:-0.1.8}
   - DB_MAX_CONNECTIONS=${DB_MAX_CONNECTIONS:-100}
@@ -345,8 +348,10 @@ x-router-environment: &router-environment
   - MAYAN_API_URL=${MAYAN_API_URL:-https://price-api.mayan.finance/v3}
   - MAYAN_API_KEY
   - CHAINFLIP_API_URL=${CHAINFLIP_API_URL:-https://chainflip-swap.chainflip.io}
-  - GARDEN_API_URL=${GARDEN_API_URL:-}
-  - GARDEN_API_KEY=${GARDEN_API_KEY:-}
+  - GARDEN_API_URL=${GARDEN_API_URL:-https://api.garden.finance/v2}
+  # Required whenever GARDEN_API_URL is set (it is, above). Supply the real
+  # garden-app-id key via the Phala deploy env/secrets — never hardcode it here.
+  - GARDEN_API_KEY=${GARDEN_API_KEY:?set GARDEN_API_KEY (Garden garden-app-id) — required because GARDEN_API_URL is enabled}
   - COINBASE_PRICE_API_BASE_URL=https://api.coinbase.com
   - ACROSS_INTEGRATOR_ID=${ACROSS_INTEGRATOR_ID:?set ACROSS_INTEGRATOR_ID}
   - CCTP_API_URL=https://iris-api.circle.com
