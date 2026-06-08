@@ -437,18 +437,14 @@ function ExplainPanel({
           const rankClass =
             path.rank <= 3 ? ` rg-rank-${path.rank}` : ''
           const isBest = path.path_id === bestPathId
+          const summary = pathBpsSummary(path.transitions, bps)
           return (
             <li
               key={path.path_id}
               className={`rg-ranked-item${rankClass}${isBest ? ' rg-best' : ''}`}
             >
-              <div className="rg-ranked-top">
-                <span
-                  className="rg-ranked-rank"
-                  style={{ color: rankColor(path.rank) }}
-                >
-                  #{path.rank}
-                </span>
+              <div className="rg-ranked-head">
+                <span className="rg-ranked-rank">#{path.rank}</span>
                 <span className="rg-ranked-venues">
                   {path.transitions.map((transition, index) => (
                     <span key={transition.id}>
@@ -460,6 +456,28 @@ function ExplainPanel({
                   ))}
                 </span>
                 {isBest ? <span className="rg-badge rg-badge-best">best</span> : null}
+                <span className="rg-ranked-summary">
+                  <span
+                    className={`rg-sum-bps${summary.allKnown ? '' : ' rg-sum-partial'}`}
+                    title={
+                      summary.allKnown
+                        ? 'Total cached cost summed across every leg'
+                        : 'Sum of cached legs only; live/uncached legs are not included, so the true total is higher'
+                    }
+                  >
+                    {formatPathBpsTotal(summary)}
+                  </span>
+                  <span className="rg-sum-hops">{path.hop_count} hops</span>
+                  {path.missing_edges > 0 ? (
+                    <span className="rg-missing">{path.missing_edges} uncached</span>
+                  ) : null}
+                  {path.total_latency_ms > 0 ? (
+                    <span>{path.total_latency_ms}ms</span>
+                  ) : null}
+                  {path.estimated_amount_out ? (
+                    <span className="rg-out">out {path.estimated_amount_out}</span>
+                  ) : null}
+                </span>
               </div>
 
               <div className="rg-path-chain">
@@ -475,18 +493,26 @@ function ExplainPanel({
                 {path.transitions.map((transition) => {
                   const bpsValue = bps.get(transition.id)
                   const isVelora = transition.provider === 'velora'
+                  const stepBps = isVelora
+                    ? 'live'
+                    : bpsValue !== undefined
+                      ? `${formatBps(bpsValue)} bps`
+                      : '—'
+                  const bpsClass = isVelora
+                    ? ' rg-hop-live'
+                    : bpsValue === undefined
+                      ? ' rg-hop-missing'
+                      : ''
                   return (
                     <span className="rg-chain-step" key={`${transition.id}-step`}>
                       <span
                         className="rg-chain-hop"
                         style={{ color: providerColor(transition.provider) }}
                       >
-                        {providerLabel(transition.provider)}
-                        {isVelora
-                          ? ' · live'
-                          : bpsValue !== undefined
-                            ? ` · ${formatBps(bpsValue)}bps`
-                            : ''}
+                        <span className="rg-hop-name">
+                          {providerLabel(transition.provider)}
+                        </span>
+                        <span className={`rg-hop-bps${bpsClass}`}>{stepBps}</span>
                       </span>
                       <span className="rg-chain-asset">
                         {assetDisplayLabel(
@@ -497,19 +523,6 @@ function ExplainPanel({
                     </span>
                   )
                 })}
-              </div>
-
-              <div className="rg-ranked-meta">
-                <span>{path.hop_count} hops</span>
-                {path.missing_edges > 0 ? (
-                  <span className="rg-missing">{path.missing_edges} uncached</span>
-                ) : (
-                  <span>{formatUsdMicros(path.total_effective_cost_usd_micros)} cost</span>
-                )}
-                <span>{path.total_latency_ms}ms</span>
-                {path.estimated_amount_out ? (
-                  <span className="rg-out">out {path.estimated_amount_out}</span>
-                ) : null}
               </div>
             </li>
           )
@@ -849,6 +862,39 @@ function rebuildBpsMapForTier(
 function formatBps(bps: number): string {
   if (!Number.isFinite(bps)) return '—'
   return bps >= 100 ? bps.toFixed(0) : bps.toFixed(1)
+}
+
+// Sum the per-leg cached bps for a ranked path. `velora` legs are live-priced
+// and uncached legs (e.g. HyperCore trades, HL bridge) have no measured cost,
+// so the total only reflects legs with a cached snapshot. When some legs are
+// unknown the sum is a lower bound, surfaced as `>=` in the label.
+function pathBpsSummary(
+  transitions: { id: string; provider: string }[],
+  bps: Map<string, number>
+): { total: number; allKnown: boolean; anyKnown: boolean } {
+  let total = 0
+  let known = 0
+  for (const transition of transitions) {
+    const value = bps.get(transition.id)
+    if (value !== undefined) {
+      total += value
+      known += 1
+    }
+  }
+  return {
+    total,
+    allKnown: transitions.length > 0 && known === transitions.length,
+    anyKnown: known > 0
+  }
+}
+
+function formatPathBpsTotal(summary: {
+  total: number
+  allKnown: boolean
+  anyKnown: boolean
+}): string {
+  if (!summary.anyKnown) return 'Σ — bps'
+  return `Σ ${summary.allKnown ? '' : '≥'}${formatBps(summary.total)} bps`
 }
 
 function formatUsd(usd: number): string {

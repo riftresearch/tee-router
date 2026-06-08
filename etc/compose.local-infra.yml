@@ -905,9 +905,6 @@ services:
       # Match the worker's ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS so the
       # Route Costs schedule timeline spans the real refresh window.
       ROUTE_COST_WINDOW_SECONDS: "1800"
-      # Upstream router-api base for the Route Graph visualizer proxy. The admin
-      # API key is injected by the devnet overlay.
-      ROUTER_INTERNAL_BASE_URL: http://router-api:4522
       BETTER_AUTH_SECRET: local-admin-dashboard-secret-000000
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
