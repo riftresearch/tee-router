@@ -50,6 +50,59 @@ const CANONICAL_PRICE_USD: Record<string, number> = {
   usdt: 1
 }
 
+// Example arbitrary ERC20s (not part of the curated graph) offered in the
+// From/To pickers so the visualizer can demonstrate the runtime Velora wrap:
+// the engine swaps the random token <-> an anchor canonical (USDC/USDT/ETH) on
+// its chain via Velora, then routes the rest through the cached graph. The
+// backend accepts any valid EVM token address here; these are just convenient
+// presets. `canonical` doubles as the display symbol.
+const EXAMPLE_ERC20S: RouteGraphNode[] = [
+  {
+    key: 'erc20:evm:1:pepe',
+    kind: 'external',
+    chain: 'evm:1',
+    asset: '0x6982508145454ce325ddbe47a25d4ec3d2311933',
+    canonical: 'pepe',
+    decimals: 18
+  },
+  {
+    key: 'erc20:evm:1:link',
+    kind: 'external',
+    chain: 'evm:1',
+    asset: '0x514910771af9ca656af840dff83e8264ecf986ca',
+    canonical: 'link',
+    decimals: 18
+  },
+  {
+    key: 'erc20:evm:1:shib',
+    kind: 'external',
+    chain: 'evm:1',
+    asset: '0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce',
+    canonical: 'shib',
+    decimals: 18
+  },
+  {
+    key: 'erc20:evm:8453:degen',
+    kind: 'external',
+    chain: 'evm:8453',
+    asset: '0x4ed4e862860bed51a9570b96d89af5e1b0efefed',
+    canonical: 'degen',
+    decimals: 18
+  },
+  {
+    key: 'erc20:evm:42161:arb',
+    kind: 'external',
+    chain: 'evm:42161',
+    asset: '0x912ce59144191c1204e64559fe8253a0e49e6548',
+    canonical: 'arb',
+    decimals: 18
+  }
+]
+
+const EXAMPLE_ERC20_BY_REF = new Map(
+  EXAMPLE_ERC20S.map((token) => [`${token.chain}:${token.asset}`, token])
+)
+
 // Left-to-right column ordering for the layered layout.
 const CHAIN_COLUMN_ORDER = [
   'bitcoin',
@@ -99,8 +152,9 @@ const EDGE_DEFAULT = '#3a423d'
 const EDGE_FAINT = '#52525b'
 // Top-3 ranking colors: #1 green, #2 amber, #3 orange. Lower ranks fall back to
 // a muted purple so they read as "also viable, but not in the top three".
-const RANK_COLORS = ['#34d399', '#fbbf24', '#fb923c']
-const RANK_FALLBACK = '#8b7fd6'
+// Best-route accent used on the graph. Only the winner is colored now (2nd/3rd
+// are intentionally not highlighted on the canvas); index 0 is the green accent.
+const RANK_COLORS = ['#34d399']
 
 type HighlightKind = 'winner' | 'top' | 'ranked' | 'none'
 
@@ -171,6 +225,20 @@ export function RouteGraphView() {
     [graph]
   )
 
+  // Core graph assets plus the example ERC20 presets; this is the full set of
+  // selectable From/To assets and the lookup table for node resolution/labels.
+  const selectableAssets = useMemo(
+    () => [...coreNodes, ...EXAMPLE_ERC20S],
+    [coreNodes]
+  )
+
+  // Nodes used for label resolution in the explain panel: the live graph nodes
+  // plus the example ERC20s (which the backend reports with an empty canonical).
+  const labelNodes = useMemo(
+    () => [...(graph?.nodes ?? []), ...EXAMPLE_ERC20S],
+    [graph]
+  )
+
   // Seed the from/to selects once the graph arrives.
   useEffect(() => {
     if (coreNodes.length === 0) return
@@ -186,8 +254,8 @@ export function RouteGraphView() {
   // Auto-fill the amount field from the tier + source asset whenever either
   // changes (the field stays editable for free-typing).
   const fromNode = useMemo(
-    () => coreNodes.find((node) => node.key === fromKey) ?? null,
-    [coreNodes, fromKey]
+    () => selectableAssets.find((node) => node.key === fromKey) ?? null,
+    [selectableAssets, fromKey]
   )
   useEffect(() => {
     if (!fromNode) return
@@ -229,7 +297,7 @@ export function RouteGraphView() {
   const runExplain = useCallback(
     async (live: boolean) => {
       if (!fromNode) return
-      const toNode = coreNodes.find((node) => node.key === toKey)
+      const toNode = selectableAssets.find((node) => node.key === toKey)
       if (!toNode) return
       setRanking(true)
       setExplainError(null)
@@ -250,7 +318,7 @@ export function RouteGraphView() {
         setRanking(false)
       }
     },
-    [fromNode, toKey, coreNodes, amountIn]
+    [fromNode, toKey, selectableAssets, amountIn]
   )
 
   const onRank = useCallback(() => runExplain(liveQuote), [runExplain, liveQuote])
@@ -312,21 +380,13 @@ export function RouteGraphView() {
         <label className="rg-field">
           <span>From</span>
           <select value={fromKey} onChange={(event) => setFromKey(event.target.value)}>
-            {coreNodes.map((node) => (
-              <option key={node.key} value={node.key}>
-                {nodeOptionLabel(node)}
-              </option>
-            ))}
+            <AssetOptions coreNodes={coreNodes} />
           </select>
         </label>
         <label className="rg-field">
           <span>To</span>
           <select value={toKey} onChange={(event) => setToKey(event.target.value)}>
-            {coreNodes.map((node) => (
-              <option key={node.key} value={node.key}>
-                {nodeOptionLabel(node)}
-              </option>
-            ))}
+            <AssetOptions coreNodes={coreNodes} />
           </select>
         </label>
         <label className="rg-toggle">
@@ -375,13 +435,17 @@ export function RouteGraphView() {
         {explain ? (
           <ExplainPanel
             explain={explain}
-            nodes={graph?.nodes ?? []}
+            nodes={labelNodes}
             bps={bpsByTransition}
           />
         ) : (
           <div className="route-graph-panel-hint">
             Pick a start and end asset and a tier — the graph redraws for that
-            source → destination automatically. Press <strong>Rank</strong> with{' '}
+            source → destination automatically. Try an{' '}
+            <strong>Example ERC20</strong> (PEPE, LINK, DEGEN…) as the source or
+            destination to see the runtime <strong>Velora</strong> wrap: the
+            token swaps to/from an anchor (USDC/USDT/ETH) on its chain, then
+            routes through the cached graph. Press <strong>Rank</strong> with{' '}
             <strong>Live quote</strong> on to fetch real per-path outputs and the
             best route. Edge labels show the venue and cached bps; Velora legs are
             live-priced and drawn dashed.
@@ -532,6 +596,29 @@ function ExplainPanel({
   )
 }
 
+// From/To picker contents: core graph assets, then the example ERC20 presets
+// in their own group so they read as a separate "arbitrary token" demo.
+function AssetOptions({ coreNodes }: { coreNodes: RouteGraphNode[] }) {
+  return (
+    <>
+      <optgroup label="Core assets">
+        {coreNodes.map((node) => (
+          <option key={node.key} value={node.key}>
+            {nodeOptionLabel(node)}
+          </option>
+        ))}
+      </optgroup>
+      <optgroup label="Example ERC20s (Velora wrap)">
+        {EXAMPLE_ERC20S.map((node) => (
+          <option key={node.key} value={node.key}>
+            {nodeOptionLabel(node)}
+          </option>
+        ))}
+      </optgroup>
+    </>
+  )
+}
+
 function Stat({ label, value }: { label: string; value: number }) {
   return (
     <div className="rg-stat">
@@ -546,15 +633,7 @@ function ColumnLegend() {
     <div className="route-graph-legend">
       <span className="rg-legend-item">
         <i style={{ background: RANK_COLORS[0] }} />
-        best
-      </span>
-      <span className="rg-legend-item">
-        <i style={{ background: RANK_COLORS[1] }} />
-        2nd
-      </span>
-      <span className="rg-legend-item">
-        <i style={{ background: RANK_COLORS[2] }} />
-        3rd
+        best route
       </span>
       <span className="rg-legend-sep" />
       {Object.entries(PROVIDER_LABEL).map(([provider, label]) => (
@@ -700,8 +779,9 @@ function layoutExplainNodes(graph: RouteExplainGraph): Node[] {
 }
 
 // Edges for the candidate subgraph: labeled with the venue (+ cached bps when
-// available), colored by the best rank traversing them (top-3 green/amber/
-// orange), with the single best path emphasized.
+// available). Only the single best route is emphasized (green, thick,
+// animated); every other edge - including the 2nd/3rd ranked routes - is drawn
+// as a faint corridor edge so the winner is not lost in a tangle of overlays.
 function buildExplainEdges(
   graph: RouteExplainGraph,
   bps: Map<string, number>,
@@ -710,7 +790,8 @@ function buildExplainEdges(
   return graph.edges.map((edge) => {
     const isVelora = edge.provider === 'velora'
     const info = ranks.get(edge.id)
-    const color = info ? rankColor(info.rank) : EDGE_FAINT
+    const isBest = info?.isBest ?? false
+    const color = isBest ? RANK_COLORS[0] : EDGE_FAINT
     const venue = providerLabel(edge.provider)
     const bpsValue = bps.get(edge.id)
     const label = isVelora
@@ -718,24 +799,19 @@ function buildExplainEdges(
       : bpsValue !== undefined
         ? `${venue} · ${formatBps(bpsValue)} bps`
         : venue
-    const inTop3 = info !== undefined && info.rank <= 3
-    // Three visual tiers so the engine's real routes pop against the full
-    // corridor topology: top-3 colored routes, other ranked routes (muted),
-    // and non-route corridor edges (faint gray).
-    const opacity = inTop3 ? 1 : info ? 0.6 : 0.35
     return {
       id: edge.id,
       source: edge.from,
       target: edge.to,
       label,
-      animated: info?.isBest ?? false,
+      animated: isBest,
       style: {
         stroke: color,
-        strokeWidth: info?.isBest ? 3.5 : inTop3 ? 2.5 : 1.5,
+        strokeWidth: isBest ? 3.5 : 1.5,
         strokeDasharray: isVelora ? '6 4' : undefined,
-        opacity
+        opacity: isBest ? 1 : 0.35
       },
-      labelStyle: { fill: '#dfe6e2', fontSize: 10, fontWeight: inTop3 ? 600 : 400 },
+      labelStyle: { fill: '#dfe6e2', fontSize: 10, fontWeight: isBest ? 600 : 400 },
       labelBgStyle: { fill: '#0f1311' },
       labelBgPadding: [3, 2] as [number, number],
       markerEnd: { type: MarkerType.ArrowClosed, color, width: 14, height: 14 }
@@ -769,10 +845,6 @@ function bestPathIdFor(explain: RouteExplain): string | null {
   return explain.ranked.find((path) => path.rank === 1)?.path_id ?? null
 }
 
-function rankColor(rank: number): string {
-  return RANK_COLORS[rank - 1] ?? RANK_FALLBACK
-}
-
 function providerColor(provider: string): string {
   return PROVIDER_COLOR[provider] ?? '#cbd5d1'
 }
@@ -797,7 +869,21 @@ function explainNodeLabel(node: RouteExplainGraphNode): string {
     return `${node.canonical.toUpperCase()}\n${venue}`
   }
   const chainLabel = CHAIN_LABELS[node.chain] ?? node.chain
-  return `${node.canonical.toUpperCase()}\n${chainLabel}`
+  const symbol = node.canonical
+    ? node.canonical.toUpperCase()
+    : erc20DisplaySymbol(node.chain, node.asset)
+  return `${symbol}\n${chainLabel}`
+}
+
+// Display symbol for a non-canonical token: a known example ERC20's symbol, or
+// a truncated address fallback for anything else the user might enter.
+function erc20DisplaySymbol(chain: string, asset: string): string {
+  const known = EXAMPLE_ERC20_BY_REF.get(`${chain}:${asset}`)
+  if (known) return known.canonical.toUpperCase()
+  if (asset.startsWith('0x') && asset.length > 10) {
+    return `${asset.slice(0, 6)}…${asset.slice(-4)}`
+  }
+  return asset.toUpperCase()
 }
 
 function nodeOptionLabel(node: RouteGraphNode): string {
@@ -812,7 +898,10 @@ function assetDisplayLabel(
   const match = nodes.find(
     (node) => node.chain === asset.chain && node.asset === asset.asset
   )
-  const canonical = match ? match.canonical.toUpperCase() : asset.asset
+  const canonical =
+    match && match.canonical
+      ? match.canonical.toUpperCase()
+      : erc20DisplaySymbol(asset.chain, asset.asset)
   const chainLabel = CHAIN_LABELS[asset.chain] ?? asset.chain
   return `${canonical} · ${chainLabel}`
 }

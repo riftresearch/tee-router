@@ -127,6 +127,11 @@ services:
       CCTP_PROXY_URL: ${CCTP_PROXY_URL:-}
       HYPERLIQUID_PROXY_URL: ${HYPERLIQUID_PROXY_URL:-}
       VELORA_PROXY_URL: ${VELORA_PROXY_URL:-}
+      # When PRODUCTION=true these are required (OFAC address screening); when
+      # PRODUCTION=false they may be empty and screening is skipped.
+      PRODUCTION: ${PRODUCTION:-true}
+      CHAINALYSIS_HOST: ${CHAINALYSIS_HOST:-}
+      CHAINALYSIS_TOKEN: ${CHAINALYSIS_TOKEN:-}
       CHAINALYSIS_PROXY_URL: ${CHAINALYSIS_PROXY_URL:-}
       COINBASE_PROXY_URL: ${COINBASE_PROXY_URL:-}
       HYPERLIQUID_API_URL: ${HYPERLIQUID_API_URL:-https://api.hyperliquid.xyz}

@@ -3,7 +3,7 @@
 > Canonical end-to-end description of the route-cost caching, refreshing,
 > quoting, and visual-debugging stack. Keep it updated as the system changes.
 >
-> Last updated: 2026-06-07.
+> Last updated: 2026-06-08.
 
 ---
 
@@ -39,9 +39,14 @@ to the curated route tables.
 measured cost row, sampled **bidirectionally**. The BFS/routing graph is broader;
 the allowlist only narrows what gets a cost row.
 
-- **Across**: `USDT`, `USDC`, `ETH` between `ETH` / `BASE` / `ARB`.
+- **Across**: `USDC`, `ETH` between `ETH` / `BASE` / `ARB`; `USDT` between `ETH` /
+  `BASE` only (Across has no usable USDT liquidity on Arbitrum, so USDT legs that
+  touch `ARB` are excluded from the cache).
 - **CCTP**: `USDC` between `ETH` / `BASE` / `ARB`.
 - **Unit**: `HL.uETH <-> ETH.ETH`, `HL.uBTC <-> BTC.BTC`.
+- **Hyperliquid bridge**: `ARB.USDC <-> HL.USDC` (native USDC bridge).
+- **Hyperliquid spot**: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`. `HYPE`
+  spot legs are not curated (no live USD reference price for value-loss bps).
 - **Velora** (same-chain): `USDC <-> USDT` on `ETH` / `BASE` / `ARB`.
 
 The anchor assets used for the arbitrary-ERC20 wrap (Section 6) are `USDC`,
@@ -104,7 +109,10 @@ flowchart LR
   tick["worker tick (window/total_units, clamped 1-15s)"] --> due["refresh_due_costs(window)"]
   due --> plan["bucket curated units by provider"]
   plan --> claim["claim_due_units: per-provider deadline pacing (<=1 unit/provider/tick)"]
-  claim --> sample["sample_and_store_units (<=16 concurrent)"]
+  due --> retry["claim_due_retries (<= MAX_RETRIES_PER_TICK)"]
+  claim --> merge["merge + dedupe by (transition, tier)"]
+  retry --> merge
+  merge --> sample["sample_and_store_units (<=16 concurrent)"]
   sample --> upsert["upsert_many -> router_route_cost_snapshots"]
 ```
 
@@ -131,26 +139,73 @@ flowchart LR
 
 A single refresh error does not crash the worker: `run_route_cost_refresh` errors
 are logged at `warn!` and the loop continues. A failed `(tier, transition)` cell
-writes no row and is retried next sweep.
+writes no row.
+
+### Benign skips (not failures)
+
+Some provider responses are expected non-results rather than failures - they
+just mean the sampled tier notional is too large for the venue at that size.
+These are recorded with the `skipped` outcome instead of `failed`:
+
+- Hyperliquid spot orderbook-depth exhaustion (`book side could not absorb ...`,
+  `empty book side`).
+- Across `AMOUNT_TOO_HIGH` (HTTP 400; notional exceeds the route cap).
+- A swap venue (Velora / HL spot) returning no route at this size - it cannot
+  fill the sampled notional (insufficient liquidity).
+
+The first two are matched by `is_benign_unsatisfiable_amount(reason)`; the
+no-route case is the exchange sampler's `None` arm. Skipped samples write no
+cost row, are shown neutrally in the activity feed (not in the failures panel or
+category counts), and are **not** retried out of band: retrying the same
+oversized tier cannot succeed, so the next paced sweep is the only re-sample.
+
+### Failure classification and intelligent retry
+
+Every failed sample is classified by `classify_failure(reason)` into a
+`FailureCategory` (`rate_limited`, `timeout`, `no_route`, `upstream_server`,
+`upstream_client`, `other`) from heuristics on the provider error string. The
+category is persisted on the sample event (`failure_category` column) and surfaces
+in the dashboard failures log.
+
+Rather than wait for the next ~30-minute sweep, failures are re-attempted out of
+band via an in-memory retry queue on `RouteCostService` (`retry_queue`, keyed by
+`(transition_id, tier_label)`):
+
+- On failure, `reschedule_failures` (re)inserts the cell with
+  `due_at = now + retry_delay(attempts, category)` and increments `attempts`;
+  success or a non-attemptable outcome removes the cell. After
+  `RETRY_MAX_ATTEMPTS` (5) the entry is dropped and the normal paced sweep is the
+  backstop.
+- `retry_delay` is exponential (`base * 2^(attempts-1)`, clamped). Ordinary
+  failures use `20s` base / `5m` cap; **rate-limited** failures back off harder
+  (`60s` base / `10m` cap) so retries do not amplify provider throttling.
+- Each tick, `refresh_due_costs` drains up to `MAX_RETRIES_PER_TICK` (8) due
+  entries, merges them with the paced chunk (deduped by cell), and samples them in
+  the same fanout-bounded (`<=16`) pass. Retry granularity therefore tracks the
+  1-15s tick rather than the window length.
+
+The retry queue is in-memory only; a worker restart simply falls back to the paced
+sweep. Retried attempts emit normal sample events, so a fail-then-succeed pair is
+visible in the activity feed.
 
 ### What a sample sends
 
 For each cell, `live_cost_snapshot` dispatches by transition kind:
 
-- **Bridges** (`AcrossBridge`, `CctpBridge`, HL bridges) → `quote_bridge` at the
-  tier size; the value loss between `amount_in` and `amount_out` (in USD micros
-  via the pricing snapshot) becomes the fee bps.
-- **Velora** (`UniversalRouterSwap`) → `ExchangeProvider::quote_trade` for the
-  curated same-chain pair; value loss recorded as bps.
+- **Bridges** (`AcrossBridge`, `CctpBridge`, `HyperliquidBridgeDeposit` /
+  `HyperliquidBridgeWithdrawal`) → `quote_bridge` at the tier size; the value
+  loss between `amount_in` and `amount_out` (in USD micros via the pricing
+  snapshot) becomes the fee bps.
+- **Exchange swaps** (`UniversalRouterSwap` Velora, `HyperliquidTrade` HL spot)
+  → `ExchangeProvider::quote_trade` (`live_exchange_cost_snapshot`); value loss
+  between the input and the exchange `amount_out` recorded as bps. The provider
+  is resolved by the leg's provider id (`velora` / `hyperliquid_spot`).
 - **Unit** (`UnitDeposit` / `UnitWithdrawal`) → Hyperunit `/v2/estimate-fees`;
   bps = `fee_native * 10_000 / sample_amount_native`.
 
 Samples use fixed dummy depositor/recipient addresses and `min_amount_out = "1"`,
 so cached fees are mildly optimistic versus a real user quote. This affects path
 **selection** only, never the returned `estimated_amount_out`.
-
-`HyperliquidTrade` has no live sampler; it is priced only by the request-time
-fanout.
 
 ---
 
@@ -188,6 +243,12 @@ flowchart TB
   Best --> Resp["return quote"]
 ```
 
+0. Validate/normalize the request. Quotes whose normalized source and
+   destination are the **same asset on the same chain** (e.g. BTC -> BTC) are
+   rejected up front (`InvalidRouting`, HTTP 400) - there is nothing to route,
+   and path enumeration would otherwise surface nonsensical bridge-out-and-back
+   round-trips. (Same canonical across different chains, e.g. `ETH.USDC ->
+   BASE.USDC`, is still a valid cross-chain route.)
 1. Convert `amount_in` to USD micros via the live pricing snapshot (falls back to
    `$1k` if pricing is missing).
 2. Pick the tier (round up).
@@ -223,7 +284,7 @@ API surface
 | Endpoint | Source | Used by |
 | --- | --- | --- |
 | `GET /api/route-costs` | `router_route_cost_snapshots` (replica) | Route Costs tab |
-| `GET /api/route-cost-events` | `router_route_cost_sample_events` (replica) | activity log + schedule timeline |
+| `GET /api/route-cost-events` | `router_route_cost_sample_events` (replica) | activity log + schedule timeline + failures panel |
 | `GET /api/route-graph` | router internal API | Route Graph tab |
 | `POST /api/route-explain` | router internal API | Route Graph ranking/demo |
 
@@ -236,6 +297,13 @@ Each venue header shows `<routes> routes · <tiers> price tiers · <grid> cells
 (<cached> cached)` where `grid = routes x tiers`. The page also renders a
 per-provider **refresh-schedule timeline** across the window and a **live
 activity log**, both from `/api/route-cost-events`.
+
+Below those, a **sampling failures panel** (`RouteCostFailuresPanel`) summarizes
+failures in the window: a per-category badge row (counts per `FailureCategory`,
+rate-limited called out most prominently) and a newest-first list of failed
+samples showing provider, asset pair, tier, a category badge, and the raw provider
+reason. Categories come from the persisted `failure_category` and drive both this
+view and the worker's retry backoff (see §5).
 
 ### Route Graph tab
 
@@ -299,6 +367,9 @@ Implemented in `crates/devnet/src/mock_integrators.rs`
 | `route_cost_pacing_tick` | [`worker.rs`](../bin/router-server/src/worker.rs) | `(window/total_units).clamp(1s,15s)`; sizes the tick so each provider advances <=1 unit per tick. |
 | `REFRESH_FANOUT_PERMITS` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`16`) | Max concurrent provider calls per tick. |
 | `DEFAULT_REFRESH_TTL` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`600s`) | Row expiry. |
+| `RETRY_MAX_ATTEMPTS` / `MAX_RETRIES_PER_TICK` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`5` / `8`) | Retry-queue give-up bound / max due retries folded into one tick. |
+| `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`20s` / `5m`) | Exponential backoff base/cap for ordinary failures. |
+| `RETRY_RATE_LIMITED_BASE_DELAY` / `RETRY_RATE_LIMITED_MAX_DELAY` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`60s` / `10m`) | Harder backoff base/cap for rate-limited failures. |
 | `CONFIDENCE_BAND_BPS` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`1_000` = 10%) | Cost band width around the leader for fanout. |
 | `CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS` | same file (`$10k`) | Above this, band widens for non-live-refreshed legs. |
 | `TOP_K_PATHS` / `MAX_PATH_DEPTH` | [`order_manager.rs`](../bin/router-server/src/services/order_manager.rs) (`8` / `5`) | Ranked-candidate cap / BFS depth. |
@@ -326,11 +397,15 @@ Implemented in `crates/devnet/src/mock_integrators.rs`
 
 ## 12. Known limitations
 
-- `HyperliquidTrade` and HL bridge legs have no live sampler, so they always show
-  as uncached (`—`) in the dashboard and are priced only by the request-time
-  fanout.
+- `HYPE` Hyperliquid spot legs are not curated (no live USD reference price for
+  value-loss bps), so they show as uncached (`—`) and are priced only by the
+  request-time fanout. Other HL spot pairs (`USDC <-> uBTC/uETH`) and the native
+  USDC bridge are now sampled and cached.
 - Limit orders and the temporal boundary requote pin to a fixed `$1k` anchor and
   skip the fanout.
+- The retry queue is in-memory; a worker restart drops pending retries and falls
+  back to the paced sweep. `classify_failure` is heuristic on provider error
+  strings, so categories are best-effort.
 
 ---
 

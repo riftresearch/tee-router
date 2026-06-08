@@ -626,6 +626,24 @@ impl AssetRegistry {
         dedupe_transition_declarations(declarations)
     }
 
+    /// Same as [`Self::display_transition_declarations`], but also includes the
+    /// runtime Velora wrap edges for a specific `source`/`destination` pair.
+    /// Used by the route-explain corridor so arbitrary ERC20 endpoints (which
+    /// are not part of the static graph) still render their live Velora in/out
+    /// legs to the anchor canonicals (`USDC`/`USDT`/`ETH`) on their chain.
+    #[must_use]
+    pub fn display_transition_declarations_for(
+        &self,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> Vec<TransitionDecl> {
+        let mut declarations = self.display_transition_declarations();
+        let start = self.source_node_for_asset(source);
+        let goal = MarketOrderNode::External(destination.clone());
+        declarations.extend(self.runtime_velora_transition_declarations(&start, &goal));
+        dedupe_transition_declarations(declarations)
+    }
+
     /// Explicit curated set of transitions the route-cost refresher is allowed
     /// to live-sample and persist. This is intentionally narrower than
     /// [`Self::transition_declarations`]: it does **not** affect the routing
@@ -634,16 +652,19 @@ impl AssetRegistry {
     /// set is left uncached on purpose - no structural estimates are written.
     ///
     /// Curated set (bidirectional):
-    /// - Across: `*.USDT`, `*.USDC`, `*.ETH` across `ETH`/`BASE`/`ARB`
+    /// - Across: `*.USDC`, `*.ETH` across `ETH`/`BASE`/`ARB`; `*.USDT` across
+    ///   `ETH`/`BASE` only (Across has no usable USDT liquidity on Arbitrum)
     /// - CCTP: `*.USDC` across `ETH`/`BASE`/`ARB`
     /// - Unit: `HL.uETH <-> ETH.ETH`, `HL.uBTC <-> BTC.BTC`
+    /// - Hyperliquid bridge: `ARB.USDC <-> HL.USDC` (native USDC bridge)
+    /// - Hyperliquid spot: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`
     /// - Velora (same-chain): `USDC <-> USDT` on `ETH`/`BASE`/`ARB`
     #[must_use]
     pub fn curated_cacheable_transitions(&self) -> Vec<TransitionDecl> {
         let mut out: Vec<TransitionDecl> = self
             .transition_declarations()
             .into_iter()
-            .filter(|decl| self.is_curated_bridge_or_unit_transition(decl))
+            .filter(|decl| self.is_curated_static_transition(decl))
             .collect();
 
         for (chain, canonical_a, canonical_b) in CURATED_VELORA_SWAP_PAIRS {
@@ -688,7 +709,7 @@ impl AssetRegistry {
             .map(ChainAsset::deposit_asset)
     }
 
-    fn is_curated_bridge_or_unit_transition(&self, decl: &TransitionDecl) -> bool {
+    fn is_curated_static_transition(&self, decl: &TransitionDecl) -> bool {
         match decl.kind {
             MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => {
                 // Both endpoints share the canonical (same-asset cross-chain
@@ -697,6 +718,15 @@ impl AssetRegistry {
                 let Some(canonical) = self.canonical_for(&decl.input.asset) else {
                     return false;
                 };
+                // Across has no USDT liquidity on Arbitrum; never cache USDT
+                // legs that touch it (ETH.USDT <-> BASE.USDT remains curated).
+                if decl.provider == ProviderId::Across
+                    && canonical == CanonicalAsset::Usdt
+                    && (decl.input.asset.chain.as_str() == "evm:42161"
+                        || decl.output.asset.chain.as_str() == "evm:42161")
+                {
+                    return false;
+                }
                 CURATED_TRIO_BRIDGE_ROUTES.contains(&(decl.provider, canonical))
                     && is_curated_l2_trio_pair(
                         decl.input.asset.chain.as_str(),
@@ -716,7 +746,28 @@ impl AssetRegistry {
                 };
                 CURATED_UNIT_ROUTES.contains(&(external.chain.as_str(), canonical))
             }
-            _ => false,
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                // Hyperliquid's native USDC bridge (Arbitrum <-> Hyperliquid).
+                // These are quoted live via `quote_bridge`, so cache them too;
+                // the declaration is already constrained to the supported
+                // corridor, so any declared HL bridge leg is curated.
+                true
+            }
+            MarketOrderTransitionKind::HyperliquidTrade => {
+                // Hyperliquid spot trades quoted via the spot exchange. Cache
+                // the priced curated pairs (USDC <-> BTC/ETH) only; skip the
+                // venue<->external identity edges (same canonical on both sides)
+                // and HYPE legs (no live USD price for value-loss bps).
+                let (Some(input), Some(output)) = (
+                    self.canonical_for(&decl.input.asset),
+                    self.canonical_for(&decl.output.asset),
+                ) else {
+                    return false;
+                };
+                input != output && is_curated_hyperliquid_trade_pair(input, output)
+            }
+            MarketOrderTransitionKind::UniversalRouterSwap => false,
         }
     }
 
@@ -1169,6 +1220,17 @@ fn is_curated_l2_trio_pair(a: &str, b: &str) -> bool {
     a != b && CURATED_L2_TRIO_CHAINS.contains(&a) && CURATED_L2_TRIO_CHAINS.contains(&b)
 }
 
+/// Curated Hyperliquid spot trade pairs (bidirectional) the refresher samples.
+/// Both sides are USD-priced canonicals so the value-loss bps is well-defined;
+/// HYPE is intentionally excluded (no live USD reference price).
+fn is_curated_hyperliquid_trade_pair(a: CanonicalAsset, b: CanonicalAsset) -> bool {
+    use CanonicalAsset::{Btc, Eth, Usdc};
+    matches!(
+        (a, b),
+        (Usdc, Btc) | (Btc, Usdc) | (Usdc, Eth) | (Eth, Usdc)
+    )
+}
+
 fn builtin_chain_assets() -> Vec<ChainAsset> {
     // Router-known external/venue assets. Adding a new asset to routing begins
     // by registering its canonical identity and chain-local representation
@@ -1544,7 +1606,7 @@ mod tests {
         let curated = registry.curated_cacheable_transitions();
         assert!(!curated.is_empty(), "curated set must not be empty");
 
-        // Every curated transition is one of the four allowed venue kinds.
+        // Every curated transition is one of the allowed venue kinds.
         for decl in &curated {
             assert!(
                 matches!(
@@ -1554,6 +1616,9 @@ mod tests {
                         | MarketOrderTransitionKind::UnitDeposit
                         | MarketOrderTransitionKind::UnitWithdrawal
                         | MarketOrderTransitionKind::UniversalRouterSwap
+                        | MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                        | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+                        | MarketOrderTransitionKind::HyperliquidTrade
                 ),
                 "unexpected curated kind {:?} ({})",
                 decl.kind,
@@ -1580,6 +1645,24 @@ mod tests {
             "evm:42161",
             "evm:8453"
         ));
+        // Across USDT is curated on ETH<->BASE but never on Arbitrum (no
+        // usable USDT liquidity there), in either direction.
+        assert!(curated.iter().all(|decl| {
+            if decl.kind != MarketOrderTransitionKind::AcrossBridge
+                || registry.canonical_for(&decl.input.asset) != Some(CanonicalAsset::Usdt)
+            {
+                return true;
+            }
+            decl.input.asset.chain.as_str() != "evm:42161"
+                && decl.output.asset.chain.as_str() != "evm:42161"
+        }));
+        assert!(curated.iter().any(|decl| {
+            decl.kind == MarketOrderTransitionKind::AcrossBridge
+                && registry.canonical_for(&decl.input.asset) == Some(CanonicalAsset::Usdt)
+                && decl.input.asset.chain.as_str() == "evm:1"
+                && decl.output.asset.chain.as_str() == "evm:8453"
+        }));
+
         // CCTP USDC trio.
         assert!(has(MarketOrderTransitionKind::CctpBridge, "evm:1", "evm:8453"));
         // Same-chain Velora swaps are present bidirectionally.
@@ -1594,12 +1677,36 @@ mod tests {
             MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal
         )));
 
-        // Nothing outside the curated set leaks in: no Hyperliquid trade or
-        // HL/Hypercore bridge legs, and no bridge between non-trio chains.
+        // Hyperliquid's native USDC bridge is curated in both directions.
+        assert!(curated.iter().any(|decl| decl.kind
+            == MarketOrderTransitionKind::HyperliquidBridgeDeposit));
+        assert!(curated.iter().any(|decl| decl.kind
+            == MarketOrderTransitionKind::HyperliquidBridgeWithdrawal));
+
+        // Hyperliquid spot trades are curated for the priced USDC<->BTC/ETH
+        // pairs (bidirectional).
+        let curated_trade = |a: CanonicalAsset, b: CanonicalAsset| {
+            curated.iter().any(|decl| {
+                decl.kind == MarketOrderTransitionKind::HyperliquidTrade
+                    && registry.canonical_for(&decl.input.asset) == Some(a)
+                    && registry.canonical_for(&decl.output.asset) == Some(b)
+            })
+        };
+        assert!(curated_trade(CanonicalAsset::Usdc, CanonicalAsset::Btc));
+        assert!(curated_trade(CanonicalAsset::Btc, CanonicalAsset::Usdc));
+        assert!(curated_trade(CanonicalAsset::Usdc, CanonicalAsset::Eth));
+        assert!(curated_trade(CanonicalAsset::Eth, CanonicalAsset::Usdc));
+
+        // HYPE spot trades and venue<->external identity edges never leak in.
         assert!(curated.iter().all(|decl| {
-            decl.kind != MarketOrderTransitionKind::HyperliquidTrade
-                && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+            if decl.kind != MarketOrderTransitionKind::HyperliquidTrade {
+                return true;
+            }
+            let input = registry.canonical_for(&decl.input.asset);
+            let output = registry.canonical_for(&decl.output.asset);
+            input != output
+                && input != Some(CanonicalAsset::Hype)
+                && output != Some(CanonicalAsset::Hype)
         }));
     }
 

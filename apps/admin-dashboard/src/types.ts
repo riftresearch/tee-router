@@ -363,7 +363,15 @@ export type RouteCostsResponse = {
   fetchedAt: string
 }
 
-export type RouteCostSampleOutcome = 'succeeded' | 'failed'
+export type RouteCostSampleOutcome = 'succeeded' | 'failed' | 'skipped'
+
+export type RouteCostFailureCategory =
+  | 'rate_limited'
+  | 'timeout'
+  | 'no_route'
+  | 'upstream_server'
+  | 'upstream_client'
+  | 'other'
 
 export type RouteCostSampleEvent = {
   id: string
@@ -379,6 +387,7 @@ export type RouteCostSampleEvent = {
   estimatedFeeBps: number | null
   estimatedLatencyMs: number | null
   reason: string | null
+  failureCategory: RouteCostFailureCategory | null
 }
 
 export type RouteCostEventsResponse = {

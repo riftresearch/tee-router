@@ -1044,6 +1044,7 @@ impl OrderManager {
         validate_positive_amount("amount_in", &request.amount_in)?;
         let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
         let destination_asset = self.validate_and_normalize_asset(&request.to_asset)?;
+        ensure_distinct_source_and_destination(&source_asset, &destination_asset)?;
 
         let bfs_started = Instant::now();
         let mut paths = self.asset_registry.select_transition_paths(
@@ -1215,8 +1216,13 @@ impl OrderManager {
             destination.asset.as_str()
         );
 
-        // Full display edge universe keyed by node, in both directions.
-        let declarations = self.asset_registry.display_transition_declarations();
+        // Full display edge universe keyed by node, in both directions. Uses
+        // the endpoint-aware variant so arbitrary ERC20 source/destination
+        // assets contribute their runtime Velora wrap edges (ERC20 <-> anchor),
+        // letting the corridor draw the Velora in/out legs the engine would use.
+        let declarations = self
+            .asset_registry
+            .display_transition_declarations_for(source, destination);
         let mut forward: HashMap<String, Vec<String>> = HashMap::new();
         let mut backward: HashMap<String, Vec<String>> = HashMap::new();
         let mut node_meta: HashMap<String, RouteExplainGraphNode> = HashMap::new();
@@ -2666,6 +2672,7 @@ impl OrderManager {
         validate_positive_amount("amount_in", &request.amount_in)?;
         let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
         let destination_asset = self.validate_and_normalize_destination_asset(&request.to_asset)?;
+        ensure_distinct_source_and_destination(&source_asset, &destination_asset)?;
         // Quotes are recipient-agnostic: the recipient is validated/normalized
         // on the order path, not here.
         let routing = validate_and_normalize_quote_routing(routing)?;
@@ -2685,6 +2692,7 @@ impl OrderManager {
         validate_positive_amount("output_amount", &request.output_amount)?;
         let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
         let destination_asset = self.validate_and_normalize_destination_asset(&request.to_asset)?;
+        ensure_distinct_source_and_destination(&source_asset, &destination_asset)?;
         let source_canonical = self
             .asset_registry
             .canonical_for(&source_asset)
@@ -3939,6 +3947,26 @@ fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResu
     Ok(())
 }
 
+/// Reject requests whose normalized source and destination are the exact same
+/// asset on the same chain (e.g. BTC.Bitcoin -> BTC.Bitcoin). There is nothing
+/// to route: path enumeration would otherwise surface nonsensical round-trips
+/// (bridge out and back to the starting asset) instead of a no-op.
+fn ensure_distinct_source_and_destination(
+    source: &DepositAsset,
+    destination: &DepositAsset,
+) -> MarketOrderResult<()> {
+    if source == destination {
+        return Err(MarketOrderError::InvalidRouting {
+            reason: format!(
+                "source and destination are the same asset ({}.{}); nothing to route",
+                source.chain.as_str(),
+                source.asset.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Dust floors per canonical destination asset — the smallest output below
 /// which a market order isn't economically viable (the fees would eat it).
 const ROUTE_OUTPUT_FLOOR_BTC_SATS: u64 = 30_000;
@@ -4073,6 +4101,19 @@ mod tests {
             asset,
         }
     }
+    #[test]
+    fn rejects_identical_source_and_destination_asset() {
+        let btc = floor_asset("bitcoin", AssetId::Native);
+        let error = ensure_distinct_source_and_destination(&btc, &btc)
+            .expect_err("BTC -> BTC must be rejected");
+        assert!(matches!(error, MarketOrderError::InvalidRouting { .. }));
+
+        // Same canonical on different chains is a legitimate cross-chain route.
+        let eth_usdc = floor_asset("evm:1", AssetId::reference("0xa0b8"));
+        let base_usdc = floor_asset("evm:8453", AssetId::reference("0xa0b8"));
+        assert!(ensure_distinct_source_and_destination(&eth_usdc, &base_usdc).is_ok());
+    }
+
     #[test]
     fn hyperliquid_spot_assets_are_valid_as_source_and_destination() {
         let ubtc = floor_asset("hyperliquid", AssetId::reference("UBTC"));

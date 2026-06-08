@@ -599,11 +599,16 @@ function isRouteCostSampleEvent(value: unknown): value is RouteCostSampleEvent {
     isAssetRef(value.source) &&
     isAssetRef(value.destination) &&
     typeof value.sampleAmountUsdMicros === 'number' &&
-    (value.outcome === 'succeeded' || value.outcome === 'failed') &&
+    (value.outcome === 'succeeded' ||
+      value.outcome === 'failed' ||
+      value.outcome === 'skipped') &&
     (value.estimatedFeeBps === null || typeof value.estimatedFeeBps === 'number') &&
     (value.estimatedLatencyMs === null ||
       typeof value.estimatedLatencyMs === 'number') &&
-    (value.reason === null || typeof value.reason === 'string')
+    (value.reason === null || typeof value.reason === 'string') &&
+    (value.failureCategory === null ||
+      value.failureCategory === undefined ||
+      typeof value.failureCategory === 'string')
   )
 }
 
