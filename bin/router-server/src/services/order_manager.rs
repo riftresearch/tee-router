@@ -1119,6 +1119,12 @@ impl OrderManager {
 
         let mut outcomes: Vec<LiveQuoteOutcome> = Vec::with_capacity(band_results.len());
         let mut survivors: Vec<ComposedMarketOrderQuote> = Vec::with_capacity(band_results.len());
+        // Per-survivor path + latency, kept so we can emit a single
+        // quote-candidate for the WINNING multi-hop path. The multi-hop router
+        // contributes only its best candidate; single-hop contributes all of
+        // its venue candidates (in best_single_hop_provider_quote).
+        let mut survivor_paths: Vec<&TransitionPath> = Vec::with_capacity(band_results.len());
+        let mut survivor_latencies: Vec<Duration> = Vec::with_capacity(band_results.len());
         let mut candidates = include_candidates.then(Vec::new);
         let mut last_error: Option<MarketOrderError> = None;
         for ((candidate, latency), path) in band_results.into_iter().zip(band_paths.iter()) {
@@ -1135,15 +1141,6 @@ impl OrderManager {
                 last_error = Some(err);
                 continue;
             }
-            if let Some(list) = candidates.as_mut() {
-                list.push(quote_candidate_success(
-                    QuoteCandidateFamily::MultiHop,
-                    quote_candidate_path_label(path),
-                    quote_candidate_path_venues(path),
-                    latency,
-                    &quote,
-                ));
-            }
             let estimated_amount_out =
                 U256::from_str(&quote.estimated_amount_out).unwrap_or_default();
             outcomes.push(LiveQuoteOutcome {
@@ -1152,6 +1149,8 @@ impl OrderManager {
                 hop_count: path.transitions.len(),
                 estimated_amount_out,
             });
+            survivor_paths.push(*path);
+            survivor_latencies.push(latency);
             survivors.push(quote);
         }
 
@@ -1168,6 +1167,17 @@ impl OrderManager {
         let winning_index = select_best_quote(&outcomes).unwrap_or(0);
         let winning_outcome = outcomes[winning_index].clone();
         let chosen = survivors[winning_outcome.quote_index].clone();
+        // Multi-hop contributes exactly ONE quote-candidate: the winning path.
+        if let Some(list) = candidates.as_mut() {
+            let winning_path = survivor_paths[winning_outcome.quote_index];
+            list.push(quote_candidate_success(
+                QuoteCandidateFamily::MultiHop,
+                quote_candidate_path_label(winning_path),
+                quote_candidate_path_venues(winning_path),
+                survivor_latencies[winning_outcome.quote_index],
+                &chosen,
+            ));
+        }
         if let Some(leader_outcome) = outcomes.first() {
             if leader_outcome.path_id != winning_outcome.path_id {
                 telemetry::record_route_select_best_path_not_leader();
