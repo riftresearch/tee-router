@@ -22,13 +22,13 @@ use devnet::mock_integrators::MockHyperliquidBridge2::MockHyperliquidBridge2Inst
 use devnet::mock_integrators::{MockIntegratorConfig, MockIntegratorServer};
 use devnet::{HyperliquidNode, HyperliquidNodeConfig, RiftDevnet};
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
-use serde_json::{json, Value};
 use hyperliquid_client::{
     client::Network, CancelRequest, ClearinghouseState, HyperliquidClient,
     HyperliquidExchangeClient, HyperliquidInfoClient, Limit, Order, OrderRequest,
     SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
     UserNonFundingLedgerUpdate, MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
+use serde_json::{json, Value};
 use std::time::Duration;
 use url::Url;
 
@@ -38,14 +38,16 @@ const UETH_USDC: &str = "UETH/USDC";
 /// Spin up a fresh node + a testnet-mode client whose wallet has the given
 /// initial spot balances pre-credited.
 async fn fixture(balances: &[(&str, f64)]) -> (HyperliquidNode, HyperliquidClient, Address) {
-    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
+    let node = HyperliquidNode::spawn()
+        .await
+        .expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let address = wallet.address();
     for (coin, amount) in balances {
         node.seed_spot(address, coin, *amount).await;
     }
-    let mut client =
-        HyperliquidClient::new(&node.url(), wallet, None, Network::Testnet).expect("client construction");
+    let mut client = HyperliquidClient::new(&node.url(), wallet, None, Network::Testnet)
+        .expect("client construction");
     client.refresh_spot_meta().await.expect("refresh spot meta");
     (node, client, address)
 }
@@ -153,16 +155,17 @@ fn sample_indexer_fill(time: u64) -> UserFill {
 
 #[tokio::test]
 async fn split_info_and_exchange_clients_work_against_node() {
-    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
+    let node = HyperliquidNode::spawn()
+        .await
+        .expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let user = wallet.address();
     node.seed_spot(user, "USDC", 10_000.0).await;
     node.set_rate("UBTC", "USDC", 30_000.0).await;
 
     let mut info = HyperliquidInfoClient::new(&node.url()).expect("info client");
-    let exchange =
-        HyperliquidExchangeClient::new(&node.url(), wallet, None, Network::Testnet)
-            .expect("exchange client");
+    let exchange = HyperliquidExchangeClient::new(&node.url(), wallet, None, Network::Testnet)
+        .expect("exchange client");
     let meta = info.refresh_spot_meta().await.expect("refresh spot meta");
     assert!(meta.base_token_for(UBTC_USDC).is_some());
     let asset = info.asset_index(UBTC_USDC).expect("asset index");
@@ -195,40 +198,42 @@ async fn split_info_and_exchange_clients_work_against_node() {
 
 #[tokio::test]
 async fn info_client_decodes_indexer_info_endpoints_against_node() {
-    let node = HyperliquidNode::spawn().await.expect("spawn hyperliquid node");
+    let node = HyperliquidNode::spawn()
+        .await
+        .expect("spawn hyperliquid node");
     let wallet = PrivateKeySigner::random();
     let user = wallet.address();
     node.record_fill(user, sample_indexer_fill(1_700_000_000_000))
         .await;
     node.record_ledger_update(
-            user,
-            UserNonFundingLedgerUpdate {
-                time: 1_700_000_000_100,
-                hash: format!("0x{}", "cd".repeat(32)),
-                delta: UserNonFundingLedgerDelta::SpotTransfer {
-                    token: "UBTC:0x11111111111111111111111111111111".to_string(),
-                    amount: "0.001".to_string(),
-                    usdc_value: "60".to_string(),
-                    user: format!("{user:#x}"),
-                    destination: "0x2222222222222222222222222222222222222222".to_string(),
-                    fee: "0".to_string(),
-                    native_token_fee: "0.00001".to_string(),
-                    nonce: 11,
-                },
+        user,
+        UserNonFundingLedgerUpdate {
+            time: 1_700_000_000_100,
+            hash: format!("0x{}", "cd".repeat(32)),
+            delta: UserNonFundingLedgerDelta::SpotTransfer {
+                token: "UBTC:0x11111111111111111111111111111111".to_string(),
+                amount: "0.001".to_string(),
+                usdc_value: "60".to_string(),
+                user: format!("{user:#x}"),
+                destination: "0x2222222222222222222222222222222222222222".to_string(),
+                fee: "0".to_string(),
+                native_token_fee: "0.00001".to_string(),
+                nonce: 11,
             },
-        )
-        .await;
+        },
+    )
+    .await;
     node.record_funding(
-            user,
-            UserFunding {
-                time: 1_700_000_000_200,
-                coin: "ETH".to_string(),
-                usdc: "-0.0123".to_string(),
-                szi: "1.25".to_string(),
-                funding_rate: "0.0000125".to_string(),
-            },
-        )
-        .await;
+        user,
+        UserFunding {
+            time: 1_700_000_000_200,
+            coin: "ETH".to_string(),
+            usdc: "-0.0123".to_string(),
+            szi: "1.25".to_string(),
+            funding_rate: "0.0000125".to_string(),
+        },
+    )
+    .await;
 
     let info = HyperliquidInfoClient::new(&node.url()).expect("info client");
     let meta = info.fetch_perp_meta().await.expect("perp meta");
@@ -430,9 +435,7 @@ async fn order_status_reflects_filled_state() {
 async fn ioc_buy_partially_fills_when_book_depth_is_smaller_than_order_size() {
     let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
     node.set_rate("UBTC", "USDC", 30_000.0).await;
-    node
-        .set_book_depth("UBTC", "USDC", 0.13)
-        .await;
+    node.set_book_depth("UBTC", "USDC", 0.13).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
 
     let response = client
@@ -477,9 +480,7 @@ async fn ioc_buy_partially_fills_when_book_depth_is_smaller_than_order_size() {
 async fn marketable_gtc_buy_partially_fills_and_rests_remainder() {
     let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
     node.set_rate("UBTC", "USDC", 30_000.0).await;
-    node
-        .set_book_depth("UBTC", "USDC", 0.05)
-        .await;
+    node.set_book_depth("UBTC", "USDC", 0.05).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
 
     let response = client
@@ -540,9 +541,7 @@ async fn resting_order_partially_fills_when_rate_moves_through_limited_book_dept
     let (node, client, user) = fixture(&[("USDC", 10_000.0)]).await;
     let asset = client.asset_index(UBTC_USDC).unwrap();
     node.set_rate("UBTC", "USDC", 60_000.0).await;
-    node
-        .set_book_depth("UBTC", "USDC", 0.01)
-        .await;
+    node.set_book_depth("UBTC", "USDC", 0.01).await;
 
     let place = client
         .place_orders(
@@ -797,9 +796,7 @@ async fn concurrent_withdraw3_releases_do_not_collide_on_signer_nonce() {
         let pk_hex = pk_hex.clone();
         let nonce = base_nonce + 1 + i as u64;
         set.spawn(async move {
-            let wallet = pk_hex
-                .parse::<PrivateKeySigner>()
-                .expect("client wallet");
+            let wallet = pk_hex.parse::<PrivateKeySigner>().expect("client wallet");
             let client = HyperliquidClient::new(&url, wallet, None, Network::Testnet)
                 .expect("client construction");
             let resp = client
@@ -1228,7 +1225,8 @@ async fn node_bridge_deposit_credits_node_clearinghouse() {
     // Mint USDC to the depositor, then transfer it into the Bridge2 address.
     // The transfer's `Transfer(from = depositor, to = bridge)` log is exactly
     // what the node's bridge indexer observes and credits.
-    let usdc = GenericEIP3009ERC20Instance::new(usdc_address, devnet.arbitrum.funded_provider.clone());
+    let usdc =
+        GenericEIP3009ERC20Instance::new(usdc_address, devnet.arbitrum.funded_provider.clone());
     usdc.mint(depositor, amount_raw)
         .send()
         .await
@@ -1256,10 +1254,12 @@ async fn node_bridge_deposit_credits_node_clearinghouse() {
     // clearinghouse AND submits the Bridge2 `release` on-chain, paying out
     // (gross - 1 USDC fee) = 5 USDC of real USDC to the destination.
     let depositor_key: [u8; 32] = devnet.arbitrum.anvil.keys()[0].clone().to_bytes().into();
-    let depositor_wallet = PrivateKeySigner::from_bytes(&depositor_key.into()).expect("depositor key");
+    let depositor_wallet =
+        PrivateKeySigner::from_bytes(&depositor_key.into()).expect("depositor key");
     let withdraw_destination = Address::repeat_byte(0x77);
-    let exchange = HyperliquidExchangeClient::new(&node_url, depositor_wallet, None, Network::Testnet)
-        .expect("exchange client");
+    let exchange =
+        HyperliquidExchangeClient::new(&node_url, depositor_wallet, None, Network::Testnet)
+            .expect("exchange client");
     let withdraw_resp = exchange
         .withdraw_to_bridge(
             format!("{withdraw_destination:#x}"),
@@ -1268,7 +1268,10 @@ async fn node_bridge_deposit_credits_node_clearinghouse() {
         )
         .await
         .expect("withdraw3");
-    assert_eq!(withdraw_resp["status"], "ok", "withdraw3 accepted: {withdraw_resp}");
+    assert_eq!(
+        withdraw_resp["status"], "ok",
+        "withdraw3 accepted: {withdraw_resp}"
+    );
 
     // The node debited the full 6 USDC gross from its clearinghouse: 10 - 6 = 4.
     let after_withdraw = wait_for_node_clearinghouse_withdrawable(&node_url, depositor, 4.0).await;
@@ -1412,9 +1415,7 @@ async fn unit_node_deposit_credits_node_spot_and_marks_operation_done() {
             destination: dest,
             nonce,
             ..
-        } => {
-            dest.eq_ignore_ascii_case(&format!("{destination:#x}")) && *nonce == expected_nonce
-        }
+        } => dest.eq_ignore_ascii_case(&format!("{destination:#x}")) && *nonce == expected_nonce,
         _ => false,
     });
     assert!(
@@ -1557,11 +1558,10 @@ async fn unit_node_withdrawal_poller_settles_via_node_spot_credit() {
     // address on the node via a guardian spotSend (the guardian is seeded
     // unbounded UETH at genesis). The node-withdrawal poller should observe this
     // spot credit and settle the withdrawal.
-    let guardian = PrivateKeySigner::from_bytes(&node.guardian_key().into())
-        .expect("guardian signer");
-    let exchange =
-        HyperliquidExchangeClient::new(&node_url, guardian, None, Network::Testnet)
-            .expect("exchange client");
+    let guardian =
+        PrivateKeySigner::from_bytes(&node.guardian_key().into()).expect("guardian signer");
+    let exchange = HyperliquidExchangeClient::new(&node_url, guardian, None, Network::Testnet)
+        .expect("exchange client");
     exchange
         .spot_send(
             format!("{protocol_address:#x}"),
@@ -1594,7 +1594,10 @@ async fn unit_node_withdrawal_poller_settles_via_node_spot_credit() {
         .unit_operation_state(&format!("{protocol_address:#x}"))
         .await
         .expect("withdrawal op state");
-    assert_eq!(state, "done", "withdrawal op should be done after poller settles");
+    assert_eq!(
+        state, "done",
+        "withdrawal op should be done after poller settles"
+    );
 }
 
 /// Regression for the Phase-3 node-withdrawal stall: the router's withdrawal
@@ -1638,8 +1641,8 @@ async fn unit_node_withdrawal_poller_threads_sendasset_signer_as_source_address(
     // primitive), so it can then transfer to the protocol address.
     let custody_vault = PrivateKeySigner::random();
     let custody_vault_address = custody_vault.address();
-    let guardian = PrivateKeySigner::from_bytes(&node.guardian_key().into())
-        .expect("guardian signer");
+    let guardian =
+        PrivateKeySigner::from_bytes(&node.guardian_key().into()).expect("guardian signer");
     let guardian_exchange =
         HyperliquidExchangeClient::new(&node_url, guardian, None, Network::Testnet)
             .expect("guardian exchange client");
@@ -1672,13 +1675,8 @@ async fn unit_node_withdrawal_poller_threads_sendasset_signer_as_source_address(
 
     // The router's withdrawal action: a spot->spot `sendAsset` of UETH from the
     // custody vault to the protocol address on the node.
-    let exchange = HyperliquidExchangeClient::new(
-        &node_url,
-        custody_vault,
-        None,
-        Network::Testnet,
-    )
-    .expect("exchange client");
+    let exchange = HyperliquidExchangeClient::new(&node_url, custody_vault, None, Network::Testnet)
+        .expect("exchange client");
     exchange
         .send_asset(
             format!("{protocol_address:#x}"),

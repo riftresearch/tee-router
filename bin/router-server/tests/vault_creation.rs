@@ -1045,16 +1045,34 @@ fn test_router_args(
         velora_api_url: None,
         velora_proxy_url: None,
         velora_partner: None,
+        relay_api_url: None,
+        relay_api_key: None,
+        relay_proxy_url: None,
+        near_intents_api_url: None,
+        near_intents_api_key: None,
+        near_intents_bearer_token: None,
+        near_intents_proxy_url: None,
+        mayan_api_url: None,
+        mayan_api_key: None,
+        mayan_proxy_url: None,
+        chainflip_api_url: None,
+        chainflip_proxy_url: None,
+        garden_api_url: None,
+        garden_api_key: None,
+        garden_proxy_url: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         temporal_address: "http://127.0.0.1:7233".to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: "tee-router-order-execution".to_string(),
         router_detector_api_key: Some(TEST_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
+        router_orders_disabled: false,
         router_admin_api_key: None,
         hyperliquid_network:
             router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
         hyperliquid_order_timeout_ms: 30_000,
+        router_market_order_quote_timeout_ms: 60_000,
+        router_single_hop_quote_timeout_ms: 5_000,
         worker_id: None,
         worker_refund_poll_seconds: 60,
         worker_order_execution_poll_seconds: 5,
@@ -1107,6 +1125,7 @@ async fn spawn_router_api_from_components_with_auth(
             address_screener: components.address_screener,
             chain_registry: components.chain_registry,
             order_workflow_client: None,
+            orders_disabled: false,
             internal_api_auth,
             gateway_api_auth,
             admin_api_auth,
@@ -1449,10 +1468,7 @@ async fn create_test_order_from_quote_with_refund(
 }
 
 /// Pick a recipient address valid for the destination chain of `quote_id`.
-async fn recipient_for_quote_destination(
-    order_manager: &OrderManager,
-    quote_id: Uuid,
-) -> String {
+async fn recipient_for_quote_destination(order_manager: &OrderManager, quote_id: Uuid) -> String {
     let quote = order_manager
         .get_quote(quote_id)
         .await
@@ -7124,6 +7140,7 @@ fn test_market_order_quote(
         provider_quote: json!({ "test": "quote_cleanup" }),
         usd_valuation: json!({}),
         expected_swap_time_ms: None,
+        quote_candidates: None,
         expires_at,
         created_at: Utc::now(),
     }

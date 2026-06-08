@@ -1057,16 +1057,34 @@ fn router_args(
         velora_api_url: None,
         velora_proxy_url: None,
         velora_partner: None,
+        relay_api_url: None,
+        relay_api_key: None,
+        relay_proxy_url: None,
+        near_intents_api_url: None,
+        near_intents_api_key: None,
+        near_intents_bearer_token: None,
+        near_intents_proxy_url: None,
+        mayan_api_url: None,
+        mayan_api_key: None,
+        mayan_proxy_url: None,
+        chainflip_api_url: None,
+        chainflip_proxy_url: None,
+        garden_api_url: None,
+        garden_api_key: None,
+        garden_proxy_url: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
+        router_orders_disabled: false,
         router_admin_api_key: None,
         hyperliquid_network:
             router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
+        router_market_order_quote_timeout_ms: 60_000,
+        router_single_hop_quote_timeout_ms: 5_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
@@ -1138,15 +1156,33 @@ fn live_router_args(
         velora_api_url: None,
         velora_proxy_url: None,
         velora_partner: None,
+        relay_api_url: None,
+        relay_api_key: None,
+        relay_proxy_url: None,
+        near_intents_api_url: None,
+        near_intents_api_key: None,
+        near_intents_bearer_token: None,
+        near_intents_proxy_url: None,
+        mayan_api_url: None,
+        mayan_api_key: None,
+        mayan_proxy_url: None,
+        chainflip_api_url: None,
+        chainflip_proxy_url: None,
+        garden_api_url: None,
+        garden_api_key: None,
+        garden_proxy_url: None,
         hyperliquid_paymaster_private_key: None,
         temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("tee-router-order-execution-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
+        router_orders_disabled: false,
         router_admin_api_key: None,
         hyperliquid_network: live.hyperliquid_network,
         hyperliquid_order_timeout_ms: 30_000,
+        router_market_order_quote_timeout_ms: 60_000,
+        router_single_hop_quote_timeout_ms: 5_000,
         worker_id: Some(format!("router-worker-{}", Uuid::now_v7())),
         worker_refund_poll_seconds: 5,
         worker_order_execution_poll_seconds: 1,
@@ -2213,7 +2249,10 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet, route: RuntimeRoute) -> MockIn
         )
         .with_across_status_latency(Duration::from_secs(2))
         .with_mainnet_hyperliquid(false)
-        .with_unit_node(hyperliquid_node(devnet).url(), hyperliquid_node(devnet).guardian_key());
+        .with_unit_node(
+            hyperliquid_node(devnet).url(),
+            hyperliquid_node(devnet).guardian_key(),
+        );
     if matches!(route, RuntimeRoute::BaseUsdcToBtc) {
         config = config
             .with_cctp_token_messenger_address(
@@ -2607,13 +2646,8 @@ async fn run_live_runtime_route(route: RuntimeRoute) {
     let client = reqwest::Client::new();
 
     let amount_in = live_route_amount_in(route);
-    let quote = submit_quote_request_custom(
-        &client,
-        &router_base_url,
-        route,
-        amount_in.clone(),
-    )
-    .await;
+    let quote =
+        submit_quote_request_custom(&client, &router_base_url, route, amount_in.clone()).await;
     let market_quote = quote.quote.as_market_order().expect("market order quote");
     assert_route_provider_id(route, &market_quote.provider_id);
     write_live_recovery_snapshot(LiveRecoverySnapshotSpec {

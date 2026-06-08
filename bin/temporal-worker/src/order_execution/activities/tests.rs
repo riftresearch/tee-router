@@ -5111,6 +5111,7 @@ fn test_market_order_quote(
         provider_quote: json!({ "legs": legs }),
         usd_valuation: json!({}),
         expected_swap_time_ms: None,
+        quote_candidates: None,
         expires_at,
         created_at,
     }

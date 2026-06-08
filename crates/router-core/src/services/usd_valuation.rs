@@ -673,6 +673,7 @@ mod tests {
             provider_quote: json!({ "legs": [{ "not": "a quote leg" }] }),
             usd_valuation: empty_usd_valuation(),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: Utc::now(),
             created_at: Utc::now(),
         };

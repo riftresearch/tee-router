@@ -29,6 +29,11 @@ export type InternalProviderId =
   | 'hyperliquid_bridge'
   | 'hyperliquid_spot'
   | 'velora'
+  | 'relay'
+  | 'near_intents'
+  | 'mayan'
+  | 'chainflip'
+  | 'garden'
 
 export type InternalQuoteRouting = {
   provider_sequence?: InternalProviderId[]
@@ -75,6 +80,7 @@ export type InternalMarketOrderQuote = {
   estimated_amount_out: string
   provider_quote?: unknown
   expected_swap_time_ms?: number | null
+  quote_candidates?: unknown
   expires_at: string
   created_at: string
 }
@@ -101,6 +107,7 @@ export type CreateQuoteRequest =
       to_asset: InternalDepositAsset
       amount_in: string
       routing?: InternalQuoteRouting
+      include_candidates?: boolean
     }
   | {
       type: 'limit_order'

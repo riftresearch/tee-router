@@ -35,9 +35,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol_types::{SolCall, SolEvent},
 };
-use axum::{
-    extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use chrono::Utc;
 use hyperliquid_client::{
     recover_l1_signer, recover_typed_signer, Actions, SendAsset, SpotSend, UsdClassTransfer,
@@ -54,7 +52,7 @@ use crate::hyperliquid_core::{
     format_hl_amount, hyperliquid_has_sufficient_amount, HyperliquidCore,
 };
 use crate::hyperliquid_devnet::contract::MockHyperliquidBridge2;
-use crate::mock_integrators::{mock_evm_indexer_initial_last_scanned, IERC20, IMockMintableERC20};
+use crate::mock_integrators::{mock_evm_indexer_initial_last_scanned, IMockMintableERC20, IERC20};
 
 /// The Unit "guardian" HL account seeded at node genesis. This account is
 /// credited with effectively unbounded spot UBTC / UETH so that — in a later
@@ -119,7 +117,10 @@ impl std::fmt::Debug for HyperliquidNodeConfig {
             .field("arbitrum_rpc_url", &self.arbitrum_rpc_url)
             .field("bridge_address", &self.bridge_address)
             .field("usdc_token_address", &self.usdc_token_address)
-            .field("release_signer_key", &self.release_signer_key.map(|_| "<redacted>"))
+            .field(
+                "release_signer_key",
+                &self.release_signer_key.map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -228,8 +229,8 @@ impl HyperliquidNode {
                 Some(usdc_token_address),
                 Some(release_signer_key),
             ) => {
-                let signer = PrivateKeySigner::from_bytes(&release_signer_key.into())
-                    .map_err(|err| {
+                let signer =
+                    PrivateKeySigner::from_bytes(&release_signer_key.into()).map_err(|err| {
                         std::io::Error::new(
                             std::io::ErrorKind::Other,
                             format!("invalid hyperliquid node release signer key: {err}"),
@@ -445,9 +446,8 @@ impl Drop for HyperliquidNode {
 
 /// The guardian HL account address, derived once from the well-known devnet key.
 fn guardian_address() -> Address {
-    let signer =
-        PrivateKeySigner::from_bytes(&HYPERLIQUID_GUARDIAN_PRIVATE_KEY.into())
-            .expect("static guardian key bytes are a valid secp256k1 scalar");
+    let signer = PrivateKeySigner::from_bytes(&HYPERLIQUID_GUARDIAN_PRIVATE_KEY.into())
+        .expect("static guardian key bytes are a valid secp256k1 scalar");
     signer.address()
 }
 
@@ -1440,9 +1440,8 @@ mod tests {
             .await
             .credit_spot(sender_address, "UBTC", 5.0);
 
-        let exchange =
-            HyperliquidExchangeClient::new(&node.url(), sender, None, Network::Testnet)
-                .expect("exchange client");
+        let exchange = HyperliquidExchangeClient::new(&node.url(), sender, None, Network::Testnet)
+            .expect("exchange client");
         let time_ms = 1_700_000_000_000;
         let response = exchange
             .spot_send(
@@ -1582,9 +1581,12 @@ mod tests {
         use hyperliquid_client::info::UserFill as ClientUserFill;
         let node = HyperliquidNode::spawn().await.expect("spawn node");
         let user = shape_test_user();
-        node.record_fill(user, sample_user_fill(1_700_000_000_000, 1)).await;
-        node.record_fill(user, sample_user_fill(1_700_000_010_000, 2)).await;
-        node.record_fill(user, sample_user_fill(1_700_000_020_000, 3)).await;
+        node.record_fill(user, sample_user_fill(1_700_000_000_000, 1))
+            .await;
+        node.record_fill(user, sample_user_fill(1_700_000_010_000, 2))
+            .await;
+        node.record_fill(user, sample_user_fill(1_700_000_020_000, 3))
+            .await;
 
         let raw: Value = info_post(
             &node,
@@ -1603,9 +1605,11 @@ mod tests {
         assert_eq!(raw.as_array().expect("array").len(), 2);
         assert!(raw[0]["startPosition"].is_string());
         assert!(raw[0]["feeToken"].is_string());
-        let body: Vec<ClientUserFill> =
-            serde_json::from_value(raw).expect("deserialize UserFill");
-        assert_eq!(body.iter().map(|fill| fill.tid).collect::<Vec<_>>(), vec![2, 3]);
+        let body: Vec<ClientUserFill> = serde_json::from_value(raw).expect("deserialize UserFill");
+        assert_eq!(
+            body.iter().map(|fill| fill.tid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 
     #[tokio::test]
@@ -1631,19 +1635,37 @@ mod tests {
         let user = shape_test_user();
         let hash = format!("0x{}", "cd".repeat(32));
         for (time, delta) in [
-            (1_700_000_001_000, UserNonFundingLedgerDelta::Withdraw { usdc: "1.5".to_string(), nonce: 7, fee: "1".to_string() }),
-            (1_700_000_004_000, UserNonFundingLedgerDelta::SpotTransfer {
-                token: "UBTC:0x11111111111111111111111111111111".to_string(),
-                amount: "0.001".to_string(),
-                usdc_value: "60".to_string(),
-                user: format!("{user:#x}"),
-                destination: "0x2222222222222222222222222222222222222222".to_string(),
-                fee: "0".to_string(),
-                native_token_fee: "0.00001".to_string(),
-                nonce: 8,
-            }),
+            (
+                1_700_000_001_000,
+                UserNonFundingLedgerDelta::Withdraw {
+                    usdc: "1.5".to_string(),
+                    nonce: 7,
+                    fee: "1".to_string(),
+                },
+            ),
+            (
+                1_700_000_004_000,
+                UserNonFundingLedgerDelta::SpotTransfer {
+                    token: "UBTC:0x11111111111111111111111111111111".to_string(),
+                    amount: "0.001".to_string(),
+                    usdc_value: "60".to_string(),
+                    user: format!("{user:#x}"),
+                    destination: "0x2222222222222222222222222222222222222222".to_string(),
+                    fee: "0".to_string(),
+                    native_token_fee: "0.00001".to_string(),
+                    nonce: 8,
+                },
+            ),
         ] {
-            node.record_ledger_update(user, UserNonFundingLedgerUpdate { time, hash: hash.clone(), delta }).await;
+            node.record_ledger_update(
+                user,
+                UserNonFundingLedgerUpdate {
+                    time,
+                    hash: hash.clone(),
+                    delta,
+                },
+            )
+            .await;
         }
         let raw: Value = info_post(
             &node,
@@ -1728,7 +1750,12 @@ mod tests {
     #[tokio::test]
     async fn info_l2_book_rejects_missing_coin() {
         let node = HyperliquidNode::spawn().await.expect("spawn node");
-        assert_info_error(&node, json!({ "type": "l2Book" }), "l2Book requires a `coin` field").await;
+        assert_info_error(
+            &node,
+            json!({ "type": "l2Book" }),
+            "l2Book requires a `coin` field",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1816,8 +1843,8 @@ mod tests {
         let node = HyperliquidNode::spawn().await.expect("spawn node");
         let wallet = PrivateKeySigner::from_bytes(&[0x24u8; 32].into()).expect("wallet");
         let vault = Address::repeat_byte(0xc2);
-        let mut client =
-            HyperliquidClient::new(&node.url(), wallet, Some(vault), Network::Testnet).expect("client");
+        let mut client = HyperliquidClient::new(&node.url(), wallet, Some(vault), Network::Testnet)
+            .expect("client");
         client.refresh_spot_meta().await.expect("spot meta");
         node.set_rate("UBTC", "USDC", 60_000.0).await;
         node.set_rate("UETH", "USDC", 3_000.0).await;
@@ -1830,7 +1857,9 @@ mod tests {
                     limit_px: "3000".to_string(),
                     sz: "1".to_string(),
                     reduce_only: false,
-                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    order_type: Order::Limit(Limit {
+                        tif: "Ioc".to_string(),
+                    }),
                     cloid: None,
                 }],
                 "na",
@@ -1841,8 +1870,14 @@ mod tests {
             .as_str()
             .expect("insufficient balance error");
         assert!(err.contains("insufficient"), "unexpected rejection: {err}");
-        let rejected_status = client.order_status(vault, 1000).await.expect("rejected status");
-        assert_eq!(rejected_status.order.expect("rejected order").status, "rejected");
+        let rejected_status = client
+            .order_status(vault, 1000)
+            .await
+            .expect("rejected status");
+        assert_eq!(
+            rejected_status.order.expect("rejected order").status,
+            "rejected"
+        );
 
         node.seed_spot(vault, "UBTC", 1.0).await;
         let sell = client
@@ -1853,14 +1888,18 @@ mod tests {
                     limit_px: "60000".to_string(),
                     sz: "0.1".to_string(),
                     reduce_only: false,
-                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    order_type: Order::Limit(Limit {
+                        tif: "Ioc".to_string(),
+                    }),
                     cloid: None,
                 }],
                 "na",
             )
             .await
             .expect("sell UBTC");
-        assert!(sell["response"]["data"]["statuses"][0].get("filled").is_some());
+        assert!(sell["response"]["data"]["statuses"][0]
+            .get("filled")
+            .is_some());
 
         let buy = client
             .place_orders(
@@ -1870,14 +1909,18 @@ mod tests {
                     limit_px: "3000".to_string(),
                     sz: "1".to_string(),
                     reduce_only: false,
-                    order_type: Order::Limit(Limit { tif: "Ioc".to_string() }),
+                    order_type: Order::Limit(Limit {
+                        tif: "Ioc".to_string(),
+                    }),
                     cloid: None,
                 }],
                 "na",
             )
             .await
             .expect("buy UETH");
-        assert!(buy["response"]["data"]["statuses"][0].get("filled").is_some());
+        assert!(buy["response"]["data"]["statuses"][0]
+            .get("filled")
+            .is_some());
 
         let state = client
             .spot_clearinghouse_state(vault)

@@ -1385,8 +1385,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     // The Ethereum-source Velora route needs the Ethereum chain, its mock-USDC
     // clone, and the Ethereum Velora contract/provider wired even though it is
     // not an Across route.
-    let ethereum_velora_enabled =
-        matches!(options.route, WorkflowRoute::VeloraEthereumEthToEthereumUsdc);
+    let ethereum_velora_enabled = matches!(
+        options.route,
+        WorkflowRoute::VeloraEthereumEthToEthereumUsdc
+    );
     let ethereum_enabled = across_enabled || ethereum_velora_enabled;
     let cctp_enabled = matches!(
         options.route,
@@ -2069,9 +2071,8 @@ fn test_action_providers(
     cctp_enabled: bool,
 ) -> ActionProviderRegistry {
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
-        across: across_enabled.then(|| {
-            AcrossHttpProviderConfig::new(mocks.across_url(), "temporal-worker-across")
-        }),
+        across: across_enabled
+            .then(|| AcrossHttpProviderConfig::new(mocks.across_url(), "temporal-worker-across")),
         cctp: cctp_enabled.then(|| CctpHttpProviderConfig::mock(mocks.cctp_url())),
         hyperunit_base_url: hyperliquid_enabled.then(|| mocks.hyperunit_url()),
         hyperunit_proxy_url: None,
@@ -2112,7 +2113,10 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
         );
     }
-    if matches!(options.route, WorkflowRoute::VeloraEthereumEthToEthereumUsdc) {
+    if matches!(
+        options.route,
+        WorkflowRoute::VeloraEthereumEthToEthereumUsdc
+    ) {
         config = config.with_velora_swap_contract_address(
             devnet.ethereum.anvil.chain_id(),
             format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),

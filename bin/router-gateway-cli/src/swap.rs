@@ -49,6 +49,7 @@ pub async fn run(args: SwapArgs) -> Result<()> {
             amount_format: Some(AmountFormat::Readable),
             from_amount: args.from_amount.clone(),
             routing,
+            include_quote_candidates: None,
         })
         .await
         .wrap_err("quote request failed")?;
@@ -161,7 +162,7 @@ fn parse_provider_sequence(value: &str) -> Result<QuoteRouting> {
 fn parse_provider_id(value: &str) -> Result<ProviderId> {
     ProviderId::parse(value).ok_or_else(|| {
         eyre!(
-            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid_spot, velora"
+            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid_spot, velora, relay, near_intents, mayan, chainflip, garden"
         )
     })
 }
