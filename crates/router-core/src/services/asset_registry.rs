@@ -37,16 +37,26 @@ pub enum ProviderId {
 
     HyperliquidSpot,
     Velora,
+    Relay,
+    NearIntents,
+    Mayan,
+    Chainflip,
+    Garden,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 11] = [
         Self::Across,
         Self::Cctp,
         Self::Unit,
         Self::HyperliquidBridge,
         Self::HyperliquidSpot,
         Self::Velora,
+        Self::Relay,
+        Self::NearIntents,
+        Self::Mayan,
+        Self::Chainflip,
+        Self::Garden,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -58,6 +68,11 @@ impl ProviderId {
 
             "hyperliquid_spot" => Some(Self::HyperliquidSpot),
             "velora" => Some(Self::Velora),
+            "relay" => Some(Self::Relay),
+            "near_intents" => Some(Self::NearIntents),
+            "mayan" => Some(Self::Mayan),
+            "chainflip" => Some(Self::Chainflip),
+            "garden" => Some(Self::Garden),
             _ => None,
         }
     }
@@ -72,6 +87,11 @@ impl ProviderId {
 
             Self::HyperliquidSpot => "hyperliquid_spot",
             Self::Velora => "velora",
+            Self::Relay => "relay",
+            Self::NearIntents => "near_intents",
+            Self::Mayan => "mayan",
+            Self::Chainflip => "chainflip",
+            Self::Garden => "garden",
         }
     }
 
@@ -87,6 +107,9 @@ impl ProviderId {
             Self::Velora => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::UniversalRouter,
             },
+            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden => {
+                ProviderVenueKind::SingleHop
+            }
         }
     }
 
@@ -97,8 +120,26 @@ impl ProviderId {
             Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::HyperliquidSpot => {
                 AssetSupportModel::StaticDeclared
             }
-            Self::Velora => AssetSupportModel::OpenAddressQuote,
+            Self::Velora
+            | Self::Relay
+            | Self::NearIntents
+            | Self::Mayan
+            | Self::Chainflip
+            | Self::Garden => AssetSupportModel::OpenAddressQuote,
         }
+    }
+
+    #[must_use]
+    pub fn is_single_hop_quote_provider(self) -> bool {
+        matches!(
+            self,
+            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden
+        )
+    }
+
+    #[must_use]
+    pub fn is_transition_provider(self) -> bool {
+        !self.is_single_hop_quote_provider()
     }
 }
 
@@ -107,6 +148,7 @@ impl ProviderId {
 pub enum ProviderVenueKind {
     CrossChain,
     MonoChain { mono_chain_kind: MonoChainVenueKind },
+    SingleHop,
 }
 
 impl ProviderVenueKind {
@@ -118,6 +160,11 @@ impl ProviderVenueKind {
     #[must_use]
     pub fn is_mono_chain(self) -> bool {
         matches!(self, Self::MonoChain { .. })
+    }
+
+    #[must_use]
+    pub fn is_single_hop(self) -> bool {
+        matches!(self, Self::SingleHop)
     }
 }
 
@@ -1529,6 +1576,17 @@ mod tests {
             serde_json::json!("hyperliquid_spot")
         );
         assert!(serde_json::from_value::<ProviderId>(serde_json::json!("hyperliquid")).is_err());
+
+        for provider in [
+            ProviderId::Relay,
+            ProviderId::NearIntents,
+            ProviderId::Mayan,
+            ProviderId::Chainflip,
+            ProviderId::Garden,
+        ] {
+            assert_eq!(ProviderId::parse(provider.as_str()), Some(provider));
+            assert!(provider.is_single_hop_quote_provider());
+        }
     }
 
     #[test]
@@ -1556,6 +1614,15 @@ mod tests {
                 mono_chain_kind: MonoChainVenueKind::UniversalRouter,
             }
         );
+        for provider in [
+            ProviderId::Relay,
+            ProviderId::NearIntents,
+            ProviderId::Mayan,
+            ProviderId::Chainflip,
+            ProviderId::Garden,
+        ] {
+            assert_eq!(provider.venue_kind(), ProviderVenueKind::SingleHop);
+        }
     }
 
     #[test]
@@ -1585,6 +1652,18 @@ mod tests {
             ProviderId::Velora.asset_support_model(),
             AssetSupportModel::OpenAddressQuote
         );
+        for provider in [
+            ProviderId::Relay,
+            ProviderId::NearIntents,
+            ProviderId::Mayan,
+            ProviderId::Chainflip,
+            ProviderId::Garden,
+        ] {
+            assert_eq!(
+                provider.asset_support_model(),
+                AssetSupportModel::OpenAddressQuote
+            );
+        }
     }
 
     #[test]

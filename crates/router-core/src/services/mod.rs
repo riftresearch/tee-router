@@ -9,6 +9,8 @@ pub mod market_order_planner;
 pub mod pricing;
 pub mod quote_legs;
 pub mod route_costs;
+pub mod single_hop_assets;
+pub mod single_hop_venues;
 pub mod upstream_proxy;
 pub mod usd_valuation;
 
@@ -30,3 +32,13 @@ pub use gas_reimbursement::{GasReimbursementPlan, GasRetentionAction};
 pub use market_order_planner::MarketOrderRoutePlanner;
 pub use pricing::{PricingSnapshot, PricingSnapshotProvider};
 pub use route_costs::{RouteCostRefreshSummary, RouteCostService, RouteCostSnapshot};
+pub use single_hop_assets::{
+    ContractEncoding, ContractPassthrough, ContractStandard, RouterAssetKind, VenueAsset,
+    VenueAssetEntry, VenueAssetLookup, VenueAssetMap, VenueAssetMapSpec, VenueAssetPolicy,
+    VenueChainAssetsSpec,
+};
+pub use single_hop_venues::{
+    ChainflipQuoteProvider, GardenQuoteProvider, MayanQuoteProvider, NearIntentsQuoteProvider,
+    RelayQuoteProvider, SingleHopQuote, SingleHopQuoteProvider, SingleHopQuoteRequest,
+    SingleHopVenueRegistry,
+};
