@@ -2,7 +2,7 @@
 title: "What is Rift?"
 ---
 
-Rift is a zero-fee router for DeFi. We let you do any action in DeFi, in one click. We currently support market orders and vault deposits from any asset / chain. Our team is actively adding new flows.
+Rift is a zero-fee router for DeFi. We let you do any action in DeFi, in one click. We currently support market orders and vault deposits/withdrawals. Our team is actively adding new chains and order types.
 
 Unlike other protocols that are secured by multisigs or staking, Rift uses hardware (cloud based TEEs) to automatically move funds between chains based on pre defined rules.
 
@@ -15,7 +15,7 @@ No fees. We aggregate all the routes, and don't pass on any fees. We only make m
 We aggregate routes nobody else can (because of our multichain smart contracts), so you can trade 100m+ for majors like BTC, ETH, USDC, USDT
 
 - **"One click" UX:**
-Any operation is just a transfer of a native asset to a Rift contract address. Rift handles the rest and the destination asset magically appears in your wallet.
+Any operation is just a normal transfer of a native asset. Rift handles the rest: routing through protocols (chaining them if necessary) and the destination asset magically appears in your wallet.
 
 Rift's [protocol code](https://github.com/riftresearch/tee-router) is 100% open source for anyone to verify, audit, or contribute to.
 
@@ -41,5 +41,5 @@ Rift's [protocol code](https://github.com/riftresearch/tee-router) is 100% open 
 | Garden | Intent + solver |
 | CCTP | Mint + burn |
 | Velora | AMM |
-| Chainflip | JIT AMM |
+| Chainflip | AMM |
 | Unit | Lock + mint |
