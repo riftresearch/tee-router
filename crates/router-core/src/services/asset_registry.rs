@@ -4,12 +4,19 @@ use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Canonical assets the router recognizes. This set is intentionally limited to
+/// exactly the assets that appear in the curated cache swap list (the
+/// Across/CCTP/Unit bridge legs and the same-chain Velora pairs); there is no
+/// separate "extra" asset universe. Adding a new routable asset means adding it
+/// here *and* to the curated route tables below.
 pub enum CanonicalAsset {
     Btc,
-    Cbbtc,
     Eth,
     Usdc,
     Usdt,
+    /// Hyperliquid-native HYPE. Not part of the curated bridge swap list; it is
+    /// reachable only as a Hyperliquid spot venue asset (HyperliquidTrade /
+    /// HyperliquidSpot) and surfaces in Hyperliquid balance/refund discovery.
     Hype,
 }
 
@@ -18,7 +25,6 @@ impl CanonicalAsset {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Btc => "btc",
-            Self::Cbbtc => "cbbtc",
             Self::Eth => "eth",
             Self::Usdc => "usdc",
             Self::Usdt => "usdt",
@@ -550,7 +556,11 @@ impl AssetRegistry {
             }
         }
 
-        let venue_canonicals: Vec<_> = self
+        // Collect, sort by canonical name, and dedupe. Using `HashSet` for
+        // dedupe would make iteration order depend on the per-process
+        // `RandomState`, which would propagate non-determinism into BFS
+        // expansion order and tie-broken ranking (audit S2.1).
+        let mut venue_canonicals: Vec<_> = self
             .provider_assets
             .iter()
             .filter(|entry| {
@@ -559,9 +569,9 @@ impl AssetRegistry {
                     && entry.supports(ProviderAssetCapability::ExchangeOutput)
             })
             .map(|entry| entry.canonical)
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect();
+        venue_canonicals.sort_by_key(|canonical| canonical.as_str());
+        venue_canonicals.dedup();
         for input in &venue_canonicals {
             for output in &venue_canonicals {
                 if input == output
@@ -597,6 +607,117 @@ impl AssetRegistry {
             .into_iter()
             .filter_map(|edge| self.transition_decl_from_edge(edge))
             .collect()
+    }
+
+    /// Full edge set used for *display* (the route-graph export and the
+    /// route-explain corridor): every declared transition plus the curated
+    /// same-chain Velora `UniversalRouterSwap` swaps. These swap edges are not
+    /// part of [`Self::transition_declarations`] (BFS never routes through them
+    /// as intermediate hops), but they belong in the visual topology so the
+    /// dashboard can show same-chain swap branches. Deduped by edge id.
+    #[must_use]
+    pub fn display_transition_declarations(&self) -> Vec<TransitionDecl> {
+        let mut declarations = self.transition_declarations();
+        for transition in self.curated_cacheable_transitions() {
+            if matches!(transition.kind, MarketOrderTransitionKind::UniversalRouterSwap) {
+                declarations.push(transition);
+            }
+        }
+        dedupe_transition_declarations(declarations)
+    }
+
+    /// Explicit curated set of transitions the route-cost refresher is allowed
+    /// to live-sample and persist. This is intentionally narrower than
+    /// [`Self::transition_declarations`]: it does **not** affect the routing
+    /// graph (BFS still sees every declared transition), it only constrains
+    /// which legs get a measured cost row in the cache. Anything outside this
+    /// set is left uncached on purpose - no structural estimates are written.
+    ///
+    /// Curated set (bidirectional):
+    /// - Across: `*.USDT`, `*.USDC`, `*.ETH` across `ETH`/`BASE`/`ARB`
+    /// - CCTP: `*.USDC` across `ETH`/`BASE`/`ARB`
+    /// - Unit: `HL.uETH <-> ETH.ETH`, `HL.uBTC <-> BTC.BTC`
+    /// - Velora (same-chain): `USDC <-> USDT` on `ETH`/`BASE`/`ARB`
+    #[must_use]
+    pub fn curated_cacheable_transitions(&self) -> Vec<TransitionDecl> {
+        let mut out: Vec<TransitionDecl> = self
+            .transition_declarations()
+            .into_iter()
+            .filter(|decl| self.is_curated_bridge_or_unit_transition(decl))
+            .collect();
+
+        for (chain, canonical_a, canonical_b) in CURATED_VELORA_SWAP_PAIRS {
+            let Some(source) = self.curated_chain_asset(chain, *canonical_a) else {
+                continue;
+            };
+            let Some(destination) = self.curated_chain_asset(chain, *canonical_b) else {
+                continue;
+            };
+            if let Some(transition) = self.velora_swap_transition(&source, &destination) {
+                out.push(transition);
+            }
+            if let Some(transition) = self.velora_swap_transition(&destination, &source) {
+                out.push(transition);
+            }
+        }
+
+        dedupe_transition_declarations(out)
+    }
+
+    /// Build the same-chain Velora `UniversalRouterSwap` transition declaration
+    /// for `source -> destination`. Shares the per-edge id format used by the
+    /// runtime Velora edges so a cached cost row matches the runtime lookup at
+    /// quote time.
+    #[must_use]
+    pub fn velora_swap_transition(
+        &self,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> Option<TransitionDecl> {
+        self.velora_runtime_transition(source, destination)
+    }
+
+    fn curated_chain_asset(
+        &self,
+        chain: &str,
+        canonical: CanonicalAsset,
+    ) -> Option<DepositAsset> {
+        self.chain_assets
+            .iter()
+            .find(|entry| entry.canonical == canonical && entry.chain.as_str() == chain)
+            .map(ChainAsset::deposit_asset)
+    }
+
+    fn is_curated_bridge_or_unit_transition(&self, decl: &TransitionDecl) -> bool {
+        match decl.kind {
+            MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge => {
+                // Both endpoints share the canonical (same-asset cross-chain
+                // bridge); look it up in the explicit `(venue, canonical)` table
+                // and require the chain pair to be inside the curated trio.
+                let Some(canonical) = self.canonical_for(&decl.input.asset) else {
+                    return false;
+                };
+                CURATED_TRIO_BRIDGE_ROUTES.contains(&(decl.provider, canonical))
+                    && is_curated_l2_trio_pair(
+                        decl.input.asset.chain.as_str(),
+                        decl.output.asset.chain.as_str(),
+                    )
+            }
+            MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
+                // The external (non-hyperliquid) side identifies the curated
+                // Unit route: HL.uETH <-> ETH.ETH and HL.uBTC <-> BTC.BTC.
+                let external = if decl.input.asset.chain.as_str() == "hyperliquid" {
+                    &decl.output.asset
+                } else {
+                    &decl.input.asset
+                };
+                let Some(canonical) = self.canonical_for(external) else {
+                    return false;
+                };
+                CURATED_UNIT_ROUTES.contains(&(external.chain.as_str(), canonical))
+            }
+            _ => false,
+        }
     }
 
     #[must_use]
@@ -656,6 +777,10 @@ impl AssetRegistry {
                     id,
                     transitions: state.path.clone(),
                 });
+                // Do not expand past the goal: "reach destination, leave,
+                // return" detours inflate the candidate set without adding
+                // any valid route (audit S1.5).
+                continue;
             }
 
             if state.path.len() >= max_depth {
@@ -997,11 +1122,51 @@ fn transition_path_id(transitions: &[TransitionDecl]) -> String {
         .join(">")
 }
 
+/// EVM anchor canonicals for the arbitrary-ERC20 Velora wrap: the random token
+/// is swapped into / out of one of these on its own chain before joining the
+/// cached graph. Exactly the three main tokens (no wrapped-BTC variants).
 fn is_anchor_canonical(canonical: CanonicalAsset) -> bool {
     matches!(
         canonical,
-        CanonicalAsset::Eth | CanonicalAsset::Usdc | CanonicalAsset::Usdt | CanonicalAsset::Cbbtc
+        CanonicalAsset::Eth | CanonicalAsset::Usdc | CanonicalAsset::Usdt
     )
+}
+
+/// The `ETH`/`BASE`/`ARB` chains the curated Across/CCTP routes span. Used to
+/// decide whether a bridge transition between two of these chains is in the
+/// curated cacheable set (order-independent).
+const CURATED_L2_TRIO_CHAINS: &[&str] = &["evm:1", "evm:8453", "evm:42161"];
+
+/// Curated cross-chain bridge routes as explicit `(venue, canonical)` entries.
+/// Each canonical is cached across every ordered chain pair within the L2 trio
+/// for the given venue. This is the single source of truth for the
+/// bridge side of the cache allowlist - both endpoints share the canonical.
+const CURATED_TRIO_BRIDGE_ROUTES: &[(ProviderId, CanonicalAsset)] = &[
+    (ProviderId::Across, CanonicalAsset::Usdc),
+    (ProviderId::Across, CanonicalAsset::Usdt),
+    (ProviderId::Across, CanonicalAsset::Eth),
+    (ProviderId::Cctp, CanonicalAsset::Usdc),
+];
+
+/// Curated Unit deposit/withdrawal routes, identified by the external
+/// (non-Hyperliquid) side as `(external_chain, canonical)`. The Hyperliquid
+/// venue side is the implied counterpart (HL.uETH / HL.uBTC).
+const CURATED_UNIT_ROUTES: &[(&str, CanonicalAsset)] = &[
+    ("evm:1", CanonicalAsset::Eth),
+    ("bitcoin", CanonicalAsset::Btc),
+];
+
+/// Curated same-chain Velora swap pairs: `(chain, canonical_a, canonical_b)`.
+/// Sampled bidirectionally by the route-cost refresher.
+const CURATED_VELORA_SWAP_PAIRS: &[(&str, CanonicalAsset, CanonicalAsset)] = &[
+    ("evm:1", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
+    ("evm:8453", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
+    ("evm:42161", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
+];
+
+/// True when both chains are in the curated `ETH`/`BASE`/`ARB` trio and differ.
+fn is_curated_l2_trio_pair(a: &str, b: &str) -> bool {
+    a != b && CURATED_L2_TRIO_CHAINS.contains(&a) && CURATED_L2_TRIO_CHAINS.contains(&b)
 }
 
 fn builtin_chain_assets() -> Vec<ChainAsset> {
@@ -1023,12 +1188,7 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             AssetId::reference("0xdac17f958d2ee523a2206206994597c13d831ec7"),
             6,
         ),
-        chain_asset(
-            CanonicalAsset::Cbbtc,
-            "evm:1",
-            AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-            8,
-        ),
+        chain_asset(CanonicalAsset::Eth, "evm:42161", AssetId::Native, 18),
         chain_asset(
             CanonicalAsset::Usdc,
             "evm:42161",
@@ -1040,12 +1200,6 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             "evm:42161",
             AssetId::reference("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"),
             6,
-        ),
-        chain_asset(
-            CanonicalAsset::Cbbtc,
-            "evm:42161",
-            AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-            8,
         ),
         chain_asset(CanonicalAsset::Eth, "evm:8453", AssetId::Native, 18),
         chain_asset(
@@ -1060,15 +1214,9 @@ fn builtin_chain_assets() -> Vec<ChainAsset> {
             AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
             6,
         ),
-        chain_asset(
-            CanonicalAsset::Cbbtc,
-            "evm:8453",
-            AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-            8,
-        ),
-        // Hyperliquid spot assets. These may be user funding sources: users
-        // deposit by transferring the spot asset into a router-derived HL
-        // account, then the route executes from the corresponding HL venue node.
+        // Hyperliquid spot assets. These are venue balances, not public
+        // user-facing start/end assets; Unit deposits/withdrawals bridge
+        // between these venue assets and their external chain representations.
         chain_asset(
             CanonicalAsset::Btc,
             "hyperliquid",
@@ -1200,11 +1348,11 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
         ),
         provider_asset(
             ProviderId::Across,
-            CanonicalAsset::Cbbtc,
-            "evm:1",
-            "1",
-            "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
-            8,
+            CanonicalAsset::Eth,
+            "evm:42161",
+            "42161",
+            "native",
+            18,
             &[
                 ProviderAssetCapability::BridgeInput,
                 ProviderAssetCapability::BridgeOutput,
@@ -1236,18 +1384,6 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
         ),
         provider_asset(
             ProviderId::Across,
-            CanonicalAsset::Cbbtc,
-            "evm:42161",
-            "42161",
-            "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
-            8,
-            &[
-                ProviderAssetCapability::BridgeInput,
-                ProviderAssetCapability::BridgeOutput,
-            ],
-        ),
-        provider_asset(
-            ProviderId::Across,
             CanonicalAsset::Eth,
             "evm:8453",
             "8453",
@@ -1265,18 +1401,6 @@ fn builtin_provider_assets() -> Vec<ProviderAsset> {
             "8453",
             "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
             6,
-            &[
-                ProviderAssetCapability::BridgeInput,
-                ProviderAssetCapability::BridgeOutput,
-            ],
-        ),
-        provider_asset(
-            ProviderId::Across,
-            CanonicalAsset::Cbbtc,
-            "evm:8453",
-            "8453",
-            "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
-            8,
             &[
                 ProviderAssetCapability::BridgeInput,
                 ProviderAssetCapability::BridgeOutput,
@@ -1415,6 +1539,71 @@ mod tests {
     }
 
     #[test]
+    fn curated_cacheable_transitions_cover_the_allowlist_only() {
+        let registry = AssetRegistry::default();
+        let curated = registry.curated_cacheable_transitions();
+        assert!(!curated.is_empty(), "curated set must not be empty");
+
+        // Every curated transition is one of the four allowed venue kinds.
+        for decl in &curated {
+            assert!(
+                matches!(
+                    decl.kind,
+                    MarketOrderTransitionKind::AcrossBridge
+                        | MarketOrderTransitionKind::CctpBridge
+                        | MarketOrderTransitionKind::UnitDeposit
+                        | MarketOrderTransitionKind::UnitWithdrawal
+                        | MarketOrderTransitionKind::UniversalRouterSwap
+                ),
+                "unexpected curated kind {:?} ({})",
+                decl.kind,
+                decl.id
+            );
+        }
+
+        let has = |kind: MarketOrderTransitionKind, src: &str, dst: &str| {
+            curated.iter().any(|decl| {
+                decl.kind == kind
+                    && decl.input.asset.chain.as_str() == src
+                    && decl.output.asset.chain.as_str() == dst
+            })
+        };
+
+        // Across covers the *.ETH legs that need the freshly-added ARB.ETH row.
+        assert!(has(
+            MarketOrderTransitionKind::AcrossBridge,
+            "evm:8453",
+            "evm:42161"
+        ));
+        assert!(has(
+            MarketOrderTransitionKind::AcrossBridge,
+            "evm:42161",
+            "evm:8453"
+        ));
+        // CCTP USDC trio.
+        assert!(has(MarketOrderTransitionKind::CctpBridge, "evm:1", "evm:8453"));
+        // Same-chain Velora swaps are present bidirectionally.
+        assert!(has(
+            MarketOrderTransitionKind::UniversalRouterSwap,
+            "evm:1",
+            "evm:1"
+        ));
+        // Unit external sides: Ethereum ETH and Bitcoin BTC only.
+        assert!(curated.iter().any(|decl| matches!(
+            decl.kind,
+            MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal
+        )));
+
+        // Nothing outside the curated set leaks in: no Hyperliquid trade or
+        // HL/Hypercore bridge legs, and no bridge between non-trio chains.
+        assert!(curated.iter().all(|decl| {
+            decl.kind != MarketOrderTransitionKind::HyperliquidTrade
+                && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeDeposit
+                && decl.kind != MarketOrderTransitionKind::HyperliquidBridgeWithdrawal
+        }));
+    }
+
+    #[test]
     fn maps_chain_assets_to_canonical_assets() {
         let registry = AssetRegistry::default();
 
@@ -1456,12 +1645,14 @@ mod tests {
             )),
             Some(CanonicalAsset::Usdt)
         );
+        // cbBTC is no longer a router canonical asset, so its token address has
+        // no canonical mapping.
         assert_eq!(
             registry.canonical_for(&asset(
                 "evm:42161",
                 AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
             )),
-            Some(CanonicalAsset::Cbbtc)
+            None
         );
     }
 
@@ -1822,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn anchor_assets_include_usdt_and_cbbtc() {
+    fn anchor_assets_include_usdt_but_not_cbbtc() {
         let registry = AssetRegistry::default();
         let anchors = registry.anchor_assets();
 
@@ -1830,14 +2021,15 @@ mod tests {
             "evm:8453",
             AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
         )));
-        assert!(anchors.contains(&asset(
+        // cbBTC was removed as a canonical/anchor asset.
+        assert!(!anchors.contains(&asset(
             "evm:42161",
             AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
         )));
     }
 
     #[test]
-    fn velora_runtime_anchor_assets_include_usdt_and_cbbtc() {
+    fn velora_runtime_anchor_assets_include_usdt_but_not_cbbtc() {
         let registry = AssetRegistry::default();
         let base = ChainId::parse("evm:8453").unwrap();
         let arbitrum = ChainId::parse("evm:42161").unwrap();
@@ -1848,7 +2040,7 @@ mod tests {
             "evm:8453",
             AssetId::reference("0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"),
         )));
-        assert!(anchors.contains(&asset(
+        assert!(!anchors.contains(&asset(
             "evm:42161",
             AssetId::reference("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
         )));
@@ -2122,7 +2314,9 @@ mod tests {
     // source/destination assets.
     // ---------------------------------------------------------------------
 
-    use crate::services::route_costs::{rank_transition_paths_structurally, structural_path_score};
+    use crate::services::route_costs::{
+        rank_transition_paths_structurally, structural_path_score, DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+    };
 
     const TRACE_ROUTE_MAX_DEPTH: usize = 5;
 
@@ -2180,7 +2374,10 @@ mod tests {
         print_paths(&same_chain_preferred, &pricing);
 
         let mut ranked = same_chain_preferred;
-        rank_transition_paths_structurally(&mut ranked);
+        // Trace harness is intentionally fixed-anchor for reproducible
+        // offline analysis. Pass DEFAULT_SAMPLE_AMOUNT_USD_MICROS so the
+        // scoring is identical across runs.
+        rank_transition_paths_structurally(&mut ranked, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
         eprintln!(
             "[4] structural ranking ({} paths, lowest cost first):",
             ranked.len()
@@ -2232,7 +2429,7 @@ mod tests {
             return;
         }
         for (i, path) in paths.iter().enumerate() {
-            let score = structural_path_score(path, pricing);
+            let score = structural_path_score(path, pricing, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
             let hops: Vec<String> = path
                 .transitions
                 .iter()

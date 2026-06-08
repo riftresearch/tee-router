@@ -306,6 +306,57 @@ pub fn record_provider_quote_blocked(provider: &str, reason: &str) {
     .increment(1);
 }
 
+/// Histogram-style counter for confidence-band fanout size at quote time.
+/// Bucketed to keep label cardinality low and make Grafana grouping easy.
+pub fn record_route_select_band_size(band_size: usize) {
+    let bucket = match band_size {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4..=8 => "4_8",
+        _ => "9_plus",
+    };
+    counter!(
+        "tee_router_route_select_band_size_total",
+        "bucket" => bucket,
+    )
+    .increment(1);
+}
+
+/// Records that `select_best_quote` returned a path other than the
+/// ranking leader. A non-zero rate means the structural/cached ranking
+/// is mispredicting which path produces the best live output.
+pub fn record_route_select_best_path_not_leader() {
+    counter!("tee_router_route_select_best_path_not_leader_total").increment(1);
+}
+
+/// Bps delta between the chosen path's `estimated_amount_out` and the
+/// leader's. Positive means fanout produced a better output than the
+/// leader promised; zero means leader won. Recorded per quote.
+pub fn record_route_select_best_output_delta_bps(delta_bps: i64) {
+    histogram!("tee_router_route_select_best_output_delta_bps").record(delta_bps as f64);
+}
+
+/// Refresher emitted a sample outside the `[structural/4, structural*5]`
+/// envelope. The sample is still written verbatim - we trust the provider
+/// rather than clamping it - but a steady non-zero rate on a single
+/// `(provider, tier, direction)` tuple is the operator signal that a
+/// venue is returning extremes worth investigating.
+///
+/// `direction` should be `"low"` (provider quoted way under structural;
+/// possible promo or parser bug) or `"high"` (provider quoted way over
+/// structural; possible outage / liquidity hole / rate-limit fallback).
+pub fn record_route_cost_sample_suspicious(provider: &str, tier: &str, direction: &str) {
+    counter!(
+        "tee_router_route_cost_sample_suspicious_total",
+        "provider" => provider.to_string(),
+        "tier" => tier.to_string(),
+        "direction" => direction.to_string(),
+    )
+    .increment(1);
+}
+
 pub fn record_provider_execution_blocked(provider: &str, state: &str, reason: &str) {
     counter!(
         "tee_router_provider_execution_blocked_total",

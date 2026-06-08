@@ -1,6 +1,7 @@
 pub mod order_repo;
 pub mod provider_health_repo;
 pub mod provider_policy_repo;
+pub mod route_cost_event_repo;
 pub mod route_cost_repo;
 pub mod router_switch_repo;
 pub mod swap_time_repo;
@@ -14,6 +15,7 @@ pub use order_repo::{
 };
 pub use provider_health_repo::ProviderHealthRepository;
 pub use provider_policy_repo::ProviderPolicyRepository;
+pub use route_cost_event_repo::RouteCostEventRepository;
 pub use route_cost_repo::RouteCostRepository;
 pub use router_switch_repo::RouterSwitchRepository;
 pub use swap_time_repo::SwapTimeRepository;
@@ -104,5 +106,10 @@ impl Database {
     #[must_use]
     pub fn swap_times(&self) -> SwapTimeRepository {
         SwapTimeRepository::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn route_cost_events(&self) -> RouteCostEventRepository {
+        RouteCostEventRepository::new(self.pool.clone())
     }
 }

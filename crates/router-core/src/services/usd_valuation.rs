@@ -1022,32 +1022,6 @@ mod tests {
     }
 
     #[test]
-    fn usd_valuation_prices_wrapped_bitcoin_with_btc_reference_price() {
-        let pricing = PricingSnapshot {
-            source: "test_live_pricing".to_string(),
-            captured_at: Utc::now(),
-            expires_at: None,
-            stable_usd_micro: USD_MICRO,
-            eth_usd_micro: 3_000 * USD_MICRO,
-            btc_usd_micro: 100_000 * USD_MICRO,
-            hype_usd_micro: None,
-            ethereum_gas_price_wei: 25_000_000_000,
-            arbitrum_gas_price_wei: 100_000_000,
-            base_gas_price_wei: 20_000_000,
-        };
-        let asset = DepositAsset {
-            chain: ChainId::parse("evm:8453").unwrap(),
-            asset: AssetId::parse("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf").unwrap(),
-        };
-
-        let valuation = amount_valuation(&AssetRegistry::default(), &pricing, &asset, "100000000")
-            .expect("CBBTC should be priced");
-
-        assert_eq!(valuation["canonical"], "cbbtc");
-        assert_eq!(valuation["amountUsdMicro"], "100000000000");
-    }
-
-    #[test]
     fn usd_valuation_omits_amounts_that_overflow_value_math() {
         let pricing = PricingSnapshot {
             source: "test_live_pricing".to_string(),

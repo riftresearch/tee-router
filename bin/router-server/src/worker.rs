@@ -45,7 +45,10 @@ pub struct RouterWorkerConfig {
     pub worker_id: String,
     pub vault_work_poll_interval: Duration,
     pub order_execution_poll_interval: Duration,
-    pub route_cost_refresh_interval: Duration,
+    /// Window over which a full sweep of the curated route-cost allowlist is
+    /// spread. The worker paces small slices across this window so prices
+    /// refresh continuously instead of in one burst per interval.
+    pub route_cost_refresh_window: Duration,
     pub provider_health_poll_interval: Duration,
     pub order_maintenance_pass_limit: i64,
     pub order_planning_pass_limit: i64,
@@ -65,8 +68,8 @@ impl fmt::Debug for RouterWorkerConfig {
                 &self.order_execution_poll_interval,
             )
             .field(
-                "route_cost_refresh_interval",
-                &self.route_cost_refresh_interval,
+                "route_cost_refresh_window",
+                &self.route_cost_refresh_window,
             )
             .field(
                 "provider_health_poll_interval",
@@ -145,7 +148,7 @@ impl RouterWorkerConfig {
             order_execution_poll_interval: Duration::from_secs(
                 args.worker_order_execution_poll_seconds,
             ),
-            route_cost_refresh_interval: Duration::from_secs(
+            route_cost_refresh_window: Duration::from_secs(
                 args.worker_route_cost_refresh_seconds,
             ),
             provider_health_poll_interval: Duration::from_secs(
@@ -306,7 +309,11 @@ pub async fn run_worker_loop(
     vault_work_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut workflow_start_poll_interval = interval(config.order_execution_poll_interval);
     workflow_start_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut route_cost_refresh_interval = interval(config.route_cost_refresh_interval);
+    let route_cost_refresh_window = config.route_cost_refresh_window;
+    let mut route_cost_refresh_interval = interval(route_cost_pacing_tick(
+        route_cost_refresh_window,
+        route_costs.curated_unit_count(),
+    ));
     route_cost_refresh_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut provider_health_poll_interval = interval(config.provider_health_poll_interval);
     provider_health_poll_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -342,6 +349,7 @@ pub async fn run_worker_loop(
     spawn_route_cost_refresh_if_idle(
         &mut route_cost_tasks,
         route_costs.clone(),
+        route_cost_refresh_window,
         &mut pending_route_cost_refresh,
     );
     spawn_provider_health_poll_if_idle(
@@ -382,6 +390,7 @@ pub async fn run_worker_loop(
                 spawn_route_cost_refresh_if_idle(
                     &mut route_cost_tasks,
                     route_costs.clone(),
+                    route_cost_refresh_window,
                     &mut pending_route_cost_refresh,
                 );
             }
@@ -493,21 +502,36 @@ pub async fn run_worker_loop(
                 );
             }
             route_cost_result = route_cost_tasks.join_next(), if !route_cost_tasks.is_empty() => {
-                let summary = handle_route_cost_task_result(route_cost_result)?;
-                info!(
-                    candidate_edges = summary.candidate_edges,
-                    snapshots_upserted = summary.snapshots_upserted,
-                    provider_quotes_attempted = summary.provider_quotes_attempted,
-                    provider_quotes_succeeded = summary.provider_quotes_succeeded,
-                    provider_quotes_failed = summary.provider_quotes_failed,
-                    refreshed_at = %summary.refreshed_at,
-                    "Router worker refreshed route costs"
-                );
-                spawn_route_cost_refresh_if_idle(
-                    &mut route_cost_tasks,
-                    route_costs.clone(),
-                    &mut pending_route_cost_refresh,
-                );
+                // A failed refresh pass must never take down the worker: log it
+                // and let the next pacing tick retry the same slice.
+                match handle_route_cost_task_result(route_cost_result) {
+                    Ok(summary) => {
+                        if summary.snapshots_upserted > 0 || summary.provider_quotes_failed > 0 {
+                            info!(
+                                candidate_edges = summary.candidate_edges,
+                                snapshots_upserted = summary.snapshots_upserted,
+                                provider_quotes_attempted = summary.provider_quotes_attempted,
+                                provider_quotes_succeeded = summary.provider_quotes_succeeded,
+                                provider_quotes_failed = summary.provider_quotes_failed,
+                                refreshed_at = %summary.refreshed_at,
+                                "Router worker refreshed route costs"
+                            );
+                        } else {
+                            debug!(
+                                candidate_edges = summary.candidate_edges,
+                                "Router worker route-cost pass had no units due this tick"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            %err,
+                            "Router worker route-cost refresh pass failed; retrying on next tick"
+                        );
+                    }
+                }
+                // The next pacing tick re-arms `pending_route_cost_refresh` and
+                // spawns the following slice; nothing to do here.
             }
             provider_health_result = provider_health_tasks.join_next(), if !provider_health_tasks.is_empty() => {
                 let summary = handle_provider_health_task_result(provider_health_result)?;
@@ -602,12 +626,23 @@ fn spawn_workflow_start_if_idle(
 fn spawn_route_cost_refresh_if_idle(
     route_cost_tasks: &mut JoinSet<RouteCostTaskResult>,
     route_costs: Arc<RouteCostService>,
+    route_cost_refresh_window: Duration,
     pending_route_cost_refresh: &mut bool,
 ) {
     if route_cost_tasks.is_empty() && *pending_route_cost_refresh {
         *pending_route_cost_refresh = false;
-        route_cost_tasks.spawn(run_route_cost_refresh(route_costs));
+        route_cost_tasks.spawn(run_route_cost_refresh(route_costs, route_cost_refresh_window));
     }
+}
+
+/// How often the worker wakes to sample the next paced slice of curated route
+/// costs. Sized to `window / total_units` so each provider advances at most one
+/// work unit per tick (true one-by-one pacing); clamped so tiny windows (local
+/// debugging) still tick at least once a second and large windows still tick
+/// frequently enough to look continuous.
+fn route_cost_pacing_tick(window: Duration, total_units: usize) -> Duration {
+    let divisor = u32::try_from(total_units.max(1)).unwrap_or(u32::MAX);
+    (window / divisor).clamp(Duration::from_secs(1), Duration::from_secs(15))
 }
 
 fn spawn_provider_health_poll_if_idle(
@@ -777,10 +812,13 @@ async fn mark_order_funded_and_start_workflow(
     }
 }
 
-async fn run_route_cost_refresh(route_costs: Arc<RouteCostService>) -> RouteCostTaskResult {
+async fn run_route_cost_refresh(
+    route_costs: Arc<RouteCostService>,
+    route_cost_refresh_window: Duration,
+) -> RouteCostTaskResult {
     let started = Instant::now();
     let summary = route_costs
-        .refresh_anchor_costs()
+        .refresh_due_costs(route_cost_refresh_window)
         .await
         .map_err(|err| err.to_string())?;
     telemetry::record_worker_tick("route_cost_refresh", started.elapsed());
@@ -1005,7 +1043,7 @@ mod tests {
             worker_id: "worker-1".to_string(),
             vault_work_poll_interval: Duration::from_secs(60),
             order_execution_poll_interval: Duration::from_secs(5),
-            route_cost_refresh_interval: Duration::from_secs(300),
+            route_cost_refresh_window: Duration::from_secs(300),
             provider_health_poll_interval: Duration::from_secs(120),
             order_maintenance_pass_limit: 100,
             order_planning_pass_limit: 100,

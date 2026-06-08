@@ -3,9 +3,11 @@ use crate::{
         CreateOrderRequest, CreateQuoteRequest, CreateVaultRequest, DetectorHintEnvelope,
         DetectorHintRequest, DetectorHintTarget, OrderRefundEnvelope, OrderRefundOutcome,
         ProviderHealthEnvelope, ProviderOperationHintEnvelope, ProviderOperationHintRequest,
-        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, RouterSwitchEnvelope,
-        RouterSwitchListEnvelope, UpdateProviderPolicyRequest, UpdateRouterSwitchRequest,
-        VaultFundingHintEnvelope, VaultFundingHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN,
+        ProviderPolicyEnvelope, ProviderPolicyListEnvelope, RouteExplainEnvelope,
+        RouteExplainRequest, RouteGraphEdge, RouteGraphEnvelope, RouteGraphNode,
+        RouterSwitchEnvelope, RouterSwitchListEnvelope, UpdateProviderPolicyRequest,
+        UpdateRouterSwitchRequest, VaultFundingHintEnvelope, VaultFundingHintRequest,
+        MAX_HINT_IDEMPOTENCY_KEY_LEN,
     },
     app::{initialize_components, PaymasterMode, RouterComponents},
     error::{RouterServerError, RouterServerResult},
@@ -39,7 +41,7 @@ use router_core::{
         StatusResponse, VaultAction,
     },
     protocol::{backend_chain_for_id, supported_chain_ids, ChainId},
-    services::asset_registry::ProviderId,
+    services::asset_registry::{AssetRegistry, MarketOrderNode, ProviderId},
 };
 use router_temporal::{
     boxed as boxed_temporal_error, OrderWorkflowClient, ProviderHintKind, ProviderKind,
@@ -271,6 +273,8 @@ pub fn build_api_router(state: AppState, cors_domain: Option<String>) -> Router 
         )
         .route("/internal/v1/orders/:id/flow", get(get_order_flow))
         .route("/internal/v1/orders/:id/refund", post(trigger_order_refund))
+        .route("/internal/v1/route-graph", get(get_route_graph))
+        .route("/internal/v1/route-explain", post(explain_route))
         .route("/api/v1/chains/:chain/tip", get(get_chain_tip))
         .with_state(state)
         .layer(DefaultBodyLimit::max(MAX_ROUTER_JSON_BODY_BYTES))
@@ -1194,6 +1198,127 @@ async fn get_order_flow(
 ) -> RouterServerResult<Json<crate::api::OrderFlowEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
     Ok(Json(crate::query_api::get_order_flow(&state.db, id).await?))
+}
+
+/// Admin-only export of the static routing graph for the dashboard visualizer.
+/// Emits every declared transition plus the curated Velora same-chain swap
+/// edges so live-priced Velora legs still render on the graph.
+async fn get_route_graph(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> RouterServerResult<Json<RouteGraphEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    Ok(Json(build_route_graph(state.order_manager.asset_registry())))
+}
+
+/// Admin-only dry-run route explainer powering the interactive demo. Runs the
+/// real BFS/ranking/confidence-band pipeline without persisting anything; with
+/// `live_quote` it additionally reports real per-path outputs and the winner.
+async fn explain_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RouterJson(request): RouterJson<RouteExplainRequest>,
+) -> RouterServerResult<Json<RouteExplainEnvelope>> {
+    authorize_admin_api_request(&state, &headers)?;
+    let explain = state
+        .order_manager
+        .explain_market_order_route(request)
+        .await?;
+    Ok(Json(RouteExplainEnvelope { explain }))
+}
+
+/// Stable node key shared by graph nodes and edge `from`/`to` references.
+fn route_graph_node_key(node: &MarketOrderNode) -> String {
+    match node {
+        MarketOrderNode::External(asset) => {
+            format!("external:{}:{}", asset.chain.as_str(), asset.asset.as_str())
+        }
+        MarketOrderNode::Venue {
+            provider,
+            canonical,
+        } => format!("venue:{}:{}", provider.as_str(), canonical.as_str()),
+    }
+}
+
+fn build_route_graph(registry: &AssetRegistry) -> RouteGraphEnvelope {
+    use std::collections::BTreeMap;
+
+    // Curated sampling set: edges the route-cost refresher persists measured
+    // bps for. Used to flag edges so the dashboard can scaffold its tables.
+    let curated_ids: std::collections::HashSet<String> = registry
+        .curated_cacheable_transitions()
+        .iter()
+        .map(|decl| decl.id.clone())
+        .collect();
+
+    // Edges: declared transitions + curated Velora swap edges (which are not
+    // part of the static declaration set but should still be visible).
+    let declarations = registry.display_transition_declarations();
+
+    let mut nodes: BTreeMap<String, RouteGraphNode> = BTreeMap::new();
+    let mut node_from_market_node = |node: &MarketOrderNode| -> String {
+        let key = route_graph_node_key(node);
+        nodes.entry(key.clone()).or_insert_with(|| match node {
+            MarketOrderNode::External(asset) => {
+                let canonical = registry
+                    .canonical_for(asset)
+                    .map(|canonical| canonical.as_str().to_string())
+                    .unwrap_or_default();
+                let decimals = registry
+                    .chain_asset(asset)
+                    .map(|entry| entry.decimals)
+                    .unwrap_or(0);
+                RouteGraphNode {
+                    key: key.clone(),
+                    kind: "external".to_string(),
+                    chain: asset.chain.as_str().to_string(),
+                    asset: asset.asset.as_str().to_string(),
+                    canonical,
+                    decimals,
+                }
+            }
+            MarketOrderNode::Venue {
+                provider,
+                canonical,
+            } => RouteGraphNode {
+                key: key.clone(),
+                kind: "venue".to_string(),
+                chain: format!("venue:{}", provider.as_str()),
+                asset: canonical.as_str().to_string(),
+                canonical: canonical.as_str().to_string(),
+                decimals: 0,
+            },
+        });
+        key
+    };
+
+    let mut edges: Vec<RouteGraphEdge> = Vec::with_capacity(declarations.len());
+    let mut seen_edge_ids = std::collections::HashSet::new();
+    for decl in &declarations {
+        if !seen_edge_ids.insert(decl.id.clone()) {
+            continue;
+        }
+        let from = node_from_market_node(&decl.from);
+        let to = node_from_market_node(&decl.to);
+        edges.push(RouteGraphEdge {
+            id: decl.id.clone(),
+            provider: decl.provider.as_str().to_string(),
+            kind: decl.kind.as_str().to_string(),
+            edge_kind: decl.route_edge_kind().as_str().to_string(),
+            from,
+            to,
+            from_chain: decl.input.asset.chain.as_str().to_string(),
+            from_asset: decl.input.asset.asset.as_str().to_string(),
+            to_chain: decl.output.asset.chain.as_str().to_string(),
+            to_asset: decl.output.asset.asset.as_str().to_string(),
+            curated: curated_ids.contains(&decl.id),
+        });
+    }
+
+    RouteGraphEnvelope {
+        nodes: nodes.into_values().collect(),
+        edges,
+    }
 }
 
 /// Admin-only endpoint to manually trigger a refund for an order stuck in

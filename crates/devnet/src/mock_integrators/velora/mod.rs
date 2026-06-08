@@ -21,13 +21,16 @@ use crate::mock_integrators::velora::contract::MockVeloraSwap;
 use crate::mock_integrators::parse_amount;
 
 /// Per-venue state for the Velora mock: the simulated USD price book, the
-/// per-network swap-contract addresses, and the two injectable
-/// transaction-failure counters.
+/// per-network swap-contract addresses, the two injectable
+/// transaction-failure counters, and the flat quote-fee haircut.
 pub(crate) struct VeloraMockState {
     pub(crate) usd_prices: Mutex<BTreeMap<String, u128>>,
     pub(crate) swap_contract_addresses: BTreeMap<u64, String>,
     pub(crate) transaction_failures_remaining: Mutex<usize>,
     pub(crate) transaction_stale_quote_failures_remaining: Mutex<usize>,
+    /// Flat fee applied to quote amounts, in basis points: haircuts the `SELL`
+    /// output and grosses up the `BUY` input. Zero means a 1:1 price conversion.
+    pub(crate) quote_fee_bps: u16,
 }
 
 /// Builds the Velora mock router. Mounted under `/velora`; receives its own
@@ -164,29 +167,60 @@ async fn mock_velora_quote_amounts(
         .get(dest_symbol.as_str())
         .ok_or_else(|| format!("missing USD price for {dest_symbol}"))?;
 
+    let fee_bps = state.quote_fee_bps;
     match query.side.as_str() {
-        "SELL" => Ok((
-            amount,
-            convert_raw_amount_floor(
+        "SELL" => {
+            let gross_output = convert_raw_amount_floor(
                 amount,
                 src_price,
                 query.src_decimals,
                 dest_price,
                 query.dest_decimals,
-            )?,
-        )),
-        "BUY" => Ok((
-            convert_raw_amount_ceil(
+            )?;
+            // Haircut the output so the swap shows a realistic value loss
+            // instead of a perfect price conversion.
+            let net_output = apply_mock_velora_discount(gross_output, fee_bps)?;
+            Ok((amount, net_output))
+        }
+        "BUY" => {
+            let gross_input = convert_raw_amount_ceil(
                 amount,
                 dest_price,
                 query.dest_decimals,
                 src_price,
                 query.src_decimals,
-            )?,
-            amount,
-        )),
+            )?;
+            // Gross up the input the caller must supply to net `amount` out.
+            let net_input = gross_up_mock_velora_input(gross_input, fee_bps)?;
+            Ok((net_input, amount))
+        }
         other => Err(format!("unsupported side: {other}")),
     }
+}
+
+/// Haircut `amount` by `fee_bps` (exact-input / `SELL`): the caller keeps
+/// `(10_000 - fee_bps) / 10_000` of the converted output.
+fn apply_mock_velora_discount(amount: u128, fee_bps: u16) -> Result<u128, String> {
+    let keep_bps = 10_000_u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| "mock Velora fee bps exceed 100%".to_string())?;
+    amount
+        .checked_mul(keep_bps)
+        .map(|value| value / 10_000_u128)
+        .ok_or_else(|| "mock Velora exact-input quote amount overflow".to_string())
+}
+
+/// Gross up `amount` by `fee_bps` (exact-output / `BUY`): the caller must
+/// supply `amount * 10_000 / (10_000 - fee_bps)` to net `amount` out.
+fn gross_up_mock_velora_input(amount: u128, fee_bps: u16) -> Result<u128, String> {
+    let keep_bps = 10_000_u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| "mock Velora fee bps exceed 100%".to_string())?
+        .max(1);
+    amount
+        .checked_mul(10_000_u128)
+        .map(|value| value.div_ceil(keep_bps))
+        .ok_or_else(|| "mock Velora exact-output quote amount overflow".to_string())
 }
 
 pub(crate) fn default_velora_usd_prices() -> BTreeMap<String, u128> {

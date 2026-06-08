@@ -339,3 +339,178 @@ export type MetricsEvent = {
   analyticsChanged?: boolean
   sort?: 'created_at_desc'
 }
+
+export type RouteCostSnapshot = {
+  transitionId: string
+  amountBucket: string
+  provider: string
+  edgeKind: string
+  source: AssetRef
+  destination: AssetRef
+  estimatedFeeBps: number
+  estimatedFeeUsdMicros: number
+  estimatedGasUsdMicros: number
+  estimatedLatencyMs: number
+  sampleAmountUsdMicros: number
+  quoteSource: string
+  refreshedAt: string
+  expiresAt: string
+  expired: boolean
+}
+
+export type RouteCostsResponse = {
+  snapshots: RouteCostSnapshot[]
+  fetchedAt: string
+}
+
+export type RouteCostSampleOutcome = 'succeeded' | 'failed'
+
+export type RouteCostSampleEvent = {
+  id: string
+  sampledAt: string
+  provider: string
+  transitionId: string
+  amountBucket: string
+  edgeKind: string
+  source: AssetRef
+  destination: AssetRef
+  sampleAmountUsdMicros: number
+  outcome: RouteCostSampleOutcome
+  estimatedFeeBps: number | null
+  estimatedLatencyMs: number | null
+  reason: string | null
+}
+
+export type RouteCostEventsResponse = {
+  events: RouteCostSampleEvent[]
+  windowSeconds: number
+  fetchedAt: string
+}
+
+// Route graph + dry-run explain types. These mirror the snake_case JSON
+// emitted directly by router-api (the dashboard server proxies the payload
+// through unchanged), unlike the camelCase replica-backed types above.
+
+export type RouteGraphNode = {
+  key: string
+  kind: 'external' | 'venue' | string
+  chain: string
+  asset: string
+  canonical: string
+  decimals: number
+}
+
+export type RouteGraphEdge = {
+  id: string
+  provider: string
+  kind: string
+  edge_kind: string
+  from: string
+  to: string
+  from_chain: string
+  from_asset: string
+  to_chain: string
+  to_asset: string
+  curated: boolean
+}
+
+export type RouteGraphResponse = {
+  nodes: RouteGraphNode[]
+  edges: RouteGraphEdge[]
+}
+
+export type RouteExplainAsset = {
+  chain: string
+  asset: string
+}
+
+export type RouteExplainRequest = {
+  from_asset: RouteExplainAsset
+  to_asset: RouteExplainAsset
+  amount_in: string
+  live_quote?: boolean
+}
+
+export type RouteTransitionView = {
+  id: string
+  provider: string
+  kind: string
+  edge_kind: string
+  from_chain: string
+  from_asset: string
+  to_chain: string
+  to_asset: string
+}
+
+export type RankedPathView = {
+  rank: number
+  path_id: string
+  top_path: boolean
+  winner: boolean
+  hop_count: number
+  missing_edges: number
+  total_effective_cost_usd_micros: number
+  total_latency_ms: number
+  transitions: RouteTransitionView[]
+  estimated_amount_out: string | null
+}
+
+export type RouteExplainCounts = {
+  paths_enumerated: number
+  paths_after_executable: number
+  paths_after_provider: number
+  paths_after_hyperevm: number
+  paths_after_same_chain: number
+  ranked_count: number
+  top_paths: number
+}
+
+export type RouteExplainTimings = {
+  bfs_ms: number
+  rank_ms: number
+  live_quote_ms: number
+  total_ms: number
+}
+
+export type RouteExplainGraphNode = {
+  key: string
+  kind: string
+  chain: string
+  asset: string
+  canonical: string
+  depth: number
+  role: string
+}
+
+export type RouteExplainGraphEdge = {
+  id: string
+  from: string
+  to: string
+  provider: string
+  kind: string
+  edge_kind: string
+}
+
+export type RouteExplainGraph = {
+  nodes: RouteExplainGraphNode[]
+  edges: RouteExplainGraphEdge[]
+  max_depth: number
+}
+
+export type RouteExplain = {
+  from_asset: RouteExplainAsset
+  to_asset: RouteExplainAsset
+  amount_in: string
+  request_usd_micros: number
+  tier_label: string
+  live_quote: boolean
+  counts: RouteExplainCounts
+  timings: RouteExplainTimings
+  ranked: RankedPathView[]
+  winner_path_id: string | null
+  graph: RouteExplainGraph
+}
+
+export type RouteExplainResponse = {
+  explain: RouteExplain
+}

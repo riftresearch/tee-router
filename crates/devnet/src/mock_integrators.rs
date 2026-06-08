@@ -369,6 +369,10 @@ pub struct MockIntegratorConfig {
     /// Deterministic per-quote jitter added on top of `across_quote_fee_bps`,
     /// in basis points. The actual jitter is derived from the request.
     pub across_quote_jitter_bps: u16,
+    /// Flat fee applied to mock Velora swap quotes, in basis points. Reduces
+    /// the `SELL` output (and grosses up the `BUY` input) so curated USDC/USDT
+    /// swaps show a realistic non-zero value loss instead of a 1:1 conversion.
+    pub velora_quote_fee_bps: u16,
     /// Artificial delay after a mock Across deposit is indexed before
     /// `/deposit/status` can leave `pending`.
     pub across_status_latency: Duration,
@@ -415,6 +419,7 @@ impl Default for MockIntegratorConfig {
             hyperliquid_withdrawal_latency: Duration::ZERO,
             across_quote_fee_bps: 0,
             across_quote_jitter_bps: 0,
+            velora_quote_fee_bps: 0,
             across_status_latency: Duration::ZERO,
             across_refund_probability_bps: 0,
         }
@@ -694,6 +699,12 @@ impl MockIntegratorConfig {
     #[must_use]
     pub fn with_across_quote_fee_bps(mut self, fee_bps: u16) -> Self {
         self.across_quote_fee_bps = fee_bps.min(9_999);
+        self
+    }
+
+    #[must_use]
+    pub fn with_velora_quote_fee_bps(mut self, fee_bps: u16) -> Self {
+        self.velora_quote_fee_bps = fee_bps.min(9_999);
         self
     }
 
@@ -1151,6 +1162,7 @@ impl MockIntegratorState {
             transaction_stale_quote_failures_remaining: Mutex::new(
                 config.velora_transaction_stale_quote_fail_next_n,
             ),
+            quote_fee_bps: config.velora_quote_fee_bps.min(9_999),
         });
         let unit = Arc::new(UnitMockState {
             generate_address_requests: Mutex::default(),

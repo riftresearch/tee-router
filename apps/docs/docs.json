@@ -29,7 +29,7 @@
             ]
           },
           {
-            "group": "API Endpoints",
+            "group": "API Endpoints (beta)",
             "pages": [
               "POST /quote",
               "POST /order/market",

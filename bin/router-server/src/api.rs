@@ -230,6 +230,170 @@ pub struct OrderFlowEnvelope {
     pub flow: OrderFlow,
 }
 
+/// Response body for `GET /internal/v1/route-graph`. A static snapshot of the
+/// `AssetRegistry` routing graph (every declared transition plus the curated
+/// Velora same-chain swap edges) used by the admin dashboard visualizer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteGraphEnvelope {
+    pub nodes: Vec<RouteGraphNode>,
+    pub edges: Vec<RouteGraphEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteGraphNode {
+    /// Stable node key shared by the edge `from`/`to` references.
+    pub key: String,
+    /// `external` (a chain asset) or `venue` (a Hyperliquid spot node).
+    pub kind: String,
+    pub chain: String,
+    pub asset: String,
+    pub canonical: String,
+    pub decimals: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteGraphEdge {
+    /// Matches the route-cost `transition_id` so cached bps can be joined.
+    pub id: String,
+    pub provider: String,
+    pub kind: String,
+    pub edge_kind: String,
+    pub from: String,
+    pub to: String,
+    pub from_chain: String,
+    pub from_asset: String,
+    pub to_chain: String,
+    pub to_asset: String,
+    /// True when this edge is in the curated route-cost sampling set, i.e. the
+    /// refresher persists a measured bps row for it. The dashboard uses this to
+    /// scaffold the route-cost tables (so curated routes still render with
+    /// dashes when no snapshot exists yet).
+    pub curated: bool,
+}
+
+/// Request body for `POST /internal/v1/route-explain`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteExplainRequest {
+    pub from_asset: DepositAsset,
+    pub to_asset: DepositAsset,
+    pub amount_in: String,
+    /// When true, additionally live-quotes the top ranked paths to report real
+    /// per-path outputs and the true winner. Defaults to cache-only dry run.
+    #[serde(default)]
+    pub live_quote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainEnvelope {
+    pub explain: RouteExplain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplain {
+    pub from_asset: DepositAsset,
+    pub to_asset: DepositAsset,
+    pub amount_in: String,
+    pub request_usd_micros: u64,
+    pub tier_label: String,
+    pub live_quote: bool,
+    pub counts: RouteExplainCounts,
+    pub timings: RouteExplainTimings,
+    pub ranked: Vec<RankedPathView>,
+    pub winner_path_id: Option<String>,
+    /// Source->destination candidate subgraph: exactly the nodes and edges that
+    /// participate in a viable ranked path, laid out left-to-right by hop depth
+    /// from the source (source at depth 0, destination forced to `max_depth`).
+    pub graph: RouteExplainGraph,
+}
+
+/// Source->destination corridor for the route-explain visualizer: the full
+/// declared display topology (incl. curated same-chain Velora swaps) restricted
+/// to nodes between source and destination. Ranked routes are overlaid as
+/// highlights by the dashboard via edge ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainGraph {
+    pub nodes: Vec<RouteExplainGraphNode>,
+    pub edges: Vec<RouteExplainGraphEdge>,
+    pub max_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainGraphNode {
+    /// Stable key shared with edge `from`/`to` references.
+    pub key: String,
+    /// `external` (a real chain asset) or `venue` (an internal venue node).
+    pub kind: String,
+    pub chain: String,
+    pub asset: String,
+    pub canonical: String,
+    /// Min hop distance from the source node (source = 0). The destination is
+    /// pinned to `max_depth` so it renders in the rightmost column.
+    pub depth: usize,
+    /// `source`, `destination`, or `intermediate`.
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainGraphEdge {
+    /// Transition id; matches `RouteTransitionView.id` and the route-cost
+    /// `transition_id`, so the dashboard can join cached bps and highlight.
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    pub provider: String,
+    pub kind: String,
+    pub edge_kind: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RouteExplainCounts {
+    pub paths_enumerated: usize,
+    pub paths_after_executable: usize,
+    pub paths_after_provider: usize,
+    pub paths_after_hyperevm: usize,
+    pub paths_after_same_chain: usize,
+    pub ranked_count: usize,
+    /// Number of top-ranked paths selected for live quoting (hardcoded top-N).
+    pub top_paths: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RouteExplainTimings {
+    pub bfs_ms: u64,
+    pub rank_ms: u64,
+    pub live_quote_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedPathView {
+    pub rank: usize,
+    pub path_id: String,
+    /// True when this path is in the top-N set selected for live quoting.
+    pub top_path: bool,
+    pub winner: bool,
+    pub hop_count: usize,
+    pub missing_edges: usize,
+    pub total_effective_cost_usd_micros: u64,
+    pub total_latency_ms: u64,
+    pub transitions: Vec<RouteTransitionView>,
+    /// Present only when `live_quote` was requested and this path was quoted.
+    pub estimated_amount_out: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTransitionView {
+    pub id: String,
+    pub provider: String,
+    pub kind: String,
+    pub edge_kind: String,
+    pub from_chain: String,
+    pub from_asset: String,
+    pub to_chain: String,
+    pub to_asset: String,
+}
+
 /// Response body for the admin manual-refund endpoint
 /// (`POST /internal/v1/orders/:id/refund`).
 #[derive(Debug, Clone, Serialize, Deserialize)]

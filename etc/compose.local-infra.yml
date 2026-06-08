@@ -560,7 +560,7 @@ services:
     environment:
       <<: *router_env
       ROUTER_WORKER_ID: local-router-worker
-      ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS: 30
+      ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS: 1800
     volumes:
       - router_local_master_key:/run/router-secrets:ro
 
@@ -885,6 +885,8 @@ services:
         condition: service_healthy
       admin-dashboard-analytics-db:
         condition: service_healthy
+      router-api:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       ADMIN_DASHBOARD_PRODUCTION: "false"
@@ -900,6 +902,12 @@ services:
       ADMIN_DASHBOARD_CDC_SLOT_NAME: admin_dashboard_orders_cdc
       ROUTER_CDC_PUBLICATION_NAME: router_cdc_publication
       ROUTER_CDC_MESSAGE_PREFIX: rift.router.change
+      # Match the worker's ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS so the
+      # Route Costs schedule timeline spans the real refresh window.
+      ROUTE_COST_WINDOW_SECONDS: "1800"
+      # Upstream router-api base for the Route Graph visualizer proxy. The admin
+      # API key is injected by the devnet overlay.
+      ROUTER_INTERNAL_BASE_URL: http://router-api:4522
       BETTER_AUTH_SECRET: local-admin-dashboard-secret-000000
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}

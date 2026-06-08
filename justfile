@@ -243,6 +243,20 @@ test-stack:
   just dc up -d --build
   just router-loadgen 1
 
+# Probe the new tier-aware ranking + confidence-band fanout across a size
+# sweep for a single pair. Prints quote responses, the structured routing
+# info log per quote_id, and a summary table.
+# Examples:
+#   just route-probe Ethereum.USDC Base.USDC
+#   just route-probe Ethereum.ETH Bitcoin.BTC 100,1000,10000,100000,1000000,10000000
+route-probe from to='Bitcoin.BTC' sizes='100,1000,10000,100000,1000000,10000000':
+    cargo run --release -p router-loadgen -- probe-routing \
+      --gateway-url http://localhost:3001 \
+      --devnet-manifest-url http://localhost:50108/manifest.json \
+      --from {{from}} \
+      --to {{to}} \
+      --sizes-usd-csv {{sizes}}
+
 
 # Inspect test-wallet balances across local EVM chains, Hyperliquid, and Bitcoin.
 # Examples:
@@ -268,6 +282,10 @@ test-integration:
 # that touch order workflow / Sauron observation / hint verification.
 test-all:
     cargo nextest run --workspace --run-ignored=all
+
+# Router graph traversal tests only (no devnet required).
+test-graph:
+    cargo nextest run -p router-core --test graph_traversal
 
 # --- Phala (TEE) deploy -----------------------------------------------------
 # No CI/CD for Phala by design. Images are built+pushed to GHCR by the image

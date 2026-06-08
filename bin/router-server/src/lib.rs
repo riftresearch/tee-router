@@ -308,11 +308,13 @@ pub struct RouterServerArgs {
     )]
     pub worker_order_execution_poll_seconds: u64,
 
-    /// Active router-worker route-cost refresh interval, in seconds
+    /// Window (in seconds) over which a full sweep of the curated route-cost
+    /// allowlist is spread. The worker paces small slices across this window so
+    /// every provider's prices refresh continuously rather than in one burst.
     #[arg(
         long,
         env = "ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS",
-        default_value = "300"
+        default_value = "1800"
     )]
     pub worker_route_cost_refresh_seconds: u64,
 

@@ -43,7 +43,11 @@ use router_core::{
         quote_legs::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
-        route_costs::{rank_transition_paths_structurally, RouteCostService},
+        route_costs::{
+            confidence_band, rank_transition_paths_structurally, raw_amount_to_usd_micros,
+            select_best_quote, LiveQuoteOutcome, RankedTransitionPath, RouteCostService,
+            DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+        },
         usd_valuation::{empty_usd_valuation, limit_quote_usd_valuation, quote_usd_valuation},
     },
 };
@@ -55,7 +59,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::warn;
+use futures_util::future::join_all;
+use std::str::FromStr;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -246,6 +252,27 @@ impl OrderManager {
         self
     }
 
+    /// Drop paths that traverse HyperEVM when we cannot currently price its
+    /// gas. Without a live HyperEVM gas price these routes can't be costed, so
+    /// surfacing them would be misleading. Returns `true` if any path was
+    /// removed.
+    async fn filter_unpriceable_hyperevm_paths(&self, paths: &mut Vec<TransitionPath>) -> bool {
+        if !paths.iter().any(path_uses_hyperevm) {
+            return false;
+        }
+        let Some(route_costs) = self.route_costs.as_ref() else {
+            paths.retain(|path| !path_uses_hyperevm(path));
+            return true;
+        };
+        let pricing = route_costs.force_refresh_pricing_snapshot().await;
+        let hyperevm_chain = ChainId::parse("evm:999").expect("static HyperEVM chain id");
+        if pricing.supports_chain_gas_pricing(&hyperevm_chain) {
+            return false;
+        }
+        paths.retain(|path| !path_uses_hyperevm(path));
+        true
+    }
+
     #[must_use]
     pub fn with_provider_policies(
         mut self,
@@ -267,6 +294,13 @@ impl OrderManager {
     pub fn with_paymasters(mut self, paymasters: PaymasterRegistry) -> Self {
         self.paymasters = paymasters;
         self
+    }
+
+    /// Shared static routing graph. Exposed for the admin route-graph
+    /// visualizer endpoint.
+    #[must_use]
+    pub fn asset_registry(&self) -> &AssetRegistry {
+        self.asset_registry.as_ref()
     }
 
     pub async fn quote_market_order(
@@ -866,18 +900,21 @@ impl OrderManager {
                 },
             });
         }
-        if let Some(route_costs) = self.route_costs.as_ref() {
-            if let Err(err) = route_costs.rank_transition_paths(&mut paths).await {
-                warn!(
-                    error = %err,
-                    "route-cost ranking failed; falling back to structural route ordering"
-                );
-                rank_transition_paths_structurally(&mut paths);
-            }
-        } else {
-            rank_transition_paths_structurally(&mut paths);
+
+        let request_usd_micros = self.market_request_usd_micros(request).await;
+        let mut ranked = self
+            .rank_market_paths(&mut paths, request_usd_micros)
+            .await;
+        // Truncate both the path list and the ranked summary in lockstep
+        // so confidence_band sees the same set we will quote against.
+        if ranked.len() > TOP_K_PATHS {
+            ranked.truncate(TOP_K_PATHS);
         }
-        paths.truncate(TOP_K_PATHS);
+        if paths.len() > TOP_K_PATHS {
+            paths.truncate(TOP_K_PATHS);
+        }
+        let band_count = confidence_band(&ranked, request_usd_micros, TOP_K_PATHS);
+        telemetry::record_route_select_band_size(band_count);
 
         let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
             Some(
@@ -900,21 +937,31 @@ impl OrderManager {
             None
         };
 
+        // Confidence-band fanout: live-quote `band_count` paths in parallel
+        // and pick the highest `estimated_amount_out`. Outside the band we
+        // trust the cached/structural leader because we have no evidence
+        // any deeper peer will beat it.
+        let band_paths: Vec<&TransitionPath> = ranked
+            .iter()
+            .take(band_count)
+            .map(|ranked_path| &ranked_path.path)
+            .collect();
+        let band_quote_futures = band_paths.iter().map(|path| {
+            self.quote_transition_path(
+                request,
+                quote_id,
+                source_depositor_address,
+                path,
+                provider_policy_snapshot.as_ref(),
+                provider_health_snapshot.as_ref(),
+            )
+        });
+        let band_results = join_all(band_quote_futures).await;
+
+        let mut outcomes: Vec<LiveQuoteOutcome> = Vec::with_capacity(band_results.len());
+        let mut survivors: Vec<ComposedMarketOrderQuote> = Vec::with_capacity(band_results.len());
         let mut last_error: Option<MarketOrderError> = None;
-        for path in paths {
-            // Path ranking is the route-selection decision. Provider quotes
-            // then prove executability for that ranked path; they do not
-            // re-run global path search by maximizing raw output.
-            let candidate = self
-                .quote_transition_path(
-                    request,
-                    quote_id,
-                    source_depositor_address,
-                    &path,
-                    provider_policy_snapshot.as_ref(),
-                    provider_health_snapshot.as_ref(),
-                )
-                .await;
+        for (candidate, path) in band_results.into_iter().zip(band_paths.iter()) {
             let quote = match candidate {
                 Ok(Some(quote)) => quote,
                 Ok(None) => continue,
@@ -928,16 +975,536 @@ impl OrderManager {
                 last_error = Some(err);
                 continue;
             }
-            return Ok(quote);
+            let estimated_amount_out = U256::from_str(&quote.estimated_amount_out).unwrap_or_default();
+            outcomes.push(LiveQuoteOutcome {
+                quote_index: survivors.len(),
+                path_id: path.id.clone(),
+                hop_count: path.transitions.len(),
+                estimated_amount_out,
+            });
+            survivors.push(quote);
         }
 
-        match last_error {
-            Some(err) => Err(err),
-            None => Err(MarketOrderError::NoRoute {
-                reason: "no executable transition path satisfied the requested constraints"
-                    .to_string(),
-            }),
+        if survivors.is_empty() {
+            return match last_error {
+                Some(err) => Err(err),
+                None => Err(MarketOrderError::NoRoute {
+                    reason: "no executable transition path satisfied the requested constraints"
+                        .to_string(),
+                }),
+            };
         }
+
+        let winning_index = select_best_quote(&outcomes).unwrap_or(0);
+        let winning_outcome = outcomes[winning_index].clone();
+        let chosen = survivors[winning_outcome.quote_index].clone();
+        if let Some(leader_outcome) = outcomes.first() {
+            if leader_outcome.path_id != winning_outcome.path_id {
+                telemetry::record_route_select_best_path_not_leader();
+            }
+            let leader_out = leader_outcome.estimated_amount_out;
+            let chosen_out = winning_outcome.estimated_amount_out;
+            let delta_bps = compute_route_select_delta_bps(leader_out, chosen_out);
+            telemetry::record_route_select_best_output_delta_bps(delta_bps);
+            info!(
+                quote_id = %quote_id,
+                request_usd_micros,
+                band_size = band_count,
+                ranked_count = ranked.len(),
+                leader_path_id = %leader_outcome.path_id,
+                chosen_path_id = %winning_outcome.path_id,
+                delta_bps,
+                "best_provider_quote selected"
+            );
+        }
+        Ok(chosen)
+    }
+
+    /// Dry-run explainer used by the admin dashboard route-graph visualizer.
+    /// Mirrors the staged pipeline of [`Self::best_provider_quote`] (BFS ->
+    /// filters -> rank) but persists nothing and is instrumented with per-stage
+    /// counts and timings. When `live_quote` is set it additionally live-quotes
+    /// the hardcoded top-N ranked paths to report real per-path outputs and the
+    /// winning path. Cache-only by default.
+    pub async fn explain_market_order_route(
+        &self,
+        request: crate::api::RouteExplainRequest,
+    ) -> MarketOrderResult<crate::api::RouteExplain> {
+        use crate::api::{
+            RankedPathView, RouteExplain, RouteExplainCounts, RouteExplainTimings,
+            RouteTransitionView,
+        };
+
+        const MAX_PATH_DEPTH: usize = 5;
+        const TOP_K_PATHS: usize = 8;
+        // Live quoting (when requested) always targets the top-N ranked paths.
+        const LIVE_QUOTE_TOP_N: usize = 3;
+
+        let total_started = Instant::now();
+        validate_positive_amount("amount_in", &request.amount_in)?;
+        let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
+        let destination_asset = self.validate_and_normalize_asset(&request.to_asset)?;
+
+        let bfs_started = Instant::now();
+        let mut paths = self.asset_registry.select_transition_paths(
+            &source_asset,
+            &destination_asset,
+            MAX_PATH_DEPTH,
+        );
+        let paths_enumerated = paths.len();
+        let bfs_ms = bfs_started.elapsed().as_millis() as u64;
+
+        // Apply the same retain filters as `best_provider_quote`, capturing the
+        // surviving count after each stage so the UI can show how the candidate
+        // set narrows.
+        let mut normalized_request = NormalizedMarketOrderQuoteRequest {
+            source_asset: source_asset.clone(),
+            destination_asset: destination_asset.clone(),
+            amount_in: request.amount_in.clone(),
+            routing: NormalizedMarketOrderRouting {
+                provider_sequence: None,
+            },
+        };
+
+        paths.retain(|path| is_executable_transition_path(path));
+        let paths_after_executable = paths.len();
+        paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
+        let paths_after_provider = paths.len();
+        self.filter_unpriceable_hyperevm_paths(&mut paths).await;
+        let paths_after_hyperevm = paths.len();
+        prefer_same_chain_evm_paths(&normalized_request, &mut paths);
+        let paths_after_same_chain = paths.len();
+
+        let request_usd_micros = self
+            .request_usd_micros(&source_asset, &request.amount_in)
+            .await;
+        let tier_label =
+            router_core::services::route_costs::select_route_cost_tier(request_usd_micros)
+                .label
+                .to_string();
+
+        let rank_started = Instant::now();
+        let mut ranked = self.rank_market_paths(&mut paths, request_usd_micros).await;
+        if ranked.len() > TOP_K_PATHS {
+            ranked.truncate(TOP_K_PATHS);
+        }
+        if paths.len() > TOP_K_PATHS {
+            paths.truncate(TOP_K_PATHS);
+        }
+        let rank_ms = rank_started.elapsed().as_millis() as u64;
+        let ranked_count = ranked.len();
+        // Top-N ranked paths are the live-quote set (hardcoded), replacing the
+        // old variable-width confidence band.
+        let top_paths = ranked_count.min(LIVE_QUOTE_TOP_N);
+
+        // Source->destination corridor for the visualizer: the full declared
+        // topology (incl. curated same-chain Velora swaps) restricted to the
+        // nodes between source and destination. The ranked routes above are
+        // overlaid as highlights by the dashboard; this is purely what we draw.
+        let graph = self.build_explain_corridor(&source_asset, &destination_asset);
+
+        // Optional live-quote stage: fan out real quotes for the top-N paths.
+        // Failures here are non-fatal for the explainer (we still return the
+        // ranked dry-run view).
+        let mut estimated_out_by_path: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut winner_path_id: Option<String> = None;
+        let mut live_quote_ms = 0_u64;
+        if request.live_quote && top_paths > 0 {
+            let live_started = Instant::now();
+            match self
+                .live_quote_top_paths(&mut normalized_request, &ranked, top_paths)
+                .await
+            {
+                Ok((outputs, winner)) => {
+                    estimated_out_by_path = outputs;
+                    winner_path_id = winner;
+                }
+                Err(err) => {
+                    warn!(error = %err, "route-explain live quote failed; returning dry-run ranking");
+                }
+            }
+            live_quote_ms = live_started.elapsed().as_millis() as u64;
+        }
+
+        let ranked_views = ranked
+            .iter()
+            .enumerate()
+            .map(|(index, ranked_path)| {
+                let path = &ranked_path.path;
+                let transitions = path
+                    .transitions
+                    .iter()
+                    .map(|transition| RouteTransitionView {
+                        id: transition.id.clone(),
+                        provider: transition.provider.as_str().to_string(),
+                        kind: transition.kind.as_str().to_string(),
+                        edge_kind: transition.route_edge_kind().as_str().to_string(),
+                        from_chain: transition.input.asset.chain.as_str().to_string(),
+                        from_asset: transition.input.asset.asset.as_str().to_string(),
+                        to_chain: transition.output.asset.chain.as_str().to_string(),
+                        to_asset: transition.output.asset.asset.as_str().to_string(),
+                    })
+                    .collect();
+                RankedPathView {
+                    rank: index + 1,
+                    path_id: path.id.clone(),
+                    top_path: index < top_paths,
+                    winner: winner_path_id.as_deref() == Some(path.id.as_str()),
+                    hop_count: path.transitions.len(),
+                    missing_edges: ranked_path.score.missing_edges,
+                    total_effective_cost_usd_micros: ranked_path
+                        .score
+                        .total_effective_cost_usd_micros,
+                    total_latency_ms: ranked_path.score.total_latency_ms,
+                    transitions,
+                    estimated_amount_out: estimated_out_by_path.get(&path.id).cloned(),
+                }
+            })
+            .collect();
+
+        Ok(RouteExplain {
+            from_asset: source_asset,
+            to_asset: destination_asset,
+            amount_in: request.amount_in,
+            request_usd_micros,
+            tier_label,
+            live_quote: request.live_quote,
+            counts: RouteExplainCounts {
+                paths_enumerated,
+                paths_after_executable,
+                paths_after_provider,
+                paths_after_hyperevm,
+                paths_after_same_chain,
+                ranked_count,
+                top_paths,
+            },
+            timings: RouteExplainTimings {
+                bfs_ms,
+                rank_ms,
+                live_quote_ms,
+                total_ms: total_started.elapsed().as_millis() as u64,
+            },
+            ranked: ranked_views,
+            winner_path_id,
+            graph,
+        })
+    }
+
+    /// Build the source->destination *corridor*: the full declared display
+    /// topology (every bridge/Unit/HyperCore edge plus the curated same-chain
+    /// Velora swaps) restricted to nodes that are both forward-reachable from
+    /// the source and backward-reachable to the destination. Nodes are laid out
+    /// by hop depth from the source (destination pinned to `max_depth`). This is
+    /// purely the visual topology - the engine's actual ranked routes are
+    /// overlaid as highlights by the dashboard via the edge ids. Independent of
+    /// `select_transition_paths`, so it includes same-chain swap branches the
+    /// router never traverses as intermediate hops.
+    fn build_explain_corridor(
+        &self,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> crate::api::RouteExplainGraph {
+        use crate::api::{RouteExplainGraph, RouteExplainGraphEdge, RouteExplainGraphNode};
+        use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+        let source_key = format!("external:{}:{}", source.chain.as_str(), source.asset.as_str());
+        let dest_key = format!(
+            "external:{}:{}",
+            destination.chain.as_str(),
+            destination.asset.as_str()
+        );
+
+        // Full display edge universe keyed by node, in both directions.
+        let declarations = self.asset_registry.display_transition_declarations();
+        let mut forward: HashMap<String, Vec<String>> = HashMap::new();
+        let mut backward: HashMap<String, Vec<String>> = HashMap::new();
+        let mut node_meta: HashMap<String, RouteExplainGraphNode> = HashMap::new();
+        for decl in &declarations {
+            let (from_key, from_node) = self.explain_graph_node(&decl.from);
+            let (to_key, to_node) = self.explain_graph_node(&decl.to);
+            forward.entry(from_key.clone()).or_default().push(to_key.clone());
+            backward.entry(to_key.clone()).or_default().push(from_key.clone());
+            node_meta.entry(from_key).or_insert(from_node);
+            node_meta.entry(to_key).or_insert(to_node);
+        }
+
+        // Corridor = forward-reachable(source) INTERSECT backward-reachable(dest).
+        let reachable_from_source = reachable_set(&forward, &source_key);
+        let reaches_dest = reachable_set(&backward, &dest_key);
+        let mut corridor: HashSet<String> = reachable_from_source
+            .intersection(&reaches_dest)
+            .cloned()
+            .collect();
+        corridor.insert(source_key.clone());
+        corridor.insert(dest_key.clone());
+
+        // Min hop-depth from the source within the corridor (BFS over corridor
+        // forward edges).
+        let mut depth: HashMap<String, usize> = HashMap::new();
+        if corridor.contains(&source_key) {
+            depth.insert(source_key.clone(), 0);
+            let mut queue = VecDeque::from([source_key.clone()]);
+            while let Some(current) = queue.pop_front() {
+                let current_depth = depth[&current];
+                if let Some(neighbours) = forward.get(&current) {
+                    for neighbour in neighbours {
+                        if corridor.contains(neighbour) && !depth.contains_key(neighbour) {
+                            depth.insert(neighbour.clone(), current_depth + 1);
+                            queue.push_back(neighbour.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let max_depth = depth.values().copied().max().unwrap_or(0);
+
+        // Emit corridor nodes (sorted for determinism) with depth + role.
+        let mut nodes: Vec<RouteExplainGraphNode> = BTreeMap::from_iter(
+            corridor
+                .iter()
+                .filter_map(|key| node_meta.get(key).map(|node| (key.clone(), node.clone()))),
+        )
+        .into_values()
+        .map(|mut node| {
+            node.depth = depth.get(&node.key).copied().unwrap_or(max_depth);
+            if node.key == source_key {
+                node.role = "source".to_string();
+                node.depth = 0;
+            } else if node.key == dest_key {
+                node.role = "destination".to_string();
+                node.depth = max_depth;
+            }
+            node
+        })
+        .collect();
+        nodes.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.key.cmp(&b.key)));
+
+        // Corridor edges: declared edges whose endpoints are both in the corridor.
+        let mut seen_edges: HashSet<String> = HashSet::new();
+        let mut edges: Vec<RouteExplainGraphEdge> = Vec::new();
+        for decl in &declarations {
+            let (from_key, _) = self.explain_graph_node(&decl.from);
+            let (to_key, _) = self.explain_graph_node(&decl.to);
+            if !corridor.contains(&from_key) || !corridor.contains(&to_key) {
+                continue;
+            }
+            if !seen_edges.insert(decl.id.clone()) {
+                continue;
+            }
+            edges.push(RouteExplainGraphEdge {
+                id: decl.id.clone(),
+                from: from_key,
+                to: to_key,
+                provider: decl.provider.as_str().to_string(),
+                kind: decl.kind.as_str().to_string(),
+                edge_kind: decl.route_edge_kind().as_str().to_string(),
+            });
+        }
+
+        RouteExplainGraph {
+            nodes,
+            edges,
+            max_depth,
+        }
+    }
+
+    /// Resolve a routing-graph node into its stable key + display metadata,
+    /// mirroring the keying used by the static `/route-graph` export so edge
+    /// `from`/`to` references line up across both endpoints.
+    fn explain_graph_node(
+        &self,
+        node: &router_core::services::asset_registry::MarketOrderNode,
+    ) -> (String, crate::api::RouteExplainGraphNode) {
+        use crate::api::RouteExplainGraphNode;
+        use router_core::services::asset_registry::MarketOrderNode;
+
+        match node {
+            MarketOrderNode::External(asset) => {
+                let key = format!("external:{}:{}", asset.chain.as_str(), asset.asset.as_str());
+                let canonical = self
+                    .asset_registry
+                    .canonical_for(asset)
+                    .map(|canonical| canonical.as_str().to_string())
+                    .unwrap_or_default();
+                (
+                    key.clone(),
+                    RouteExplainGraphNode {
+                        key,
+                        kind: "external".to_string(),
+                        chain: asset.chain.as_str().to_string(),
+                        asset: asset.asset.as_str().to_string(),
+                        canonical,
+                        depth: 0,
+                        role: "intermediate".to_string(),
+                    },
+                )
+            }
+            MarketOrderNode::Venue {
+                provider,
+                canonical,
+            } => {
+                let key = format!("venue:{}:{}", provider.as_str(), canonical.as_str());
+                (
+                    key.clone(),
+                    RouteExplainGraphNode {
+                        key,
+                        kind: "venue".to_string(),
+                        chain: format!("venue:{}", provider.as_str()),
+                        asset: canonical.as_str().to_string(),
+                        canonical: canonical.as_str().to_string(),
+                        depth: 0,
+                        role: "intermediate".to_string(),
+                    },
+                )
+            }
+        }
+    }
+
+    /// Live-quote the top `top_count` ranked paths (mirroring the
+    /// `best_provider_quote` fan-out) and return a map of `path_id ->
+    /// estimated_amount_out` plus the winning path id. Used only by the
+    /// route-explain dry run; it derives throwaway deposit/recipient addresses
+    /// so it never touches persisted order state.
+    async fn live_quote_top_paths(
+        &self,
+        request: &mut NormalizedMarketOrderQuoteRequest,
+        ranked: &[RankedTransitionPath],
+        top_count: usize,
+    ) -> MarketOrderResult<(std::collections::HashMap<String, String>, Option<String>)> {
+        let quote_id = Uuid::now_v7();
+        let (source_depositor_address, _) = derive_deposit_address_for_quote(
+            self.chain_registry.as_ref(),
+            &self.settings.master_key_bytes(),
+            quote_id,
+            &request.source_asset.chain,
+        )
+        .map_err(MarketOrderError::deposit_address)?;
+
+        let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
+            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
+        } else {
+            None
+        };
+        let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
+            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
+        } else {
+            None
+        };
+
+        let top_paths: Vec<&TransitionPath> = ranked
+            .iter()
+            .take(top_count)
+            .map(|ranked_path| &ranked_path.path)
+            .collect();
+        let top_quote_futures = top_paths.iter().map(|path| {
+            self.quote_transition_path(
+                request,
+                quote_id,
+                &source_depositor_address,
+                path,
+                provider_policy_snapshot.as_ref(),
+                provider_health_snapshot.as_ref(),
+            )
+        });
+        let top_results = join_all(top_quote_futures).await;
+
+        let mut outputs: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut outcomes: Vec<LiveQuoteOutcome> = Vec::new();
+        for (candidate, path) in top_results.into_iter().zip(top_paths.iter()) {
+            let quote = match candidate {
+                Ok(Some(quote)) => quote,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(error = %err, path_id = %path.id, "route-explain top-path leg failed");
+                    continue;
+                }
+            };
+            if self.validate_provider_quote(request, &quote).is_err() {
+                continue;
+            }
+            let estimated_amount_out =
+                U256::from_str(&quote.estimated_amount_out).unwrap_or_default();
+            outputs.insert(path.id.clone(), quote.estimated_amount_out.clone());
+            outcomes.push(LiveQuoteOutcome {
+                quote_index: outcomes.len(),
+                path_id: path.id.clone(),
+                hop_count: path.transitions.len(),
+                estimated_amount_out,
+            });
+        }
+
+        let winner_path_id =
+            select_best_quote(&outcomes).map(|index| outcomes[index].path_id.clone());
+        Ok((outputs, winner_path_id))
+    }
+
+    /// Best-effort conversion of `request.amount_in` to USD micros for
+    /// amount-aware ranking. Falls back to `DEFAULT_SAMPLE_AMOUNT_USD_MICROS`
+    /// when the source asset has no pricing row, so ranking degrades to
+    /// today's behaviour rather than failing the request.
+    async fn market_request_usd_micros(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+    ) -> u64 {
+        self.request_usd_micros(&request.source_asset, &request.amount_in).await
+    }
+
+    async fn request_usd_micros(&self, source_asset: &DepositAsset, amount_in: &str) -> u64 {
+        let Some(chain_asset) = self.asset_registry.chain_asset(source_asset) else {
+            return DEFAULT_SAMPLE_AMOUNT_USD_MICROS;
+        };
+        let Ok(raw_amount) = U256::from_str(amount_in) else {
+            return DEFAULT_SAMPLE_AMOUNT_USD_MICROS;
+        };
+        let pricing = if let Some(route_costs) = self.route_costs.as_ref() {
+            route_costs.current_or_refresh_pricing_snapshot().await
+        } else {
+            router_core::services::pricing::PricingSnapshot::static_bootstrap(Utc::now())
+        };
+        match raw_amount_to_usd_micros(raw_amount, chain_asset, &pricing) {
+            Some(value) if value > 0 => value,
+            _ => DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+        }
+    }
+
+    /// Rank `paths` against `request_usd_micros` using the route-cost
+    /// service when available, falling back to the structural sort
+    /// otherwise. The returned `RankedTransitionPath` list is aligned with
+    /// the sorted `paths` and includes per-path scores for `confidence_band`.
+    async fn rank_market_paths(
+        &self,
+        paths: &mut Vec<TransitionPath>,
+        request_usd_micros: u64,
+    ) -> Vec<RankedTransitionPath> {
+        if let Some(route_costs) = self.route_costs.as_ref() {
+            match route_costs
+                .rank_transition_paths_for_request(paths, request_usd_micros)
+                .await
+            {
+                Ok(ranked) => return ranked,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "route-cost ranking failed; falling back to structural route ordering"
+                    );
+                }
+            }
+        }
+        rank_transition_paths_structurally(paths, request_usd_micros);
+        let pricing = router_core::services::pricing::PricingSnapshot::static_bootstrap(Utc::now());
+        paths
+            .iter()
+            .map(|path| RankedTransitionPath {
+                path: path.clone(),
+                score: router_core::services::route_costs::structural_path_score(
+                    path,
+                    &pricing,
+                    request_usd_micros,
+                ),
+            })
+            .collect()
     }
 
     async fn best_limit_order_quote(
@@ -993,16 +1560,25 @@ impl OrderManager {
                 ),
             });
         }
+        // V1 limit orders intentionally do not invest in amount-aware
+        // ranking (audit S1.10): no request-size math, no confidence-band
+        // fanout, no best-output selection. Pinning to the explicit
+        // `DEFAULT_SAMPLE_AMOUNT_USD_MICROS` anchor keeps limit's structural
+        // ordering identical to its pre-deprecation behaviour while still
+        // funnelling through the tier-aware ranking surface.
         if let Some(route_costs) = self.route_costs.as_ref() {
-            if let Err(err) = route_costs.rank_transition_paths(&mut paths).await {
+            if let Err(err) = route_costs
+                .rank_transition_paths_for_request(&mut paths, DEFAULT_SAMPLE_AMOUNT_USD_MICROS)
+                .await
+            {
                 warn!(
                     error = %err,
                     "limit-order route-cost ranking failed; falling back to structural ordering"
                 );
-                rank_transition_paths_structurally(&mut paths);
+                rank_transition_paths_structurally(&mut paths, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
             }
         } else {
-            rank_transition_paths_structurally(&mut paths);
+            rank_transition_paths_structurally(&mut paths, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
         }
         paths.truncate(TOP_K_PATHS);
 
@@ -2303,6 +2879,28 @@ impl OrderManager {
     }
 }
 
+/// BFS reachability over an adjacency map, returning every node reachable from
+/// `start` (inclusive). Used to compute the source->destination corridor.
+fn reachable_set(
+    adjacency: &std::collections::HashMap<String, Vec<String>>,
+    start: &str,
+) -> std::collections::HashSet<String> {
+    use std::collections::{HashSet, VecDeque};
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(start.to_string());
+    let mut queue = VecDeque::from([start.to_string()]);
+    while let Some(current) = queue.pop_front() {
+        if let Some(neighbours) = adjacency.get(&current) {
+            for neighbour in neighbours {
+                if visited.insert(neighbour.clone()) {
+                    queue.push_back(neighbour.clone());
+                }
+            }
+        }
+    }
+    visited
+}
+
 fn provider_allowed_for_new_routes(
     snapshot: Option<&crate::services::ProviderPolicySnapshot>,
     health: Option<&crate::services::ProviderHealthSnapshot>,
@@ -2329,6 +2927,33 @@ fn provider_allowed_for_new_routes(
     }
 
     true
+}
+
+/// Returns `(chosen_out - leader_out) / leader_out` in bps, clamped to
+/// `i64`. Positive means fanout chose a better-output peer than the cached
+/// leader predicted; zero means the leader won; negative is unreachable
+/// today since `select_best_quote` never picks a smaller output, but the
+/// function tolerates it for telemetry hygiene.
+fn compute_route_select_delta_bps(leader_out: U256, chosen_out: U256) -> i64 {
+    if leader_out.is_zero() {
+        return 0;
+    }
+    let (diff, sign) = if chosen_out >= leader_out {
+        (chosen_out - leader_out, 1_i64)
+    } else {
+        (leader_out - chosen_out, -1_i64)
+    };
+    let numerator = alloy::primitives::U512::from(diff)
+        * alloy::primitives::U512::from(router_core::services::pricing::BPS_DENOMINATOR);
+    let denom = alloy::primitives::U512::from(leader_out);
+    if denom.is_zero() {
+        return 0;
+    }
+    let magnitude = (numerator / denom)
+        .to_string()
+        .parse::<i64>()
+        .unwrap_or(i64::MAX);
+    sign.saturating_mul(magnitude)
 }
 
 fn validate_hyperliquid_spot_asset(asset: &DepositAsset) -> Result<DepositAsset, String> {
@@ -2440,6 +3065,13 @@ fn unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath) -> bool 
             }
             _ => true,
         })
+}
+
+fn path_uses_hyperevm(path: &TransitionPath) -> bool {
+    path.transitions.iter().any(|transition| {
+        transition.input.asset.chain.as_str() == "evm:999"
+            || transition.output.asset.chain.as_str() == "evm:999"
+    })
 }
 
 fn path_has_configured_provider_set(
@@ -3317,9 +3949,7 @@ const ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW: u64 = 1_000_000;
 /// assets with no defined floor (e.g. HYPE) — those routes are not gated.
 fn route_output_floor(registry: &AssetRegistry, destination_asset: &DepositAsset) -> Option<U256> {
     match registry.canonical_for(destination_asset)? {
-        CanonicalAsset::Btc | CanonicalAsset::Cbbtc => {
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS))
-        }
+        CanonicalAsset::Btc => Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS)),
         CanonicalAsset::Eth => Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI)),
         CanonicalAsset::Usdc | CanonicalAsset::Usdt => {
             Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))

@@ -1261,9 +1261,28 @@ impl RiftDevnetBuilder {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             DEVNET_MOCK_INTEGRATOR_PORT,
         );
+        // Optional mock-fee knobs. Default to 0 (1:1 quotes) so test harnesses
+        // that spawn the devnet keep their exact-amount assertions; the local
+        // compose stack sets these to realistic values for visual debugging.
+        // Changing the values only requires recreating the devnet container,
+        // not recompiling.
+        let mock_fee_bps_from_env = |name: &str| -> u16 {
+            std::env::var(name)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u16>().ok())
+                .map(|bps| bps.min(9_999))
+                .unwrap_or(0)
+        };
+        let across_quote_fee_bps = mock_fee_bps_from_env("MOCK_ACROSS_QUOTE_FEE_BPS");
+        let across_quote_jitter_bps = mock_fee_bps_from_env("MOCK_ACROSS_QUOTE_JITTER_BPS");
+        let velora_quote_fee_bps = mock_fee_bps_from_env("MOCK_VELORA_QUOTE_FEE_BPS");
+
         let config = mock_integrators::MockIntegratorConfig::default()
             .with_bind_addr(bind_addr)
             .with_advertised_base_url(format!("http://127.0.0.1:{DEVNET_MOCK_INTEGRATOR_PORT}"))
+            .with_across_quote_fee_bps(across_quote_fee_bps)
+            .with_across_quote_jitter_bps(across_quote_jitter_bps)
+            .with_velora_quote_fee_bps(velora_quote_fee_bps)
             .with_across_spoke_pool_address(MOCK_ACROSS_SPOKE_POOL_ADDRESS)
             .with_across_evm_rpc_url(base_devnet.anvil.endpoint())
             .with_across_chain(

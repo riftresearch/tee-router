@@ -342,6 +342,62 @@ enum Command {
     Quote(QuoteCommand),
     /// Create orders through the router gateway and optionally fund them.
     CreateAndFund(CreateAndFundCommand),
+    /// Probe the route-cost ranking + confidence-band fanout at a curated
+    /// USD size sweep and correlate each response to the router-api
+    /// structured routing log.
+    ProbeRouting(ProbeRoutingCommand),
+}
+
+#[derive(Args, Clone)]
+struct ProbeRoutingCommand {
+    /// Router gateway base URL.
+    #[arg(
+        long,
+        env = "ROUTER_LOADGEN_GATEWAY_URL",
+        default_value = "http://localhost:3001"
+    )]
+    gateway_url: String,
+
+    /// Source asset, e.g. Ethereum.USDC or Ethereum.ETH.
+    #[arg(long)]
+    from: String,
+
+    /// Destination asset, e.g. Bitcoin.BTC.
+    #[arg(long)]
+    to: String,
+
+    /// Recipient passed to the gateway. Defaults to the devnet manifest
+    /// demo Bitcoin address when `--to` is on bitcoin, otherwise to the
+    /// reserved 0x1111...1111 sink so the EVM side is irrelevant.
+    #[arg(long)]
+    to_address: Option<String>,
+
+    /// Devnet manifest URL used to resolve the Bitcoin recipient default.
+    #[arg(long, env = "ROUTER_LOADGEN_DEVNET_MANIFEST_URL")]
+    devnet_manifest_url: Option<String>,
+
+    /// Comma-separated USD notional sizes to probe.
+    #[arg(long, default_value = "100,1000,10000,100000,1000000,10000000")]
+    sizes_usd_csv: String,
+
+    /// After issuing all quotes, fetch the router-api container logs and
+    /// print the routing info line per quote_id.
+    #[arg(long, default_value_t = true)]
+    show_router_server_logs: bool,
+
+    /// Docker-compose project name used for the log lookup.
+    #[arg(long, default_value = "tee-router-local-full-test")]
+    compose_project: String,
+
+    /// Docker-compose file used for the log lookup.
+    #[arg(long, default_value = "etc/compose.local-full.yml")]
+    compose_file: String,
+
+    /// Container service whose logs hold the structured routing info
+    /// lines. Defaults to `router-api` because that is where the Rust
+    /// `tracing` subscriber emits them.
+    #[arg(long, default_value = "router-api")]
+    compose_log_service: String,
 }
 
 #[derive(Args, Clone)]
@@ -617,10 +673,6 @@ struct OrderResponse {
     expiry: String,
     estimated_out: String,
     amount_format: String,
-    #[serde(default)]
-    refund_mode: Option<String>,
-    #[serde(default)]
-    refund_authorizer: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -675,6 +727,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&quote)?);
         }
         Command::CreateAndFund(command) => run_create_and_fund(command).await?,
+        Command::ProbeRouting(command) => run_probe_routing(command).await?,
     }
 
     Ok(())
@@ -790,6 +843,326 @@ async fn run_create_and_fund(command: CreateAndFundCommand) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ProbeRow {
+    size_usd: u128,
+    quote_id: String,
+}
+
+async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
+    let sizes = parse_probe_sizes_usd(&command.sizes_usd_csv)?;
+    if sizes.is_empty() {
+        return Err(eyre!("--sizes-usd-csv must contain at least one size"));
+    }
+
+    let (price_usd_micros, decimals) = probe_asset_price(&command.from)
+        .ok_or_else(|| eyre!(
+            "unknown asset {} in --from; supported: *.USDC, *.USDT, *.ETH, *.BTC, *.CBBTC",
+            command.from
+        ))?;
+
+    let runtime = runtime_config(&QuoteInput {
+        gateway_url: command.gateway_url.clone(),
+        order_type: OrderType::Market,
+        from: Some(command.from.clone()),
+        to: Some(command.to.clone()),
+        to_address: command.to_address.clone().unwrap_or_default(),
+        from_amount: None,
+        amount_format: AmountFormat::Raw,
+        from_address: None,
+    })?;
+
+    let to_address = resolve_probe_to_address(&command, &runtime).await?;
+    eprintln!(
+        "probe-routing: gateway={} from={} to={} to_address={} sizes_usd=[{}]",
+        runtime.gateway_url,
+        command.from,
+        command.to,
+        to_address,
+        sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let probe_start = chrono::Utc::now();
+    let mut rows = Vec::with_capacity(sizes.len());
+    for &size_usd in &sizes {
+        let raw_amount = usd_to_raw_amount_string(size_usd, price_usd_micros, decimals)
+            .ok_or_else(|| eyre!("could not convert ${size_usd} to raw amount for {}", command.from))?;
+        let resolved = ResolvedQuoteInput {
+            order_type: OrderType::Market,
+            from: command.from.clone(),
+            to: command.to.clone(),
+            to_address: to_address.clone(),
+            from_amount: Some(raw_amount.clone()),
+            amount_format: AmountFormat::Raw,
+            from_address: None,
+        };
+        match create_quote(&runtime, &resolved).await {
+            Ok(quote) => {
+                eprintln!(
+                    "  ${size_usd:>10} raw={raw_amount}: quote_id={} estimated_out={} expiry={}",
+                    quote.quote_id, quote.estimated_out, quote.expiry
+                );
+                rows.push(ProbeRow {
+                    size_usd,
+                    quote_id: quote.quote_id,
+                });
+            }
+            Err(err) => {
+                eprintln!("  ${size_usd:>10} raw={raw_amount}: quote failed: {err:#}");
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Err(eyre!("probe-routing produced no quotes"));
+    }
+
+    eprintln!("\n-- routing info lines (matched by quote_id) --");
+    let router_log_lines = if command.show_router_server_logs {
+        fetch_compose_logs(&command, probe_start).await.unwrap_or_else(|err| {
+            eprintln!("  (could not read router logs: {err:#})");
+            String::new()
+        })
+    } else {
+        String::new()
+    };
+    if router_log_lines.is_empty() && command.show_router_server_logs {
+        eprintln!("  (no log lines captured; check `just dc logs {} --tail 50` manually)", command.compose_log_service);
+    }
+    for row in &rows {
+        eprintln!(
+            "  ${size:>10} quote_id={qid}",
+            size = row.size_usd,
+            qid = row.quote_id
+        );
+        let mut found = false;
+        for line in router_log_lines.lines() {
+            if line.contains(&row.quote_id)
+                && line.contains("best_provider_quote selected")
+            {
+                eprintln!("    {}", line.trim());
+                found = true;
+            }
+        }
+        if !found && command.show_router_server_logs {
+            eprintln!("    (no matching `best_provider_quote selected` log)");
+        }
+    }
+
+    eprintln!("\n-- summary --");
+    eprintln!(
+        "  {:>10} {:>12} {:>10} {:>30} {}",
+        "size_usd", "band_size", "delta_bps", "leader -> chosen", "quote_id"
+    );
+    for row in &rows {
+        let parsed = router_log_lines
+            .lines()
+            .find(|line| line.contains(&row.quote_id))
+            .map(parse_routing_log_fields)
+            .unwrap_or_default();
+        let band = parsed.band_size.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let delta = parsed.delta_bps.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let leader = parsed.leader_path_id.as_deref().unwrap_or("?");
+        let chosen = parsed.chosen_path_id.as_deref().unwrap_or("?");
+        let arrow = if leader == chosen {
+            "(stable)".to_string()
+        } else {
+            format!("{} -> {}", short_path_id(leader), short_path_id(chosen))
+        };
+        eprintln!(
+            "  {:>10} {:>12} {:>10} {:>30} {}",
+            row.size_usd, band, delta, arrow, row.quote_id
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_probe_sizes_usd(csv: &str) -> Result<Vec<u128>> {
+    let mut out = Vec::new();
+    for token in csv.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = trimmed
+            .replace('_', "")
+            .parse::<u128>()
+            .map_err(|err| eyre!("invalid size `{}`: {}", token, err))?;
+        if value == 0 {
+            return Err(eyre!("size `{}` must be greater than zero", token));
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
+/// Returns `(price_usd_micros, decimals)` for the assets the loadgen probe
+/// knows how to size in USD. Aligned with `PricingSnapshot::static_bootstrap`
+/// so the resulting `request_usd_micros` matches what the gateway sees.
+fn probe_asset_price(asset: &str) -> Option<(u64, u8)> {
+    let token = asset.split('.').nth(1)?.to_ascii_uppercase();
+    match token.as_str() {
+        "USDC" | "USDT" => Some((1_000_000, 6)),
+        "ETH" => Some((3_000 * 1_000_000, 18)),
+        "BTC" => Some((100_000 * 1_000_000, 8)),
+        "CBBTC" => Some((100_000 * 1_000_000, 8)),
+        _ => None,
+    }
+}
+
+fn usd_to_raw_amount_string(size_usd: u128, price_usd_micros: u64, decimals: u8) -> Option<String> {
+    let size_usd_micros = size_usd.checked_mul(1_000_000)?;
+    let mut pow10 = U256::from(1_u64);
+    for _ in 0..decimals {
+        pow10 = pow10.checked_mul(U256::from(10_u64))?;
+    }
+    let numerator = U256::from(size_usd_micros).checked_mul(pow10)?;
+    let raw = numerator / U256::from(price_usd_micros);
+    Some(raw.to_string())
+}
+
+async fn resolve_probe_to_address(
+    command: &ProbeRoutingCommand,
+    runtime: &RuntimeConfig,
+) -> Result<String> {
+    if let Some(explicit) = command.to_address.clone() {
+        return Ok(explicit);
+    }
+    let dest_lower = command.to.to_ascii_lowercase();
+    if dest_lower.starts_with("bitcoin.") || dest_lower.starts_with("bitcoin/") {
+        let manifest = load_devnet_manifest(&runtime.http, command.devnet_manifest_url.as_deref())
+            .await
+            .wrap_err("failed to load devnet manifest for BTC recipient default")?;
+        if let Some(addr) = manifest
+            .as_ref()
+            .and_then(|m| m.accounts.demo_bitcoin_address.clone())
+        {
+            return Ok(addr);
+        }
+        return Err(eyre!(
+            "Bitcoin destination requires --to-address or --devnet-manifest-url"
+        ));
+    }
+    Ok("0x1111111111111111111111111111111111111111".to_string())
+}
+
+async fn fetch_compose_logs(
+    command: &ProbeRoutingCommand,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<String> {
+    let since_arg = since
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    // We deliberately do NOT pass `-f` here: the docker daemon tracks the
+    // running project by name, and the local stack splits across several
+    // compose files (compose.local-infra.yml + compose.local-devnet.yml
+    // + compose.local-observability.yml). Looking up by project name alone
+    // is robust to that split.
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "compose",
+            "-p",
+            &command.compose_project,
+            "logs",
+            "--no-color",
+            "--no-log-prefix",
+            "--since",
+            &since_arg,
+            &command.compose_log_service,
+        ])
+        .output()
+        .await
+        .wrap_err("failed to spawn `docker compose logs`")?;
+    if !output.status.success() {
+        return Err(eyre!(
+            "`docker compose logs` failed: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    // Strip ANSI escapes the inner tracing fmt subscriber injects (docker's
+    // `--no-color` only suppresses its own coloring, not the application's).
+    Ok(strip_ansi_escapes(&raw))
+}
+
+#[derive(Default)]
+struct ParsedRoutingFields {
+    band_size: Option<u64>,
+    delta_bps: Option<i64>,
+    leader_path_id: Option<String>,
+    chosen_path_id: Option<String>,
+}
+
+fn parse_routing_log_fields(line: &str) -> ParsedRoutingFields {
+    ParsedRoutingFields {
+        band_size: extract_field(line, "band_size").and_then(|v| v.parse().ok()),
+        delta_bps: extract_field(line, "delta_bps").and_then(|v| v.parse().ok()),
+        leader_path_id: extract_field(line, "leader_path_id"),
+        chosen_path_id: extract_field(line, "chosen_path_id"),
+    }
+}
+
+/// The tracing fmt subscriber wraps field names with ANSI italic/dim codes
+/// (`\x1b[3m...\x1b[0m\x1b[2m=\x1b[0m`). Strip them before field parsing.
+fn strip_ansi_escapes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for inner in chars.by_ref() {
+                if inner.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Tracing's default fmt subscriber renders fields as `key=value` (no
+/// quotes) for unquoted primitives and `key="value"` for strings. Try both.
+fn extract_field(line: &str, key: &str) -> Option<String> {
+    if let Some(idx) = line.find(&format!("{key}=\"")) {
+        let after = &line[idx + key.len() + 2..];
+        let end = after.find('"')?;
+        return Some(after[..end].to_string());
+    }
+    if let Some(idx) = line.find(&format!("{key}=")) {
+        let after = &line[idx + key.len() + 1..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ',')
+            .unwrap_or(after.len());
+        return Some(after[..end].trim_end_matches('"').to_string());
+    }
+    None
+}
+
+/// Compact a transition path id (which is the `:`-joined concatenation of
+/// transition_decl ids and can be 100+ chars) down to a short hint of its
+/// kind sequence. Falls back to the first/last 12 chars when parsing fails.
+fn short_path_id(path_id: &str) -> String {
+    let kinds: Vec<&str> = path_id
+        .split('>')
+        .filter_map(|hop| hop.split(':').next())
+        .collect();
+    if kinds.len() >= 2 {
+        return kinds.join("+");
+    }
+    if path_id.len() <= 24 {
+        path_id.to_string()
+    } else {
+        format!("{}...{}", &path_id[..12], &path_id[path_id.len() - 12..])
+    }
 }
 
 async fn create_order_and_maybe_fund(

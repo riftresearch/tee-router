@@ -73,7 +73,7 @@ impl PricingSnapshot {
         match canonical {
             CanonicalAsset::Usdc | CanonicalAsset::Usdt => Some(self.stable_usd_micro),
             CanonicalAsset::Eth => Some(self.eth_usd_micro),
-            CanonicalAsset::Btc | CanonicalAsset::Cbbtc => Some(self.btc_usd_micro),
+            CanonicalAsset::Btc => Some(self.btc_usd_micro),
             CanonicalAsset::Hype => self.hype_usd_micro,
         }
     }
@@ -195,10 +195,7 @@ mod tests {
             pricing.canonical_asset_usd_micro(CanonicalAsset::Btc),
             Some(100_000 * USD_MICRO)
         );
-        assert_eq!(
-            pricing.canonical_asset_usd_micro(CanonicalAsset::Hype),
-            None
-        );
+        assert!(!pricing.supports_chain_gas_pricing(&ChainId::parse("evm:999").unwrap()));
     }
 
     #[test]

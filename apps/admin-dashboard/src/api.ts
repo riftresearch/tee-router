@@ -15,6 +15,18 @@ import type {
   ProviderQuoteState,
   RemoveEvent,
   RouterSwitchEnvelope,
+  RouteCostsResponse,
+  RouteCostSnapshot,
+  RouteCostEventsResponse,
+  RouteCostSampleEvent,
+  RouteExplain,
+  RouteExplainRequest,
+  RouteExplainResponse,
+  RouteGraphEdge,
+  RouteGraphNode,
+  RouteGraphResponse,
+  RankedPathView,
+  RouteTransitionView,
   SnapshotEvent,
   SwitchesResponse,
   SwapTimeAveragesResponse,
@@ -134,6 +146,75 @@ export async function fetchSwapTimeAverages(
     throw new Error('Invalid swap time averages response payload')
   }
   return payload
+}
+
+export async function fetchRouteCosts(): Promise<RouteCostsResponse> {
+  const response = await fetch('/api/route-costs', {
+    credentials: 'include'
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to load route costs: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'route costs')
+  if (!isRouteCostsResponse(payload)) {
+    throw new Error('Invalid route costs response payload')
+  }
+  return payload
+}
+
+export async function fetchRouteCostEvents(): Promise<RouteCostEventsResponse> {
+  const response = await fetch('/api/route-cost-events', {
+    credentials: 'include'
+  })
+
+  if (!response.ok) {
+    throw new Error(`Failed to load route cost events: HTTP ${response.status}`)
+  }
+
+  const payload = await readJsonResponse(response, 'route cost events')
+  if (!isRouteCostEventsResponse(payload)) {
+    throw new Error('Invalid route cost events response payload')
+  }
+  return payload
+}
+
+export async function fetchRouteGraph(): Promise<RouteGraphResponse> {
+  const response = await fetch('/api/route-graph', {
+    credentials: 'include'
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorBody(response, 'route graph'))
+  }
+
+  const payload = await readJsonResponse(response, 'route graph')
+  if (!isRouteGraphResponse(payload)) {
+    throw new Error('Invalid route graph response payload')
+  }
+  return payload
+}
+
+export async function postRouteExplain(
+  request: RouteExplainRequest
+): Promise<RouteExplain> {
+  const response = await fetch('/api/route-explain', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request)
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorBody(response, 'route explain'))
+  }
+
+  const payload = await readJsonResponse(response, 'route explain')
+  if (!isRouteExplainResponse(payload)) {
+    throw new Error('Invalid route explain response payload')
+  }
+  return payload.explain
 }
 
 export async function fetchChatList(): Promise<ChatThread[]> {
@@ -462,6 +543,212 @@ function isOrdersResponse(value: unknown): value is OrdersResponse {
 
 function isOrderLookupResponse(value: unknown): value is OrderLookupResponse {
   return isRecord(value) && isOrderFirehoseRow(value.order)
+}
+
+function isRouteCostsResponse(value: unknown): value is RouteCostsResponse {
+  return (
+    isRecord(value) &&
+    isIsoTimestamp(value.fetchedAt) &&
+    Array.isArray(value.snapshots) &&
+    value.snapshots.every(isRouteCostSnapshot)
+  )
+}
+
+function isRouteCostSnapshot(value: unknown): value is RouteCostSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.transitionId === 'string' &&
+    typeof value.amountBucket === 'string' &&
+    typeof value.provider === 'string' &&
+    typeof value.edgeKind === 'string' &&
+    isAssetRef(value.source) &&
+    isAssetRef(value.destination) &&
+    typeof value.estimatedFeeBps === 'number' &&
+    typeof value.estimatedFeeUsdMicros === 'number' &&
+    typeof value.estimatedGasUsdMicros === 'number' &&
+    typeof value.estimatedLatencyMs === 'number' &&
+    typeof value.sampleAmountUsdMicros === 'number' &&
+    typeof value.quoteSource === 'string' &&
+    isIsoTimestamp(value.refreshedAt) &&
+    isIsoTimestamp(value.expiresAt) &&
+    typeof value.expired === 'boolean'
+  )
+}
+
+function isRouteCostEventsResponse(
+  value: unknown
+): value is RouteCostEventsResponse {
+  return (
+    isRecord(value) &&
+    isIsoTimestamp(value.fetchedAt) &&
+    typeof value.windowSeconds === 'number' &&
+    Array.isArray(value.events) &&
+    value.events.every(isRouteCostSampleEvent)
+  )
+}
+
+function isRouteCostSampleEvent(value: unknown): value is RouteCostSampleEvent {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    isIsoTimestamp(value.sampledAt) &&
+    typeof value.provider === 'string' &&
+    typeof value.transitionId === 'string' &&
+    typeof value.amountBucket === 'string' &&
+    typeof value.edgeKind === 'string' &&
+    isAssetRef(value.source) &&
+    isAssetRef(value.destination) &&
+    typeof value.sampleAmountUsdMicros === 'number' &&
+    (value.outcome === 'succeeded' || value.outcome === 'failed') &&
+    (value.estimatedFeeBps === null || typeof value.estimatedFeeBps === 'number') &&
+    (value.estimatedLatencyMs === null ||
+      typeof value.estimatedLatencyMs === 'number') &&
+    (value.reason === null || typeof value.reason === 'string')
+  )
+}
+
+function isRouteGraphResponse(value: unknown): value is RouteGraphResponse {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every(isRouteGraphNode) &&
+    Array.isArray(value.edges) &&
+    value.edges.every(isRouteGraphEdge)
+  )
+}
+
+function isRouteGraphNode(value: unknown): value is RouteGraphNode {
+  return (
+    isRecord(value) &&
+    typeof value.key === 'string' &&
+    typeof value.kind === 'string' &&
+    typeof value.chain === 'string' &&
+    typeof value.asset === 'string' &&
+    typeof value.canonical === 'string' &&
+    typeof value.decimals === 'number'
+  )
+}
+
+function isRouteGraphEdge(value: unknown): value is RouteGraphEdge {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.provider === 'string' &&
+    typeof value.kind === 'string' &&
+    typeof value.edge_kind === 'string' &&
+    typeof value.from === 'string' &&
+    typeof value.to === 'string' &&
+    typeof value.from_chain === 'string' &&
+    typeof value.from_asset === 'string' &&
+    typeof value.to_chain === 'string' &&
+    typeof value.to_asset === 'string' &&
+    typeof value.curated === 'boolean'
+  )
+}
+
+function isRouteExplainResponse(value: unknown): value is RouteExplainResponse {
+  return isRecord(value) && isRouteExplain(value.explain)
+}
+
+function isRouteExplain(value: unknown): value is RouteExplain {
+  if (!isRecord(value)) return false
+  const counts = value.counts
+  const timings = value.timings
+  return (
+    isRouteExplainAsset(value.from_asset) &&
+    isRouteExplainAsset(value.to_asset) &&
+    typeof value.amount_in === 'string' &&
+    typeof value.request_usd_micros === 'number' &&
+    typeof value.tier_label === 'string' &&
+    typeof value.live_quote === 'boolean' &&
+    isRecord(counts) &&
+    typeof counts.paths_enumerated === 'number' &&
+    typeof counts.paths_after_executable === 'number' &&
+    typeof counts.paths_after_provider === 'number' &&
+    typeof counts.paths_after_hyperevm === 'number' &&
+    typeof counts.paths_after_same_chain === 'number' &&
+    typeof counts.ranked_count === 'number' &&
+    typeof counts.top_paths === 'number' &&
+    isRecord(timings) &&
+    typeof timings.bfs_ms === 'number' &&
+    typeof timings.rank_ms === 'number' &&
+    typeof timings.live_quote_ms === 'number' &&
+    typeof timings.total_ms === 'number' &&
+    Array.isArray(value.ranked) &&
+    value.ranked.every(isRankedPathView) &&
+    (value.winner_path_id === null || typeof value.winner_path_id === 'string') &&
+    isRouteExplainGraph(value.graph)
+  )
+}
+
+function isRouteExplainGraph(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.max_depth === 'number' &&
+    Array.isArray(value.nodes) &&
+    value.nodes.every(
+      (node) =>
+        isRecord(node) &&
+        typeof node.key === 'string' &&
+        typeof node.kind === 'string' &&
+        typeof node.chain === 'string' &&
+        typeof node.asset === 'string' &&
+        typeof node.canonical === 'string' &&
+        typeof node.depth === 'number' &&
+        typeof node.role === 'string'
+    ) &&
+    Array.isArray(value.edges) &&
+    value.edges.every(
+      (edge) =>
+        isRecord(edge) &&
+        typeof edge.id === 'string' &&
+        typeof edge.from === 'string' &&
+        typeof edge.to === 'string' &&
+        typeof edge.provider === 'string' &&
+        typeof edge.kind === 'string' &&
+        typeof edge.edge_kind === 'string'
+    )
+  )
+}
+
+function isRouteExplainAsset(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.chain === 'string' &&
+    typeof value.asset === 'string'
+  )
+}
+
+function isRankedPathView(value: unknown): value is RankedPathView {
+  return (
+    isRecord(value) &&
+    typeof value.rank === 'number' &&
+    typeof value.path_id === 'string' &&
+    typeof value.top_path === 'boolean' &&
+    typeof value.winner === 'boolean' &&
+    typeof value.hop_count === 'number' &&
+    typeof value.missing_edges === 'number' &&
+    typeof value.total_effective_cost_usd_micros === 'number' &&
+    typeof value.total_latency_ms === 'number' &&
+    Array.isArray(value.transitions) &&
+    value.transitions.every(isRouteTransitionView) &&
+    (value.estimated_amount_out === null ||
+      typeof value.estimated_amount_out === 'string')
+  )
+}
+
+function isRouteTransitionView(value: unknown): value is RouteTransitionView {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.provider === 'string' &&
+    typeof value.kind === 'string' &&
+    typeof value.edge_kind === 'string' &&
+    typeof value.from_chain === 'string' &&
+    typeof value.from_asset === 'string' &&
+    typeof value.to_chain === 'string' &&
+    typeof value.to_asset === 'string'
+  )
 }
 
 function isVolumeAnalyticsResponse(

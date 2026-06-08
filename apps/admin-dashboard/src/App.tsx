@@ -12,14 +12,16 @@ import {
   MessageSquare,
   RefreshCw,
   Search,
+  Share2,
   ShieldCheck,
   Wifi,
   WifiOff,
   X
 } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { ChatsView } from './Chats'
+import { RouteGraphView } from './RouteGraph'
 
 import {
   fetchMe,
@@ -27,6 +29,9 @@ import {
   fetchOrders,
   fetchSwitches,
   fetchSwapTimeAverages,
+  fetchRouteCosts,
+  fetchRouteCostEvents,
+  fetchRouteGraph,
   fetchVolumeAnalytics,
   parseMetricsEvent,
   parseRemoveEvent,
@@ -51,6 +56,9 @@ import type {
   ProviderQuoteState,
   SwitchesResponse,
   SwapTimeAveragesResponse,
+  RouteCostSnapshot,
+  RouteCostSampleEvent,
+  RouteGraphEdge,
   UsdAmountValuation,
   UsdValuation,
   VolumeAnalyticsResponse,
@@ -242,7 +250,7 @@ const ASSET_DECIMALS: Record<string, number> = {
   'hyperliquid|ueth': 18
 }
 
-type DashboardView = 'orders' | 'switches' | 'chats'
+type DashboardView = 'orders' | 'switches' | 'chats' | 'route-costs' | 'route-graph'
 
 export function App() {
   const [me, setMe] = useState<MeResponse | null>(null)
@@ -938,6 +946,42 @@ export function App() {
     )
   }
 
+  if (view === 'route-costs') {
+    return (
+      <Shell
+        right={
+          <UserMenu
+            me={me}
+            streamState={streamState}
+            onRefresh={refreshOrderStream}
+            view={view}
+            onViewChange={setView}
+          />
+        }
+      >
+        <RouteCostsView />
+      </Shell>
+    )
+  }
+
+  if (view === 'route-graph') {
+    return (
+      <Shell
+        right={
+          <UserMenu
+            me={me}
+            streamState={streamState}
+            onRefresh={refreshOrderStream}
+            view={view}
+            onViewChange={setView}
+          />
+        }
+      >
+        <RouteGraphView />
+      </Shell>
+    )
+  }
+
   if (view === 'chats') {
     return (
       <Shell
@@ -1425,12 +1469,32 @@ function ViewSwitcher({
       <button
         type="button"
         role="tab"
-        aria-selected={active === 'switches'}
+aria-selected={active === 'switches'}
         className={active === 'switches' ? 'active' : undefined}
         onClick={() => onChange('switches')}
       >
         <ShieldCheck size={14} />
         <span>Switches</span>
+        </button>
+              <button
+        type="button"
+        role="tab"
+        aria-selected={active === 'route-costs'}
+        className={active === 'route-costs' ? 'active' : undefined}
+        onClick={() => onChange('route-costs')}
+      >
+        <BarChart3 size={14} />
+        <span>Route Costs</span>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={active === 'route-graph'}
+        className={active === 'route-graph' ? 'active' : undefined}
+        onClick={() => onChange('route-graph')}
+      >
+        <Share2 size={14} />
+        <span>Route Graph</span>
       </button>
       <button
         type="button"
@@ -1444,6 +1508,741 @@ function ViewSwitcher({
       </button>
     </div>
   )
+}
+
+const ROUTE_COST_POLL_MS = 30_000
+const ROUTE_COST_EVENTS_POLL_MS = 4_000
+const ROUTE_COST_DEFAULT_WINDOW_SECONDS = 1800
+const ROUTE_COST_ACTIVITY_LOG_LIMIT = 150
+
+const ROUTE_COST_PROVIDER_ORDER = [
+  'across',
+  'cctp',
+  'unit',
+  'velora',
+  'hyperliquid',
+  'hyperliquid_bridge',
+  'hypercore_bridge'
+]
+
+const ROUTE_COST_PROVIDER_LABELS: Record<string, string> = {
+  across: 'Across',
+  cctp: 'CCTP',
+  unit: 'Unit',
+  velora: 'Velora',
+  hyperliquid: 'Hyperliquid',
+  hyperliquid_bridge: 'HL Bridge',
+  hypercore_bridge: 'Hypercore Bridge'
+}
+
+const ROUTE_COST_CHAIN_CODES: Record<string, string> = {
+  'evm:1': 'ETH',
+  'evm:8453': 'BASE',
+  'evm:42161': 'ARB',
+  'evm:999': 'HYPEREVM',
+  bitcoin: 'BTC',
+  hyperliquid: 'HL'
+}
+
+const ROUTE_COST_TOKEN_SYMBOLS: Record<string, string> = {
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'USDC',
+  '0xaf88d065e77c8cc2239327c5edb3a432268e5831': 'USDC',
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'USDC',
+  '0xb88339cb7199b77e23db6e890353e22632ba630f': 'USDC',
+  '0xdac17f958d2ee523a2206206994597c13d831ec7': 'USDT',
+  '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9': 'USDT',
+  '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2': 'USDT',
+  '0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf': 'cbBTC'
+}
+
+const ROUTE_COST_NAMED_TOKENS: Record<string, string> = {
+  UBTC: 'uBTC',
+  UETH: 'uETH'
+}
+
+type RouteCostTierColumn = {
+  bucket: string
+  usdMicros: number
+  label: string
+}
+
+// Full cache tier ladder, mirrored from `route_costs::ROUTE_COST_TIERS`. Used
+// to scaffold the table columns so every curated route shows all price tiers
+// (with dashes) even before any bps sample lands.
+const ROUTE_COST_TIER_LADDER: ReadonlyArray<{ bucket: string; usdMicros: number }> = [
+  { bucket: 'usd_100', usdMicros: 100_000_000 },
+  { bucket: 'usd_1000', usdMicros: 1_000_000_000 },
+  { bucket: 'usd_10000', usdMicros: 10_000_000_000 },
+  { bucket: 'usd_25000', usdMicros: 25_000_000_000 },
+  { bucket: 'usd_50000', usdMicros: 50_000_000_000 },
+  { bucket: 'usd_75000', usdMicros: 75_000_000_000 },
+  { bucket: 'usd_100000', usdMicros: 100_000_000_000 },
+  { bucket: 'usd_200000', usdMicros: 200_000_000_000 },
+  { bucket: 'usd_500000', usdMicros: 500_000_000_000 },
+  { bucket: 'usd_1000000', usdMicros: 1_000_000_000_000 },
+  { bucket: 'usd_5000000', usdMicros: 5_000_000_000_000 },
+  { bucket: 'usd_10000000', usdMicros: 10_000_000_000_000 }
+]
+
+type RouteCostRow = {
+  transitionId: string
+  source: AssetRef
+  destination: AssetRef
+  cells: Map<string, RouteCostSnapshot>
+}
+
+type RouteCostVenueGroup = {
+  provider: string
+  rows: RouteCostRow[]
+}
+
+function RouteCostsView() {
+  const [snapshots, setSnapshots] = useState<RouteCostSnapshot[]>([])
+  const [curatedEdges, setCuratedEdges] = useState<RouteGraphEdge[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [fetchedAt, setFetchedAt] = useState<string | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  const [events, setEvents] = useState<RouteCostSampleEvent[]>([])
+  const [windowSeconds, setWindowSeconds] = useState(ROUTE_COST_DEFAULT_WINDOW_SECONDS)
+  // (client clock - server clock) in ms, derived from the server's `fetchedAt`.
+  // The dashboard and the router run on different hosts whose clocks can drift;
+  // anchoring "now" to the server keeps the timeline + ages correct under skew.
+  const [clockOffsetMs, setClockOffsetMs] = useState(0)
+
+  const load = useCallback(async () => {
+    try {
+      const response = await fetchRouteCosts()
+      setSnapshots(response.snapshots)
+      setFetchedAt(response.fetchedAt)
+      setClockOffsetMs(Date.now() - Date.parse(response.fetchedAt))
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load route costs')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  const loadEvents = useCallback(async () => {
+    try {
+      const response = await fetchRouteCostEvents()
+      setEvents(response.events)
+      setWindowSeconds(response.windowSeconds)
+      setClockOffsetMs(Date.now() - Date.parse(response.fetchedAt))
+    } catch {
+      // The activity feed is auxiliary; a transient failure must not blank
+      // the cache tables. Keep the last good events and retry next tick.
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+    const interval = setInterval(() => void load(), ROUTE_COST_POLL_MS)
+    return () => clearInterval(interval)
+  }, [load])
+
+  // The routing graph is static; fetch it once to scaffold the tables with the
+  // full curated route set. This lets routes that never produce a snapshot
+  // (e.g. Unit while its API is failing) still render with dashes. A failure
+  // here is non-fatal — the tables fall back to snapshot-derived rows.
+  useEffect(() => {
+    let cancelled = false
+    void fetchRouteGraph()
+      .then((graph) => {
+        if (cancelled) return
+        setCuratedEdges(graph.edges.filter((edge) => edge.curated))
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadEvents()
+    const interval = setInterval(() => void loadEvents(), ROUTE_COST_EVENTS_POLL_MS)
+    return () => clearInterval(interval)
+  }, [loadEvents])
+
+  useEffect(() => {
+    const tick = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(tick)
+  }, [])
+
+  // With the curated scaffold loaded we render the full tier ladder so empty
+  // routes still show every price column; otherwise fall back to whatever
+  // tiers the snapshots cover.
+  const tiers = useMemo(
+    () =>
+      curatedEdges.length > 0
+        ? routeCostTierLadderColumns()
+        : routeCostTierColumns(snapshots),
+    [curatedEdges, snapshots]
+  )
+  const providers = useMemo(
+    () => buildRouteCostGroups(curatedEdges, snapshots),
+    [curatedEdges, snapshots]
+  )
+  const totals = useMemo(
+    () => routeCostTotals(curatedEdges, snapshots),
+    [curatedEdges, snapshots]
+  )
+  // Worst-case freshness: how long ago the *least*-recently sampled cell was
+  // refreshed. The paced refresher always touches some cell, so the previous
+  // MAX(refreshed_at) reading was perpetually "0s ago"; the oldest cell is the
+  // meaningful staleness signal (it tracks one full sweep of the window).
+  const oldestRefreshedAt = useMemo(() => {
+    let min = Number.POSITIVE_INFINITY
+    for (const snap of snapshots) {
+      const parsed = Date.parse(snap.refreshedAt)
+      if (Number.isFinite(parsed) && parsed < min) min = parsed
+    }
+    return Number.isFinite(min) ? min : null
+  }, [snapshots])
+
+  // Server-anchored "now": the locally-ticking clock corrected by the offset
+  // so ages/positions are computed against the same clock that stamped the
+  // events, regardless of host clock skew.
+  const serverNowMs = nowMs - clockOffsetMs
+  const windowMs = windowSeconds * 1000
+  const eventsInWindow = useMemo(
+    () => events.filter((e) => serverNowMs - Date.parse(e.sampledAt) <= windowMs),
+    [events, serverNowMs, windowMs]
+  )
+
+  return (
+    <main className="dashboard route-costs">
+      <section className="route-costs-header">
+        <div className="route-costs-title">
+          <h1>Route cost cache</h1>
+          <p>
+            Live-measured per-leg fee (bps) by trade size. The refresher spreads
+            every provider sample evenly across a {formatRouteCostWindow(windowSeconds)}{' '}
+            window; this view polls snapshots every 30s and the activity feed
+            every {Math.round(ROUTE_COST_EVENTS_POLL_MS / 1000)}s.
+          </p>
+        </div>
+        <div className="route-costs-status">
+          <div className="route-costs-metrics">
+            <span className="route-costs-metric">
+              <strong>{totals.edges}</strong> edges
+            </span>
+            <span className="route-costs-metric">
+              <strong>{totals.cells}</strong> cached cells
+            </span>
+            <span className="route-costs-metric">
+              <strong>{eventsInWindow.length}</strong> reqs /{' '}
+              {formatRouteCostWindow(windowSeconds)}
+            </span>
+          </div>
+          {oldestRefreshedAt ? (
+            <span className="route-costs-freshness">
+              Oldest cell {formatRouteCostAgo(serverNowMs - oldestRefreshedAt)} old
+            </span>
+          ) : null}
+          {fetchedAt ? (
+            <span className="route-costs-freshness subtle">
+              Fetched {formatRouteCostAgo(serverNowMs - Date.parse(fetchedAt))} ago
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="icon-button"
+            onClick={() => {
+              void load()
+              void loadEvents()
+            }}
+            aria-label="Refresh route costs"
+          >
+            <RefreshCw size={16} />
+          </button>
+        </div>
+      </section>
+
+      {error ? <div className="notice error">{error}</div> : null}
+
+      <div className="route-costs-widgets">
+        <RouteCostScheduleTimeline
+          events={eventsInWindow}
+          windowSeconds={windowSeconds}
+          nowMs={serverNowMs}
+        />
+        <RouteCostActivityLog events={events} nowMs={serverNowMs} />
+      </div>
+
+      {loading && snapshots.length === 0 ? (
+        <div className="route-costs-empty">Loading route costs…</div>
+      ) : providers.length === 0 ? (
+        <div className="route-costs-empty">No route cost snapshots cached yet.</div>
+      ) : (
+        providers.map((group) => (
+          <RouteCostVenueTable
+            key={group.provider}
+            group={group}
+            tiers={tiers}
+            nowMs={serverNowMs}
+          />
+        ))
+      )}
+    </main>
+  )
+}
+
+type RouteCostTotals = {
+  edges: number
+  cells: number
+}
+
+function routeCostTotals(
+  curatedEdges: RouteGraphEdge[],
+  snapshots: RouteCostSnapshot[]
+): RouteCostTotals {
+  const edges = new Set<string>()
+  for (const edge of curatedEdges) edges.add(edge.id)
+  for (const snap of snapshots) edges.add(snap.transitionId)
+  return { edges: edges.size, cells: snapshots.length }
+}
+
+function RouteCostVenueTable({
+  group,
+  tiers,
+  nowMs
+}: {
+  group: RouteCostVenueGroup
+  tiers: RouteCostTierColumn[]
+  nowMs: number
+}) {
+  const routeCount = group.rows.length
+  const tierCount = tiers.length
+  const gridCells = routeCount * tierCount
+  const cachedCells = group.rows.reduce((sum, row) => sum + row.cells.size, 0)
+  return (
+    <section className="route-costs-venue" aria-label={`${group.provider} route costs`}>
+      <header className="route-costs-venue-header">
+        <h2>{routeCostProviderLabel(group.provider)}</h2>
+        <span className="route-costs-venue-count">
+          {routeCount} routes · {tierCount} price tiers · {gridCells} cells (
+          {cachedCells} cached)
+        </span>
+      </header>
+      <div className="table-scroll">
+        <table className="route-costs-table">
+          <thead>
+            <tr>
+              <th className="route-costs-route-col">Route</th>
+              {tiers.map((tier) => (
+                <th key={tier.bucket} className="route-costs-tier-col">
+                  {tier.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {group.rows.map((row) => (
+              <tr key={row.transitionId}>
+                <td className="route-costs-route-col">
+                  <span className="route-costs-pair">
+                    {routeCostAssetLabel(row.source)}
+                    <ArrowRight size={12} />
+                    {routeCostAssetLabel(row.destination)}
+                  </span>
+                </td>
+                {tiers.map((tier) => (
+                  <RouteCostCell
+                    key={tier.bucket}
+                    snapshot={row.cells.get(tier.bucket)}
+                    nowMs={nowMs}
+                  />
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
+function RouteCostCell({
+  snapshot,
+  nowMs
+}: {
+  snapshot: RouteCostSnapshot | undefined
+  nowMs: number
+}) {
+  if (!snapshot) {
+    return <td className="route-costs-cell rc-missing">—</td>
+  }
+  const className = `route-costs-cell ${routeCostBpsClass(snapshot.estimatedFeeBps)}${
+    snapshot.expired ? ' rc-expired' : ''
+  }`
+  const refreshedAgo = formatRouteCostAgo(nowMs - Date.parse(snapshot.refreshedAt))
+  const tooltip = [
+    `${snapshot.estimatedFeeBps.toLocaleString()} bps`,
+    `fee ${formatRouteCostUsdMicros(snapshot.estimatedFeeUsdMicros)}`,
+    `gas ${formatRouteCostUsdMicros(snapshot.estimatedGasUsdMicros)}`,
+    `~${snapshot.estimatedLatencyMs.toLocaleString()}ms`,
+    `source ${snapshot.quoteSource}`,
+    `refreshed ${refreshedAgo} ago${snapshot.expired ? ' (expired)' : ''}`
+  ].join(' · ')
+  return (
+    <td className={className} title={tooltip}>
+      {formatRouteCostBps(snapshot.estimatedFeeBps)}
+    </td>
+  )
+}
+
+type RouteCostProviderLane = {
+  provider: string
+  total: number
+  succeeded: number
+  failed: number
+  events: RouteCostSampleEvent[]
+}
+
+function RouteCostScheduleTimeline({
+  events,
+  windowSeconds,
+  nowMs
+}: {
+  events: RouteCostSampleEvent[]
+  windowSeconds: number
+  nowMs: number
+}) {
+  const lanes = useMemo(() => groupEventsByProvider(events), [events])
+  const windowMs = windowSeconds * 1000
+
+  return (
+    <section className="route-costs-timeline" aria-label="Refresh schedule">
+      <header className="route-costs-widget-header">
+        <h2>Refresh schedule</h2>
+        <span className="route-costs-widget-sub">
+          {events.length} samples over the last {formatRouteCostWindow(windowSeconds)}
+        </span>
+      </header>
+      {lanes.length === 0 ? (
+        <div className="route-costs-widget-empty">No samples in this window yet.</div>
+      ) : (
+        <div className="route-costs-timeline-lanes">
+          {lanes.map((lane) => (
+            <div className="route-costs-lane" key={lane.provider}>
+              <div className="route-costs-lane-label">
+                <span>{routeCostProviderLabel(lane.provider)}</span>
+                <span className="route-costs-lane-count">
+                  {lane.total}
+                  {lane.failed > 0 ? (
+                    <span className="route-costs-lane-failed"> · {lane.failed} failed</span>
+                  ) : null}
+                </span>
+              </div>
+              <div className="route-costs-lane-track">
+                {lane.events.map((event) => {
+                  const age = nowMs - Date.parse(event.sampledAt)
+                  const ratio = Math.min(Math.max(1 - age / windowMs, 0), 1)
+                  return (
+                    <span
+                      key={event.id}
+                      className={`route-costs-tick ${
+                        event.outcome === 'failed' ? 'rc-bad' : 'rc-good'
+                      }`}
+                      style={{ left: `${(ratio * 100).toFixed(3)}%` }}
+                      title={routeCostEventTooltip(event, nowMs)}
+                    />
+                  )
+                })}
+              </div>
+            </div>
+          ))}
+          <div className="route-costs-timeline-axis">
+            <span>-{formatRouteCostWindow(windowSeconds)}</span>
+            <span>now</span>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function RouteCostActivityLog({
+  events,
+  nowMs
+}: {
+  events: RouteCostSampleEvent[]
+  nowMs: number
+}) {
+  const recent = events.slice(0, ROUTE_COST_ACTIVITY_LOG_LIMIT)
+  return (
+    <section className="route-costs-activity" aria-label="API activity log">
+      <header className="route-costs-widget-header">
+        <h2>API activity</h2>
+        <span className="route-costs-widget-sub">newest first</span>
+      </header>
+      {recent.length === 0 ? (
+        <div className="route-costs-widget-empty">Waiting for samples…</div>
+      ) : (
+        <ol className="route-costs-activity-list">
+          {recent.map((event) => (
+            <li
+              key={event.id}
+              className={`route-costs-activity-row ${
+                event.outcome === 'failed' ? 'rc-bad' : 'rc-good'
+              }`}
+            >
+              <span className="route-costs-activity-time">
+                {formatRouteCostAgo(nowMs - Date.parse(event.sampledAt))}
+              </span>
+              <span className="route-costs-activity-provider">
+                {routeCostProviderLabel(event.provider)}
+              </span>
+              <span className="route-costs-activity-pair">
+                {routeCostAssetLabel(event.source)}
+                <ArrowRight size={11} />
+                {routeCostAssetLabel(event.destination)}
+              </span>
+              <span className="route-costs-activity-tier">
+                {formatRouteCostTier(event.sampleAmountUsdMicros)}
+              </span>
+              <span className="route-costs-activity-outcome">
+                {event.outcome === 'failed'
+                  ? `failed${event.reason ? `: ${event.reason}` : ''}`
+                  : `${formatRouteCostBps(event.estimatedFeeBps ?? 0)} bps`}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </section>
+  )
+}
+
+function groupEventsByProvider(
+  events: RouteCostSampleEvent[]
+): RouteCostProviderLane[] {
+  const byProvider = new Map<string, RouteCostProviderLane>()
+  for (const event of events) {
+    let lane = byProvider.get(event.provider)
+    if (!lane) {
+      lane = {
+        provider: event.provider,
+        total: 0,
+        succeeded: 0,
+        failed: 0,
+        events: []
+      }
+      byProvider.set(event.provider, lane)
+    }
+    lane.total += 1
+    if (event.outcome === 'failed') lane.failed += 1
+    else lane.succeeded += 1
+    lane.events.push(event)
+  }
+  return [...byProvider.values()].sort(
+    (a, b) =>
+      routeCostProviderOrderIndex(a.provider) -
+        routeCostProviderOrderIndex(b.provider) ||
+      a.provider.localeCompare(b.provider)
+  )
+}
+
+function routeCostEventTooltip(event: RouteCostSampleEvent, nowMs: number): string {
+  const parts = [
+    `${routeCostProviderLabel(event.provider)} ${routeCostAssetLabel(
+      event.source
+    )} → ${routeCostAssetLabel(event.destination)}`,
+    formatRouteCostTier(event.sampleAmountUsdMicros),
+    event.outcome === 'failed'
+      ? `failed${event.reason ? `: ${event.reason}` : ''}`
+      : `${formatRouteCostBps(event.estimatedFeeBps ?? 0)} bps`,
+    `${formatRouteCostAgo(nowMs - Date.parse(event.sampledAt))} ago`
+  ]
+  if (event.estimatedLatencyMs !== null && event.outcome === 'succeeded') {
+    parts.push(`~${event.estimatedLatencyMs.toLocaleString()}ms`)
+  }
+  return parts.join(' · ')
+}
+
+function formatRouteCostWindow(windowSeconds: number): string {
+  if (windowSeconds % 60 === 0) return `${windowSeconds / 60}m`
+  if (windowSeconds < 60) return `${windowSeconds}s`
+  const minutes = Math.floor(windowSeconds / 60)
+  return `${minutes}m ${windowSeconds % 60}s`
+}
+
+function routeCostTierColumns(
+  snapshots: RouteCostSnapshot[]
+): RouteCostTierColumn[] {
+  const byBucket = new Map<string, number>()
+  for (const snap of snapshots) {
+    if (!byBucket.has(snap.amountBucket)) {
+      byBucket.set(snap.amountBucket, snap.sampleAmountUsdMicros)
+    }
+  }
+  return [...byBucket.entries()]
+    .map(([bucket, usdMicros]) => ({
+      bucket,
+      usdMicros,
+      label: formatRouteCostTier(usdMicros)
+    }))
+    .sort((a, b) => a.usdMicros - b.usdMicros)
+}
+
+// The full price-tier ladder as table columns. Used when the curated scaffold
+// is available so every route shows all tiers (dashes included).
+function routeCostTierLadderColumns(): RouteCostTierColumn[] {
+  return ROUTE_COST_TIER_LADDER.map(({ bucket, usdMicros }) => ({
+    bucket,
+    usdMicros,
+    label: formatRouteCostTier(usdMicros)
+  }))
+}
+
+// Build the per-provider tables from the curated route scaffold, overlaying
+// any cached snapshots. Routes/cells with no snapshot render as dashes so the
+// whole curated surface is always visible — including providers (like Unit)
+// that currently produce no measurements. Falls back to snapshot-only rows
+// when the scaffold could not be loaded.
+function buildRouteCostGroups(
+  curatedEdges: RouteGraphEdge[],
+  snapshots: RouteCostSnapshot[]
+): RouteCostVenueGroup[] {
+  const providerMap = new Map<string, Map<string, RouteCostRow>>()
+
+  const ensureRow = (
+    provider: string,
+    transitionId: string,
+    source: AssetRef,
+    destination: AssetRef
+  ): RouteCostRow => {
+    let rows = providerMap.get(provider)
+    if (!rows) {
+      rows = new Map()
+      providerMap.set(provider, rows)
+    }
+    let row = rows.get(transitionId)
+    if (!row) {
+      row = { transitionId, source, destination, cells: new Map() }
+      rows.set(transitionId, row)
+    }
+    return row
+  }
+
+  // Seed rows from the curated scaffold first so empty routes still appear.
+  for (const edge of curatedEdges) {
+    ensureRow(
+      edge.provider,
+      edge.id,
+      { chainId: edge.from_chain, assetId: edge.from_asset },
+      { chainId: edge.to_chain, assetId: edge.to_asset }
+    )
+  }
+
+  // Overlay measured snapshots (creating rows for anything not in the scaffold
+  // so nothing is ever silently dropped).
+  for (const snap of snapshots) {
+    const row = ensureRow(
+      snap.provider,
+      snap.transitionId,
+      snap.source,
+      snap.destination
+    )
+    row.cells.set(snap.amountBucket, snap)
+  }
+
+  const groups = [...providerMap.entries()].map(([provider, rows]) => ({
+    provider,
+    rows: [...rows.values()].sort((a, b) =>
+      routeCostRowLabel(a).localeCompare(routeCostRowLabel(b))
+    )
+  }))
+  groups.sort(
+    (a, b) =>
+      routeCostProviderOrderIndex(a.provider) -
+        routeCostProviderOrderIndex(b.provider) ||
+      a.provider.localeCompare(b.provider)
+  )
+  return groups
+}
+
+function routeCostProviderOrderIndex(provider: string): number {
+  const index = ROUTE_COST_PROVIDER_ORDER.indexOf(provider)
+  return index === -1 ? ROUTE_COST_PROVIDER_ORDER.length : index
+}
+
+function routeCostProviderLabel(provider: string): string {
+  return ROUTE_COST_PROVIDER_LABELS[provider] ?? humanizeRouteCostKey(provider)
+}
+
+function routeCostRowLabel(row: RouteCostRow): string {
+  return `${routeCostAssetLabel(row.source)} → ${routeCostAssetLabel(row.destination)}`
+}
+
+function routeCostAssetLabel(ref: AssetRef): string {
+  const chain = ROUTE_COST_CHAIN_CODES[ref.chainId] ?? ref.chainId
+  return `${chain}.${routeCostAssetSymbol(ref)}`
+}
+
+function routeCostAssetSymbol(ref: AssetRef): string {
+  const lower = ref.assetId.toLowerCase()
+  if (ROUTE_COST_TOKEN_SYMBOLS[lower]) return ROUTE_COST_TOKEN_SYMBOLS[lower]
+  if (ROUTE_COST_NAMED_TOKENS[ref.assetId]) {
+    return ROUTE_COST_NAMED_TOKENS[ref.assetId]
+  }
+  if (ref.assetId === 'native') {
+    if (ref.chainId === 'bitcoin') return 'BTC'
+    if (ref.chainId === 'hyperliquid') return 'USDC'
+    return 'ETH'
+  }
+  if (ref.assetId.startsWith('0x')) {
+    return `${ref.assetId.slice(0, 6)}…${ref.assetId.slice(-4)}`
+  }
+  return ref.assetId
+}
+
+function routeCostBpsClass(bps: number): string {
+  if (bps <= 1) return 'rc-good'
+  if (bps <= 5) return 'rc-ok'
+  if (bps <= 20) return 'rc-warn'
+  return 'rc-bad'
+}
+
+function formatRouteCostBps(bps: number): string {
+  if (bps >= 100) return Math.round(bps).toLocaleString()
+  return (Math.round(bps * 10) / 10).toString()
+}
+
+function formatRouteCostTier(usdMicros: number): string {
+  const usd = usdMicros / 1_000_000
+  if (usd >= 1_000_000) return `$${trimRouteCostNumber(usd / 1_000_000)}M`
+  if (usd >= 1_000) return `$${trimRouteCostNumber(usd / 1_000)}k`
+  return `$${trimRouteCostNumber(usd)}`
+}
+
+function trimRouteCostNumber(value: number): string {
+  return (Math.round(value * 100) / 100).toString()
+}
+
+function formatRouteCostUsdMicros(usdMicros: number): string {
+  const usd = usdMicros / 1_000_000
+  return `$${usd.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+}
+
+function formatRouteCostAgo(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '0s'
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+function humanizeRouteCostKey(value: string): string {
+  return value
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(' ')
 }
 
 function OrderTabs({
