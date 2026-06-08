@@ -50,6 +50,11 @@ pub enum ProviderId {
     HyperliquidBridge,
     HyperliquidSpot,
     Velora,
+    Relay,
+    NearIntents,
+    Mayan,
+    Chainflip,
+    Garden,
 }
 
 impl ProviderId {
@@ -62,6 +67,11 @@ impl ProviderId {
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
             "hyperliquid_spot" => Some(Self::HyperliquidSpot),
             "velora" => Some(Self::Velora),
+            "relay" => Some(Self::Relay),
+            "near_intents" => Some(Self::NearIntents),
+            "mayan" => Some(Self::Mayan),
+            "chainflip" => Some(Self::Chainflip),
+            "garden" => Some(Self::Garden),
             _ => None,
         }
     }
@@ -89,6 +99,8 @@ pub struct QuoteRequest {
     pub from_amount: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<QuoteRouting>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_quote_candidates: Option<bool>,
 }
 
 /// A single fee line item attached to a quote or order.
@@ -116,6 +128,8 @@ pub struct QuoteResponse {
     pub venues: Vec<String>,
     #[serde(default)]
     pub fees: Option<Vec<Fee>>,
+    #[serde(default)]
+    pub quote_candidates: Option<serde_json::Value>,
     pub amount_format: AmountFormat,
 }
 
@@ -257,6 +271,7 @@ mod tests {
             amount_format: Some(AmountFormat::Readable),
             from_amount: "100".to_string(),
             routing: None,
+            include_quote_candidates: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(json["from"], "Ethereum.USDC");
@@ -277,6 +292,7 @@ mod tests {
             routing: Some(QuoteRouting {
                 provider_sequence: Some(vec![ProviderId::Velora, ProviderId::Cctp]),
             }),
+            include_quote_candidates: None,
         };
         let json = serde_json::to_value(&request).expect("serialize");
         assert_eq!(

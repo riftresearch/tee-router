@@ -232,6 +232,66 @@ pub struct RouterServerArgs {
     #[arg(long, env = "VELORA_PARTNER")]
     pub velora_partner: Option<String>,
 
+    /// Relay quote API base URL
+    #[arg(long, env = "RELAY_API_URL")]
+    pub relay_api_url: Option<String>,
+
+    /// Optional Relay API key sent as x-api-key
+    #[arg(long, env = "RELAY_API_KEY")]
+    pub relay_api_key: Option<String>,
+
+    /// Optional Relay SOCKS5 proxy URL
+    #[arg(long, env = "RELAY_PROXY_URL")]
+    pub relay_proxy_url: Option<String>,
+
+    /// NEAR Intents 1Click API base URL
+    #[arg(long, env = "NEAR_INTENTS_API_URL")]
+    pub near_intents_api_url: Option<String>,
+
+    /// Optional NEAR Intents API key sent as X-API-Key
+    #[arg(long, env = "NEAR_INTENTS_API_KEY")]
+    pub near_intents_api_key: Option<String>,
+
+    /// Optional NEAR Intents bearer token
+    #[arg(long, env = "NEAR_INTENTS_BEARER_TOKEN")]
+    pub near_intents_bearer_token: Option<String>,
+
+    /// Optional NEAR Intents SOCKS5 proxy URL
+    #[arg(long, env = "NEAR_INTENTS_PROXY_URL")]
+    pub near_intents_proxy_url: Option<String>,
+
+    /// Mayan quote API base URL
+    #[arg(long, env = "MAYAN_API_URL")]
+    pub mayan_api_url: Option<String>,
+
+    /// Optional Mayan API key
+    #[arg(long, env = "MAYAN_API_KEY")]
+    pub mayan_api_key: Option<String>,
+
+    /// Optional Mayan SOCKS5 proxy URL
+    #[arg(long, env = "MAYAN_PROXY_URL")]
+    pub mayan_proxy_url: Option<String>,
+
+    /// Chainflip swap API base URL
+    #[arg(long, env = "CHAINFLIP_API_URL")]
+    pub chainflip_api_url: Option<String>,
+
+    /// Optional Chainflip SOCKS5 proxy URL
+    #[arg(long, env = "CHAINFLIP_PROXY_URL")]
+    pub chainflip_proxy_url: Option<String>,
+
+    /// Garden quote API base URL
+    #[arg(long, env = "GARDEN_API_URL")]
+    pub garden_api_url: Option<String>,
+
+    /// Garden API key sent as garden-app-id
+    #[arg(long, env = "GARDEN_API_KEY")]
+    pub garden_api_key: Option<String>,
+
+    /// Optional Garden SOCKS5 proxy URL
+    #[arg(long, env = "GARDEN_PROXY_URL")]
+    pub garden_proxy_url: Option<String>,
+
     /// Hyperliquid paymaster private key used as the recovery/sweep destination
     /// for released internal Hyperliquid custody
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]
@@ -267,6 +327,15 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ROUTER_GATEWAY_API_KEY")]
     pub router_gateway_api_key: Option<String>,
 
+    /// Disable POST /api/v1/orders while keeping quote and read endpoints enabled
+    #[arg(
+        long,
+        env = "ROUTER_ORDERS_DISABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    pub router_orders_disabled: bool,
+
     /// Bearer API key accepted on internal admin endpoints such as provider
     /// policy updates
     #[arg(long, env = "ROUTER_ADMIN_API_KEY")]
@@ -287,6 +356,22 @@ pub struct RouterServerArgs {
     /// exchange-side dead-man switch to cancel them, in milliseconds.
     #[arg(long, env = "HYPERLIQUID_ORDER_TIMEOUT_MS", default_value = "30000")]
     pub hyperliquid_order_timeout_ms: u64,
+
+    /// Global market-order quote deadline in milliseconds
+    #[arg(
+        long,
+        env = "ROUTER_MARKET_ORDER_QUOTE_TIMEOUT_MS",
+        default_value = "60000"
+    )]
+    pub router_market_order_quote_timeout_ms: u64,
+
+    /// Per single-hop venue quote deadline in milliseconds
+    #[arg(
+        long,
+        env = "ROUTER_SINGLE_HOP_QUOTE_TIMEOUT_MS",
+        default_value = "5000"
+    )]
+    pub router_single_hop_quote_timeout_ms: u64,
 
     /// Stable worker identity for router-worker records
     #[arg(long, env = "ROUTER_WORKER_ID")]

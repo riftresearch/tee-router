@@ -73,6 +73,7 @@ pub const MAX_ROUTER_JSON_BODY_BYTES: usize = 256 * 1024;
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES >= MAX_HINT_EVIDENCE_JSON_BYTES * 2);
 const _: () = assert!(MAX_ROUTER_JSON_BODY_BYTES <= 1024 * 1024);
 const LIMIT_ORDERS_DISABLED_MESSAGE: &str = "limit orders are currently disabled";
+const ORDER_CREATION_DISABLED_MESSAGE: &str = "order creation is currently disabled";
 /// Placeholder cancellation commitment stamped onto router-order funding
 /// vaults. User-initiated cancellation has been removed, so funding vaults no
 /// longer carry a meaningful commitment; the `deposit_vaults.cancellation_commitment`
@@ -183,6 +184,7 @@ pub struct AppState {
     pub address_screener: Option<Arc<AddressScreeningService>>,
     pub chain_registry: Arc<ChainRegistry>,
     pub order_workflow_client: Option<Arc<OrderWorkflowClient>>,
+    pub orders_disabled: bool,
     pub internal_api_auth: Option<InternalApiAuth>,
     pub gateway_api_auth: Option<GatewayApiAuth>,
     pub admin_api_auth: Option<AdminApiAuth>,
@@ -222,6 +224,7 @@ async fn serve_api(args: RouterServerArgs, components: RouterComponents) -> Resu
         address_screener: components.address_screener,
         chain_registry: components.chain_registry,
         order_workflow_client: Some(order_workflow_client),
+        orders_disabled: args.router_orders_disabled,
         internal_api_auth: InternalApiAuth::from_args(&args),
         gateway_api_auth: GatewayApiAuth::from_args(&args),
         admin_api_auth: AdminApiAuth::from_args(&args),
@@ -406,10 +409,14 @@ async fn create_quote(
     ensure_order_intake_enabled(&state)?;
     let envelope = match request {
         CreateQuoteRequest::MarketOrder(market_order) => {
-            let (market_order, routing) = market_order.into_parts();
+            let (market_order, routing, include_candidates) = market_order.into_parts();
             state
                 .order_manager
-                .quote_market_order_with_routing(market_order, routing)
+                .quote_market_order_with_routing_and_candidates(
+                    market_order,
+                    routing,
+                    include_candidates,
+                )
                 .await?
         }
         CreateQuoteRequest::LimitOrder(_limit_order) => {
@@ -437,6 +444,7 @@ async fn create_order(
     authorize_gateway_api_request(&state, &headers)?;
     require_order_idempotency_key(&request)?;
     ensure_order_intake_enabled(&state)?;
+    ensure_order_creation_enabled(&state)?;
     let quote_for_screening = state.order_manager.get_quote(request.quote_id).await?;
     if quote_for_screening.as_limit_order().is_some() {
         return Err(limit_orders_disabled_error());
@@ -518,6 +526,19 @@ fn ensure_order_intake_enabled(state: &AppState) -> RouterServerResult<()> {
         });
     }
     Ok(())
+}
+
+fn ensure_order_creation_enabled(state: &AppState) -> RouterServerResult<()> {
+    if state.orders_disabled {
+        return Err(order_creation_disabled_error());
+    }
+    Ok(())
+}
+
+fn order_creation_disabled_error() -> RouterServerError {
+    RouterServerError::Conflict {
+        message: ORDER_CREATION_DISABLED_MESSAGE.to_string(),
+    }
 }
 fn require_order_idempotency_key(request: &CreateOrderRequest) -> RouterServerResult<()> {
     let Some(idempotency_key) = request.idempotency_key.as_deref() else {
@@ -1726,6 +1747,12 @@ mod tests {
     fn limit_orders_disabled_error_returns_validation_status() {
         let response = limit_orders_disabled_error().into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn order_creation_disabled_error_returns_conflict_status() {
+        let response = order_creation_disabled_error().into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[test]

@@ -44,6 +44,7 @@ use router_core::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
         route_costs::{rank_transition_paths_structurally, RouteCostService},
+        single_hop_venues::{SingleHopQuote, SingleHopQuoteRequest, SingleHopVenueRegistry},
         usd_valuation::{empty_usd_valuation, limit_quote_usd_valuation, quote_usd_valuation},
     },
 };
@@ -58,7 +59,9 @@ use std::{
 use tracing::warn;
 use uuid::Uuid;
 
+const MARKET_ORDER_QUOTE_TIMEOUT: Duration = Duration::from_secs(60);
 const MARKET_ORDER_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10);
+const SINGLE_HOP_PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
 // HyperCore charges one quote token when the destination HyperCore account is
 // not yet activated. Unit withdrawal protocol addresses are often fresh, so
 // quote paths that end with Hyperliquid -> Unit need to leave 1 USDC available.
@@ -102,19 +105,6 @@ pub enum MarketOrderError {
     #[snafu(display("No market-order route found: {}", reason))]
     NoRoute { reason: String },
 
-    #[snafu(display(
-        "Estimated output {} is below the viable floor {} for {} {} (the order is too small to clear route fees)",
-        estimated_amount_out,
-        output_floor,
-        destination_chain,
-        destination_asset
-    ))]
-    OutputBelowFloor {
-        estimated_amount_out: String,
-        output_floor: String,
-        destination_chain: Box<ChainId>,
-        destination_asset: Box<AssetId>,
-    },
 
     #[snafu(display("Gas reimbursement planning failed: {}", source))]
     GasReimbursement { source: Box<GasReimbursementError> },
@@ -164,6 +154,27 @@ struct ComposedMarketOrderQuote {
 }
 
 #[derive(Debug, Clone)]
+struct MarketOrderQuoteSelection {
+    pub quote: ComposedMarketOrderQuote,
+    pub candidates: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QuoteCandidateFamily {
+    MultiHop,
+    SingleHop,
+}
+
+impl QuoteCandidateFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MultiHop => "multi_hop",
+            Self::SingleHop => "single_hop",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ComposedLimitOrderQuote {
     pub provider_id: String,
     pub input_amount: String,
@@ -202,10 +213,13 @@ pub struct OrderManager {
     chain_registry: Arc<ChainRegistry>,
     asset_registry: Arc<AssetRegistry>,
     action_providers: Arc<ActionProviderRegistry>,
+    single_hop_venues: Arc<SingleHopVenueRegistry>,
     route_costs: Option<Arc<RouteCostService>>,
     provider_policies: Option<Arc<ProviderPolicyService>>,
     provider_health: Option<Arc<ProviderHealthService>>,
     paymasters: PaymasterRegistry,
+    market_order_quote_timeout: Duration,
+    single_hop_quote_timeout: Duration,
 }
 
 impl OrderManager {
@@ -233,10 +247,13 @@ impl OrderManager {
             chain_registry,
             asset_registry,
             action_providers,
+            single_hop_venues: Arc::new(SingleHopVenueRegistry::default()),
             route_costs: None,
             provider_policies: None,
             provider_health: None,
             paymasters: PaymasterRegistry::default(),
+            market_order_quote_timeout: MARKET_ORDER_QUOTE_TIMEOUT,
+            single_hop_quote_timeout: SINGLE_HOP_PROVIDER_TIMEOUT,
         }
     }
 
@@ -263,9 +280,30 @@ impl OrderManager {
         self.provider_health = provider_health;
         self
     }
+
+    #[must_use]
+    pub fn with_single_hop_venues(
+        mut self,
+        single_hop_venues: Arc<SingleHopVenueRegistry>,
+    ) -> Self {
+        self.single_hop_venues = single_hop_venues;
+        self
+    }
+
     #[must_use]
     pub fn with_paymasters(mut self, paymasters: PaymasterRegistry) -> Self {
         self.paymasters = paymasters;
+        self
+    }
+
+    #[must_use]
+    pub fn with_quote_timeouts(
+        mut self,
+        market_order_quote_timeout: Duration,
+        single_hop_quote_timeout: Duration,
+    ) -> Self {
+        self.market_order_quote_timeout = market_order_quote_timeout;
+        self.single_hop_quote_timeout = single_hop_quote_timeout;
         self
     }
 
@@ -282,8 +320,19 @@ impl OrderManager {
         request: MarketOrderQuoteRequest,
         routing: QuoteRoutingRequest,
     ) -> MarketOrderResult<RouterOrderQuoteEnvelope> {
+        self.quote_market_order_with_routing_and_candidates(request, routing, false)
+            .await
+    }
+
+    pub async fn quote_market_order_with_routing_and_candidates(
+        &self,
+        request: MarketOrderQuoteRequest,
+        routing: QuoteRoutingRequest,
+        include_candidates: bool,
+    ) -> MarketOrderResult<RouterOrderQuoteEnvelope> {
         let started = Instant::now();
-        let normalized_request = self.validate_and_normalize_quote_request(request, routing)?;
+        let normalized_request =
+            self.validate_and_normalize_quote_request(request, routing, include_candidates)?;
         telemetry::record_market_order_quote_requested(&normalized_request.source_asset);
 
         let quote_id = Uuid::now_v7();
@@ -295,11 +344,26 @@ impl OrderManager {
         )
         .map_err(MarketOrderError::deposit_address)?;
 
-        let provider_quote = match self
-            .best_provider_quote(&normalized_request, quote_id, &depositor_address)
-            .await
-        {
-            Ok(provider_quote) => provider_quote,
+        let include_candidates = normalized_request.include_candidates;
+        let provider_quote_result = tokio::time::timeout(
+            self.market_order_quote_timeout,
+            self.best_provider_quote(
+                &normalized_request,
+                quote_id,
+                &depositor_address,
+                include_candidates,
+            ),
+        )
+        .await
+        .map_err(|_| MarketOrderError::NoRoute {
+            reason: format!(
+                "market-order quote timed out after {}ms",
+                self.market_order_quote_timeout.as_millis()
+            ),
+        })?;
+
+        let provider_selection = match provider_quote_result {
+            Ok(provider_selection) => provider_selection,
             Err(err @ MarketOrderError::NoRoute { .. }) => {
                 telemetry::record_market_order_quote_no_route(
                     &normalized_request.source_asset,
@@ -310,28 +374,8 @@ impl OrderManager {
             }
             Err(err) => return Err(err),
         };
+        let provider_quote = provider_selection.quote;
 
-        // Economic-viability gate. Reject orders whose estimated output is
-        // below the route's dust floor — too small to clear route fees, so the
-        // depositor would receive dust (or strand funds on a deposit-then-
-        // execute route). This replaces the old live route-minimum fan-out: it
-        // reuses the quote we already computed instead of a separate
-        // exact-out walk across every candidate path. Assets with no defined
-        // floor are not gated, matching the previous lenient behaviour.
-        if let Some(output_floor) =
-            route_output_floor(&self.asset_registry, &normalized_request.destination_asset)
-        {
-            let estimated_out =
-                parse_amount("estimated_amount_out", &provider_quote.estimated_amount_out)?;
-            if estimated_out < output_floor {
-                return Err(MarketOrderError::OutputBelowFloor {
-                    estimated_amount_out: provider_quote.estimated_amount_out.clone(),
-                    output_floor: output_floor.to_string(),
-                    destination_chain: Box::new(normalized_request.destination_asset.chain.clone()),
-                    destination_asset: Box::new(normalized_request.destination_asset.asset.clone()),
-                });
-            }
-        }
 
         let now = Utc::now();
         let expected_swap_time_ms = self
@@ -352,6 +396,7 @@ impl OrderManager {
             usd_valuation: empty_usd_valuation(),
             expected_swap_time_ms,
             expires_at: provider_quote.expires_at,
+            quote_candidates: provider_selection.candidates.map(Value::Array),
             created_at: now,
         };
         let usd_pricing = self.usd_pricing_snapshot().await;
@@ -596,6 +641,15 @@ impl OrderManager {
         request: CreateOrderRequest,
         quote: MarketOrderQuote,
     ) -> MarketOrderResult<(RouterOrder, MarketOrderQuote)> {
+        if quote.provider_quote.get("planner").and_then(Value::as_str)
+            == Some("single_hop_quote_v1")
+        {
+            return Err(MarketOrderError::NoRoute {
+                reason:
+                    "single-hop market-order quotes are quote-only; execution is not implemented"
+                        .to_string(),
+            });
+        }
         if quote.expires_at <= Utc::now() {
             return Err(MarketOrderError::QuoteExpired);
         }
@@ -824,9 +878,78 @@ impl OrderManager {
         request: &NormalizedMarketOrderQuoteRequest,
         quote_id: Uuid,
         source_depositor_address: &str,
-    ) -> MarketOrderResult<ComposedMarketOrderQuote> {
+        include_candidates: bool,
+    ) -> MarketOrderResult<MarketOrderQuoteSelection> {
+        let multi_hop_result = async {
+            if request.routing.allows_transition_providers() {
+                Some(
+                    self.best_multi_hop_provider_quote(
+                        request,
+                        quote_id,
+                        source_depositor_address,
+                        include_candidates,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        };
+        let single_hop_result = async {
+            if request.routing.allows_single_hop_quote_providers() {
+                Some(
+                    self.best_single_hop_provider_quote(
+                        request,
+                        quote_id,
+                        source_depositor_address,
+                        include_candidates,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
+        };
+
+        let (multi_hop_result, single_hop_result) =
+            tokio::join!(multi_hop_result, single_hop_result);
+        let mut best: Option<ComposedMarketOrderQuote> = None;
+        let mut candidates = include_candidates.then(Vec::new);
+        let mut last_error: Option<MarketOrderError> = None;
+        for result in [multi_hop_result, single_hop_result].into_iter().flatten() {
+            match result {
+                Ok(selection) => {
+                    if let Some(candidate_list) = candidates.as_mut() {
+                        if let Some(mut child_candidates) = selection.candidates {
+                            candidate_list.append(&mut child_candidates);
+                        }
+                    }
+                    best = choose_better_quote(request, selection.quote, best);
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        match best {
+            Some(quote) => Ok(MarketOrderQuoteSelection { quote, candidates }),
+            None => match last_error {
+                Some(err) => Err(err),
+                None => Err(MarketOrderError::NoRoute {
+                    reason: "no quote venue matched the requested constraints".to_string(),
+                }),
+            },
+        }
+    }
+
+    async fn best_multi_hop_provider_quote(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+        include_candidates: bool,
+    ) -> MarketOrderResult<MarketOrderQuoteSelection> {
         const MAX_PATH_DEPTH: usize = 5;
-        const TOP_K_PATHS: usize = 8;
+        const TOP_K_PATHS: usize = 12;
 
         let mut paths = self.asset_registry.select_transition_paths(
             &request.source_asset,
@@ -835,23 +958,19 @@ impl OrderManager {
         );
         paths.retain(is_executable_transition_path);
         paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
-        if request.routing.provider_sequence.is_none() {
+        let provider_sequence = request.routing.transition_provider_sequence();
+        if provider_sequence.is_none() {
             prefer_same_chain_evm_paths(request, &mut paths);
         }
-        let provider_sequence_paths_filtered = filter_provider_sequence_paths(
-            &mut paths,
-            request.routing.provider_sequence.as_deref(),
-        );
+        let provider_sequence_paths_filtered =
+            filter_provider_sequence_paths(&mut paths, provider_sequence);
         if paths.is_empty() {
             return Err(MarketOrderError::NoRoute {
                 reason: if provider_sequence_paths_filtered {
                     format!(
                         "no executable transition path matches providerSequence {}",
                         format_provider_sequence(
-                            request
-                                .routing
-                                .provider_sequence
-                                .as_deref()
+                            provider_sequence
                                 .expect("provider sequence filter only runs when configured"),
                         )
                     )
@@ -900,11 +1019,12 @@ impl OrderManager {
             None
         };
 
+        let mut best: Option<ComposedMarketOrderQuote> = None;
+        let mut best_candidate: Option<Value> = None;
+        let mut candidates = include_candidates.then(Vec::new);
         let mut last_error: Option<MarketOrderError> = None;
         for path in paths {
-            // Path ranking is the route-selection decision. Provider quotes
-            // then prove executability for that ranked path; they do not
-            // re-run global path search by maximizing raw output.
+            let started = Instant::now();
             let candidate = self
                 .quote_transition_path(
                     request,
@@ -915,6 +1035,7 @@ impl OrderManager {
                     provider_health_snapshot.as_ref(),
                 )
                 .await;
+            let latency = started.elapsed();
             let quote = match candidate {
                 Ok(Some(quote)) => quote,
                 Ok(None) => continue,
@@ -928,15 +1049,226 @@ impl OrderManager {
                 last_error = Some(err);
                 continue;
             }
-            return Ok(quote);
+            if is_better_quote(&quote, &best) {
+                if include_candidates {
+                    best_candidate = Some(quote_candidate_success(
+                        QuoteCandidateFamily::MultiHop,
+                        quote_candidate_path_label(&path),
+                        quote_candidate_path_venues(&path),
+                        latency,
+                        &quote,
+                    ));
+                }
+                best = Some(quote);
+            }
+        }
+        if let (Some(candidate_list), Some(candidate)) = (candidates.as_mut(), best_candidate) {
+            candidate_list.push(candidate);
         }
 
-        match last_error {
-            Some(err) => Err(err),
-            None => Err(MarketOrderError::NoRoute {
+        match (best, last_error) {
+            (Some(quote), _) => Ok(MarketOrderQuoteSelection { quote, candidates }),
+            (None, Some(err)) => Err(err),
+            (None, None) => Err(MarketOrderError::NoRoute {
                 reason: "no executable transition path satisfied the requested constraints"
                     .to_string(),
             }),
+        }
+    }
+
+    async fn best_single_hop_provider_quote(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+        include_candidates: bool,
+    ) -> MarketOrderResult<MarketOrderQuoteSelection> {
+        let providers = match request.routing.single_hop_quote_provider_allowlist() {
+            Some(provider_ids) => {
+                let mut providers = Vec::with_capacity(provider_ids.len());
+                for provider_id in provider_ids {
+                    let provider =
+                        self.single_hop_venues
+                            .provider(*provider_id)
+                            .ok_or_else(|| MarketOrderError::NoRoute {
+                                reason: format!(
+                                    "single-hop quote provider {} is not configured",
+                                    provider_id.as_str()
+                                ),
+                            })?;
+                    providers.push(provider);
+                }
+                providers
+            }
+            None => self.single_hop_venues.providers().to_vec(),
+        };
+        if providers.is_empty() {
+            return Err(MarketOrderError::NoRoute {
+                reason: "no single-hop quote providers are configured".to_string(),
+            });
+        }
+
+        let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
+        } else {
+            None
+        };
+        let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
+        } else {
+            None
+        };
+
+        let destination_recipient_address =
+            self.quote_address_for_chain(quote_id, &request.destination_asset.chain)?;
+        let refund_address = self.quote_address_for_chain(quote_id, &request.source_asset.chain)?;
+        let mut candidates = include_candidates.then(Vec::new);
+        let mut tasks = tokio::task::JoinSet::new();
+        for provider in providers {
+            let provider_id = provider.id();
+            if !provider_allowed_for_new_routes(
+                provider_policy_snapshot.as_ref(),
+                provider_health_snapshot.as_ref(),
+                provider_id.as_str(),
+            ) {
+                if let Some(candidate_list) = candidates.as_mut() {
+                    candidate_list.push(quote_candidate_error(
+                        QuoteCandidateFamily::SingleHop,
+                        provider_id.as_str().to_string(),
+                        vec![provider_id.as_str().to_string()],
+                        Duration::from_millis(0),
+                        "disabled",
+                        "provider is disabled for new routes".to_string(),
+                    ));
+                }
+                continue;
+            }
+            let provider_request = SingleHopQuoteRequest {
+                source_asset: request.source_asset.clone(),
+                destination_asset: request.destination_asset.clone(),
+                amount_in: request.amount_in.clone(),
+                source_depositor_address: source_depositor_address.to_string(),
+                destination_recipient_address: destination_recipient_address.clone(),
+                refund_address: refund_address.clone(),
+            };
+            let timeout = self.single_hop_quote_timeout;
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let result =
+                    tokio::time::timeout(timeout, provider.quote_market_order(provider_request))
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "single-hop quote provider {} timed out after {}ms",
+                                provider_id.as_str(),
+                                timeout.as_millis()
+                            )
+                        })
+                        .and_then(|result| result);
+                (provider_id, started.elapsed(), result)
+            });
+        }
+
+        let mut best: Option<ComposedMarketOrderQuote> = None;
+        let mut last_error: Option<MarketOrderError> = None;
+        while let Some(joined) = tasks.join_next().await {
+            let (provider_id, latency, result) = match joined {
+                Ok(result) => result,
+                Err(err) => {
+                    last_error = Some(MarketOrderError::NoRoute {
+                        reason: format!("single-hop quote task failed: {err}"),
+                    });
+                    continue;
+                }
+            };
+            let quote = match result {
+                Ok(Some(quote)) => quote,
+                Ok(None) => {
+                    if let Some(candidate_list) = candidates.as_mut() {
+                        candidate_list.push(quote_candidate_no_route(
+                            QuoteCandidateFamily::SingleHop,
+                            provider_id.as_str().to_string(),
+                            vec![provider_id.as_str().to_string()],
+                            latency,
+                        ));
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    let status = if err.contains("timed out") {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
+                    if let Some(candidate_list) = candidates.as_mut() {
+                        candidate_list.push(quote_candidate_error(
+                            QuoteCandidateFamily::SingleHop,
+                            provider_id.as_str().to_string(),
+                            vec![provider_id.as_str().to_string()],
+                            latency,
+                            status,
+                            err.clone(),
+                        ));
+                    }
+                    last_error = Some(MarketOrderError::NoRoute {
+                        reason: format!(
+                            "single-hop quote provider {} failed: {err}",
+                            provider_id.as_str()
+                        ),
+                    });
+                    continue;
+                }
+            };
+            let composed = composed_single_hop_quote(request, quote);
+            if let Err(err) = self.validate_provider_quote(request, &composed) {
+                warn!(
+                    provider = provider_id.as_str(),
+                    error = %err,
+                    "Ignoring invalid single-hop quote"
+                );
+                if let Some(candidate_list) = candidates.as_mut() {
+                    candidate_list.push(quote_candidate_error(
+                        QuoteCandidateFamily::SingleHop,
+                        provider_id.as_str().to_string(),
+                        vec![provider_id.as_str().to_string()],
+                        latency,
+                        "invalid",
+                        err.to_string(),
+                    ));
+                }
+                last_error = Some(err);
+                continue;
+            }
+            if let Some(candidate_list) = candidates.as_mut() {
+                candidate_list.push(quote_candidate_success(
+                    QuoteCandidateFamily::SingleHop,
+                    provider_id.as_str().to_string(),
+                    vec![provider_id.as_str().to_string()],
+                    latency,
+                    &composed,
+                ));
+            }
+            best = choose_better_quote(request, composed, best);
+        }
+
+        match best {
+            Some(quote) => Ok(MarketOrderQuoteSelection { quote, candidates }),
+            None => match last_error {
+                Some(err) => Err(err),
+                None => Err(MarketOrderError::NoRoute {
+                    reason: "no single-hop quote provider returned a route".to_string(),
+                }),
+            },
         }
     }
 
@@ -947,7 +1279,7 @@ impl OrderManager {
         source_depositor_address: &str,
     ) -> MarketOrderResult<ComposedLimitOrderQuote> {
         const MAX_PATH_DEPTH: usize = 5;
-        const TOP_K_PATHS: usize = 8;
+        const TOP_K_PATHS: usize = 12;
 
         let source_canonical = self
             .asset_registry
@@ -1189,6 +1521,7 @@ impl OrderManager {
                 source_asset: limit_transition.output.asset.clone(),
                 destination_asset: request.destination_asset.clone(),
                 amount_in: String::new(),
+                include_candidates: false,
                 routing: NormalizedMarketOrderRouting::default(),
             };
             let suffix_order_kind = ProviderOrderKind::ExactOut {
@@ -1242,6 +1575,7 @@ impl OrderManager {
                 source_asset: request.source_asset.clone(),
                 destination_asset: limit_transition.input.asset.clone(),
                 amount_in: String::new(),
+                include_candidates: false,
                 routing: NormalizedMarketOrderRouting::default(),
             };
             let prefix_order_kind = ProviderOrderKind::ExactOut {
@@ -2086,6 +2420,7 @@ impl OrderManager {
         &self,
         request: MarketOrderQuoteRequest,
         routing: QuoteRoutingRequest,
+        include_candidates: bool,
     ) -> MarketOrderResult<NormalizedMarketOrderQuoteRequest> {
         validate_positive_amount("amount_in", &request.amount_in)?;
         let source_asset = self.validate_and_normalize_asset(&request.from_asset)?;
@@ -2097,6 +2432,7 @@ impl OrderManager {
             source_asset,
             destination_asset,
             amount_in: request.amount_in,
+            include_candidates,
             routing,
         })
     }
@@ -2790,6 +3126,113 @@ fn required_paymaster_native_balances(
     }
     Ok(required_by_chain)
 }
+fn composed_single_hop_quote(
+    request: &NormalizedMarketOrderQuoteRequest,
+    quote: SingleHopQuote,
+) -> ComposedMarketOrderQuote {
+    let provider_id = quote.provider_id.as_str().to_string();
+    ComposedMarketOrderQuote {
+        provider_id,
+        amount_in: quote.amount_in.clone(),
+        estimated_amount_out: quote.estimated_amount_out.clone(),
+        provider_quote: single_hop_quote_blob(request, &quote),
+        expires_at: quote.expires_at,
+    }
+}
+
+fn single_hop_quote_blob(
+    request: &NormalizedMarketOrderQuoteRequest,
+    quote: &SingleHopQuote,
+) -> Value {
+    json!({
+        "schema_version": 1,
+        "planner": "single_hop_quote_v1",
+        "provider": quote.provider_id.as_str(),
+        "venues": [quote.provider_id.as_str()],
+        "source_asset": {
+            "chain_id": request.source_asset.chain.as_str(),
+            "asset": request.source_asset.asset.as_str(),
+        },
+        "destination_asset": {
+            "chain_id": request.destination_asset.chain.as_str(),
+            "asset": request.destination_asset.asset.as_str(),
+        },
+        "amount_in": quote.amount_in.clone(),
+        "estimated_amount_out": quote.estimated_amount_out.clone(),
+        "min_amount_out": quote.min_amount_out.clone(),
+        "raw_quote": quote.provider_quote.clone(),
+    })
+}
+
+fn quote_candidate_success(
+    family: QuoteCandidateFamily,
+    label: String,
+    venues: Vec<String>,
+    latency: Duration,
+    quote: &ComposedMarketOrderQuote,
+) -> Value {
+    json!({
+        "family": family.as_str(),
+        "label": label,
+        "status": "success",
+        "provider_id": quote.provider_id.clone(),
+        "venues": venues,
+        "latency_ms": duration_millis_u64(latency),
+        "amount_in": quote.amount_in.clone(),
+        "estimated_amount_out": quote.estimated_amount_out.clone(),
+        "expires_at": quote.expires_at,
+        "raw_quote": quote.provider_quote.clone(),
+    })
+}
+
+fn quote_candidate_no_route(
+    family: QuoteCandidateFamily,
+    label: String,
+    venues: Vec<String>,
+    latency: Duration,
+) -> Value {
+    json!({
+        "family": family.as_str(),
+        "label": label,
+        "status": "no_route",
+        "venues": venues,
+        "latency_ms": duration_millis_u64(latency),
+    })
+}
+
+fn quote_candidate_error(
+    family: QuoteCandidateFamily,
+    label: String,
+    venues: Vec<String>,
+    latency: Duration,
+    status: &'static str,
+    error: String,
+) -> Value {
+    json!({
+        "family": family.as_str(),
+        "label": label,
+        "status": status,
+        "venues": venues,
+        "latency_ms": duration_millis_u64(latency),
+        "error": error,
+    })
+}
+
+fn quote_candidate_path_label(path: &TransitionPath) -> String {
+    path.id.clone()
+}
+
+fn quote_candidate_path_venues(path: &TransitionPath) -> Vec<String> {
+    path.transitions
+        .iter()
+        .map(|transition| transition.provider.as_str().to_string())
+        .collect()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn transition_path_quote_blob(
     path: &TransitionPath,
     legs: &[QuoteLeg],
@@ -2852,6 +3295,9 @@ fn quote_legs_from_provider_quote(provider_quote: &Value) -> MarketOrderResult<V
 fn swap_time_route_keys_from_provider_quote(
     provider_quote: &Value,
 ) -> MarketOrderResult<Vec<SwapTimeRouteKey>> {
+    if provider_quote.get("planner").and_then(Value::as_str) == Some("single_hop_quote_v1") {
+        return Ok(Vec::new());
+    }
     let transitions = provider_quote
         .get("transitions")
         .ok_or_else(|| MarketOrderError::NoRoute {
@@ -3253,9 +3699,41 @@ fn choose_better_quote(
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct NormalizedMarketOrderRouting {
-    provider_sequence: Option<Vec<ProviderId>>,
+#[derive(Debug, Clone)]
+enum NormalizedMarketOrderRouting {
+    All,
+    TransitionProviderSequence(Vec<ProviderId>),
+    SingleHopQuoteProviderAllowlist(Vec<ProviderId>),
+}
+
+impl Default for NormalizedMarketOrderRouting {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+impl NormalizedMarketOrderRouting {
+    fn allows_transition_providers(&self) -> bool {
+        matches!(self, Self::All | Self::TransitionProviderSequence(_))
+    }
+
+    fn allows_single_hop_quote_providers(&self) -> bool {
+        matches!(self, Self::All | Self::SingleHopQuoteProviderAllowlist(_))
+    }
+
+    fn transition_provider_sequence(&self) -> Option<&[ProviderId]> {
+        match self {
+            Self::TransitionProviderSequence(providers) => Some(providers),
+            Self::All | Self::SingleHopQuoteProviderAllowlist(_) => None,
+        }
+    }
+
+    fn single_hop_quote_provider_allowlist(&self) -> Option<&[ProviderId]> {
+        match self {
+            Self::SingleHopQuoteProviderAllowlist(providers) => Some(providers),
+            Self::All | Self::TransitionProviderSequence(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3263,6 +3741,7 @@ struct NormalizedMarketOrderQuoteRequest {
     source_asset: DepositAsset,
     destination_asset: DepositAsset,
     amount_in: String,
+    include_candidates: bool,
     routing: NormalizedMarketOrderRouting,
 }
 
@@ -3278,7 +3757,7 @@ fn validate_and_normalize_quote_routing(
     routing: QuoteRoutingRequest,
 ) -> MarketOrderResult<NormalizedMarketOrderRouting> {
     let Some(provider_sequence) = routing.provider_sequence else {
-        return Ok(NormalizedMarketOrderRouting::default());
+        return Ok(NormalizedMarketOrderRouting::All);
     };
     if provider_sequence.is_empty() {
         return Err(MarketOrderError::InvalidRouting {
@@ -3292,9 +3771,26 @@ fn validate_and_normalize_quote_routing(
             ),
         });
     }
-    Ok(NormalizedMarketOrderRouting {
-        provider_sequence: Some(provider_sequence),
-    })
+    let has_single_hop = provider_sequence
+        .iter()
+        .any(|provider| provider.is_single_hop_quote_provider());
+    let has_transition = provider_sequence
+        .iter()
+        .any(|provider| provider.is_transition_provider());
+    if has_single_hop && has_transition {
+        return Err(MarketOrderError::InvalidRouting {
+            reason:
+                "providerSequence cannot mix transition providers with single-hop quote providers"
+                    .to_string(),
+        });
+    }
+    if has_single_hop {
+        Ok(NormalizedMarketOrderRouting::SingleHopQuoteProviderAllowlist(provider_sequence))
+    } else {
+        Ok(NormalizedMarketOrderRouting::TransitionProviderSequence(
+            provider_sequence,
+        ))
+    }
 }
 fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResult<()> {
     let amount = parse_amount(field, value)?;
@@ -3307,26 +3803,6 @@ fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResu
     Ok(())
 }
 
-/// Dust floors per canonical destination asset — the smallest output below
-/// which a market order isn't economically viable (the fees would eat it).
-const ROUTE_OUTPUT_FLOOR_BTC_SATS: u64 = 30_000;
-const ROUTE_OUTPUT_FLOOR_ETH_WEI: u128 = 7_000_000_000_000_000;
-const ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW: u64 = 1_000_000;
-
-/// The minimum viable output for a route, by destination asset. `None` for
-/// assets with no defined floor (e.g. HYPE) — those routes are not gated.
-fn route_output_floor(registry: &AssetRegistry, destination_asset: &DepositAsset) -> Option<U256> {
-    match registry.canonical_for(destination_asset)? {
-        CanonicalAsset::Btc | CanonicalAsset::Cbbtc => {
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS))
-        }
-        CanonicalAsset::Eth => Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI)),
-        CanonicalAsset::Usdc | CanonicalAsset::Usdt => {
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))
-        }
-        CanonicalAsset::Hype => None,
-    }
-}
 
 fn parse_amount(field: &'static str, value: &str) -> MarketOrderResult<U256> {
     if value.is_empty() {
@@ -3426,6 +3902,9 @@ fn is_better_quote(
 }
 
 fn quote_hop_count(quote: &ComposedMarketOrderQuote) -> usize {
+    if quote.provider_quote.get("planner").and_then(Value::as_str) == Some("single_hop_quote_v1") {
+        return 1;
+    }
     quote
         .provider_quote
         .get("transition_decl_ids")
@@ -3560,46 +4039,33 @@ mod tests {
     }
 
     #[test]
-    fn route_output_floor_resolves_canonical_destination_assets() {
-        let registry = AssetRegistry::default();
+    fn provider_sequence_routing_accepts_single_hop_allowlist() {
+        let routing = validate_and_normalize_quote_routing(QuoteRoutingRequest {
+            provider_sequence: Some(vec![ProviderId::Relay, ProviderId::Chainflip]),
+        })
+        .expect("single-hop provider allowlist");
+
+        assert!(routing.allows_single_hop_quote_providers());
+        assert!(!routing.allows_transition_providers());
         assert_eq!(
-            route_output_floor(&registry, &floor_asset("bitcoin", AssetId::Native)),
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_BTC_SATS))
-        );
-        assert_eq!(
-            route_output_floor(&registry, &floor_asset("evm:1", AssetId::Native)),
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI))
-        );
-        assert_eq!(
-            route_output_floor(&registry, &floor_asset("evm:8453", AssetId::Native)),
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_ETH_WEI))
-        );
-        assert_eq!(
-            route_output_floor(
-                &registry,
-                &floor_asset(
-                    "evm:8453",
-                    AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
-                ),
-            ),
-            Some(U256::from(ROUTE_OUTPUT_FLOOR_STABLECOIN_RAW))
+            routing.single_hop_quote_provider_allowlist(),
+            Some([ProviderId::Relay, ProviderId::Chainflip].as_slice())
         );
     }
 
     #[test]
-    fn route_output_floor_is_none_for_unknown_destination_asset() {
-        // An asset the registry can't canonicalize is not gated.
-        assert_eq!(
-            route_output_floor(
-                &AssetRegistry::default(),
-                &floor_asset(
-                    "evm:1",
-                    AssetId::reference("0x000000000000000000000000000000000000dead"),
-                ),
-            ),
-            None
-        );
+    fn provider_sequence_routing_rejects_mixed_families() {
+        let error = validate_and_normalize_quote_routing(QuoteRoutingRequest {
+            provider_sequence: Some(vec![ProviderId::Cctp, ProviderId::Chainflip]),
+        })
+        .expect_err("mixed provider families must be rejected");
+
+        let MarketOrderError::InvalidRouting { reason } = error else {
+            panic!("expected invalid routing");
+        };
+        assert!(reason.contains("cannot mix transition providers with single-hop"));
     }
+
 
     #[test]
     fn amount_parser_rejects_oversized_decimal_strings_before_u256_parse() {

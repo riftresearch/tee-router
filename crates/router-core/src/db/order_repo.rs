@@ -7375,6 +7375,7 @@ impl OrderRepository {
                     })
                 })
                 .transpose()?,
+            quote_candidates: None,
             expires_at: row.get("expires_at"),
             created_at: row.get("created_at"),
         })

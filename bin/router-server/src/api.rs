@@ -63,11 +63,13 @@ pub struct ApiMarketOrderQuoteRequest {
     pub amount_in: String,
     #[serde(default)]
     pub routing: QuoteRoutingRequest,
+    #[serde(default)]
+    pub include_candidates: bool,
 }
 
 impl ApiMarketOrderQuoteRequest {
     #[must_use]
-    pub fn into_parts(self) -> (MarketOrderQuoteRequest, QuoteRoutingRequest) {
+    pub fn into_parts(self) -> (MarketOrderQuoteRequest, QuoteRoutingRequest, bool) {
         (
             MarketOrderQuoteRequest {
                 from_asset: self.from_asset,
@@ -75,6 +77,7 @@ impl ApiMarketOrderQuoteRequest {
                 amount_in: self.amount_in,
             },
             self.routing,
+            self.include_candidates,
         )
     }
 }
@@ -440,6 +443,53 @@ mod tests {
             request.routing.provider_sequence,
             Some(vec![ProviderId::Velora, ProviderId::HyperliquidSpot])
         );
+    }
+
+    #[test]
+    fn create_quote_request_deserializes_single_hop_provider_routing() {
+        let request: CreateQuoteRequest = serde_json::from_value(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "evm:1", "asset": "native"},
+            "to_asset": {"chain": "bitcoin", "asset": "native"},
+            "amount_in": "1000000000000000000",
+            "routing": {
+                "provider_sequence": ["relay", "near_intents", "mayan", "chainflip", "garden"]
+            }
+        }))
+        .expect("market order request with single-hop routing");
+
+        let CreateQuoteRequest::MarketOrder(request) = request else {
+            panic!("expected market order request");
+        };
+        assert_eq!(
+            request.routing.provider_sequence,
+            Some(vec![
+                ProviderId::Relay,
+                ProviderId::NearIntents,
+                ProviderId::Mayan,
+                ProviderId::Chainflip,
+                ProviderId::Garden,
+            ])
+        );
+    }
+
+    #[test]
+    fn create_quote_request_deserializes_candidate_debug_flag() {
+        let request: CreateQuoteRequest = serde_json::from_value(json!({
+            "type": "market_order",
+            "from_asset": {"chain": "evm:8453", "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+            "to_asset": {"chain": "evm:1", "asset": "native"},
+            "amount_in": "100000000",
+            "include_candidates": true
+        }))
+        .expect("market order request with include_candidates");
+
+        let CreateQuoteRequest::MarketOrder(request) = request else {
+            panic!("expected market order request");
+        };
+        assert!(request.include_candidates);
+        let (_, _, include_candidates) = request.into_parts();
+        assert!(include_candidates);
     }
 
     #[test]

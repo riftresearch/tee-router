@@ -24,15 +24,20 @@ const ProviderIdSchema = z.enum([
   'unit',
   'hyperliquid_bridge',
   'hyperliquid_spot',
-  'velora'
+  'velora',
+  'relay',
+  'near_intents',
+  'mayan',
+  'chainflip',
+  'garden'
 ])
 
 const QuoteRoutingSchema = z
   .object({
     providerSequence: z.array(ProviderIdSchema).min(1).max(5).optional().openapi({
       description:
-        'Exact provider sequence the selected transition path must use. This filters candidate routes before quote hydration; it does not bypass provider quoting or execution validation.',
-      example: ['velora', 'cctp']
+        'Provider constraints. Transition providers are interpreted as an exact multihop provider sequence; single-hop providers are interpreted as a whole-route venue allowlist. Mixing the two families is rejected by the router.',
+      example: ['relay', 'chainflip']
     })
   })
   .strict()
@@ -66,6 +71,11 @@ export const QuoteRequestSchema = z
     routing: QuoteRoutingSchema.optional().openapi({
       description:
         'Optional route-selection constraints. providerSequence is an exact transition-provider sequence.'
+    }),
+    includeQuoteCandidates: z.boolean().optional().openapi({
+      description:
+        'When true, include debug quote candidate records with per-venue latency and raw provider quote payloads.',
+      example: true
     })
   })
   .strict()
@@ -175,7 +185,10 @@ export function createQuoteHandler(
           amountFormat,
           'fromAmount'
         ),
-        ...(routing === undefined ? {} : { routing })
+        ...(routing === undefined ? {} : { routing }),
+        ...(request.includeQuoteCandidates === true
+          ? { include_candidates: true }
+          : {})
       })
 
       return c.json(presentQuoteEnvelope(envelope, amountFormat), 200)

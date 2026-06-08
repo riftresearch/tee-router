@@ -44,7 +44,8 @@ describe('router gateway routes', () => {
       'amountFormat',
       'orderType',
       'fromAmount',
-      'routing'
+      'routing',
+      'includeQuoteCandidates',
     ])
     expect(body.components.schemas.QuoteRequest.properties.orderType.enum).toEqual([
       'market_order',
@@ -795,6 +796,102 @@ describe('router gateway routes', () => {
         provider_sequence: ['velora', 'hyperliquid_spot']
       }
     })
+  })
+
+  test('forwards single-hop quote provider allowlists', async () => {
+    const calls: RecordedCall[] = []
+    const quote = internalQuote()
+    quote.quote.payload.source_asset = {
+      chain: 'evm:8453',
+      asset: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+    }
+    quote.quote.payload.destination_asset = {
+      chain: 'bitcoin',
+      asset: 'native'
+    }
+    quote.quote.payload.provider_id = 'relay'
+    const singleHopProviderQuote = quote.quote.payload.provider_quote as {
+      transitions: { provider: string }[]
+      venues?: string[]
+    }
+    singleHopProviderQuote.transitions = []
+    singleHopProviderQuote.venues = ['relay']
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () => Response.json(quote, { status: 200 }))
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Base.USDC',
+        to: 'Bitcoin.BTC',
+        fromAmount: '5',
+        amountFormat: 'readable',
+        routing: {
+          providerSequence: ['relay', 'near_intents', 'mayan', 'chainflip', 'garden']
+        }
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(calls[0]?.body).toMatchObject({
+      type: 'market_order',
+      routing: {
+        provider_sequence: ['relay', 'near_intents', 'mayan', 'chainflip', 'garden']
+      }
+    })
+
+    const body = await response.json()
+    expect(body.venues).toEqual(['relay'])
+  })
+
+  test('forwards quote candidate debug flag and presents candidates', async () => {
+    const calls: RecordedCall[] = []
+    const quote = internalQuote()
+    const quoteCandidates = [
+      {
+        family: 'single_hop',
+        label: 'relay',
+        status: 'success',
+        venues: ['relay'],
+        latency_ms: 123,
+        raw_quote: {
+          response: {
+            details: {
+              currencyOut: {
+                amount: '1000'
+              }
+            }
+          }
+        }
+      }
+    ]
+    ;(quote.quote.payload as { quote_candidates?: unknown }).quote_candidates =
+      quoteCandidates
+    const app = createApp(testConfig(), {
+      fetch: mockFetch(calls, async () => Response.json(quote, { status: 200 }))
+    })
+
+    const response = await app.request('/quote', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        from: 'Bitcoin.BTC',
+        to: 'Ethereum.USDC',
+        fromAmount: '1',
+        amountFormat: 'raw',
+        includeQuoteCandidates: true
+      })
+    })
+
+    expect(response.status).toBe(200)
+    expect(calls[0]?.body).toMatchObject({
+      type: 'market_order',
+      include_candidates: true
+    })
+    const body = await response.json()
+    expect(body.quoteCandidates).toEqual(quoteCandidates)
   })
 
   test('rejects invalid EVM order refund addresses before creating orders', async () => {

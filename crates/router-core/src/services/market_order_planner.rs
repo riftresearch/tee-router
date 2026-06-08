@@ -226,6 +226,7 @@ impl MarketOrderRoutePlanner {
             provider_quote: quote.provider_quote.clone(),
             usd_valuation: json!({}),
             expected_swap_time_ms: quote.expected_swap_time_ms,
+            quote_candidates: None,
             expires_at: quote.expires_at,
             created_at: quote.created_at,
         };
@@ -2848,6 +2849,7 @@ mod tests {
             provider_quote: json!({ "legs": legs }),
             usd_valuation: json!({}),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: now + chrono::Duration::minutes(5),
             created_at: now,
         }
@@ -3215,6 +3217,7 @@ mod tests {
             }),
             usd_valuation: json!({}),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: now + chrono::Duration::minutes(5),
             created_at: now,
         };
@@ -3403,6 +3406,7 @@ mod tests {
             }),
             usd_valuation: json!({}),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: now + chrono::Duration::minutes(5),
             created_at: now,
         };
@@ -3568,6 +3572,7 @@ mod tests {
             }),
             usd_valuation: json!({}),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: now + chrono::Duration::minutes(5),
             created_at: now,
         };
@@ -3737,6 +3742,7 @@ mod tests {
             }),
             usd_valuation: json!({}),
             expected_swap_time_ms: None,
+            quote_candidates: None,
             expires_at: now + chrono::Duration::minutes(5),
             created_at: now,
         };

@@ -161,7 +161,7 @@ fn parse_provider_sequence(value: &str) -> Result<QuoteRouting> {
 fn parse_provider_id(value: &str) -> Result<ProviderId> {
     ProviderId::parse(value).ok_or_else(|| {
         eyre!(
-            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid_spot, velora"
+            "unknown provider `{value}`; expected one of: across, cctp, unit, hyperliquid_bridge, hyperliquid_spot, velora, relay, near_intents, mayan, chainflip, garden"
         )
     })
 }

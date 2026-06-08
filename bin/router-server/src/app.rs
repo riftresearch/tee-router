@@ -24,6 +24,11 @@ use router_core::{
         asset_registry::ProviderId,
         custody_action_executor::{evm_address_from_private_key, PaymasterRegistry},
         route_costs::RouteCostService,
+        single_hop_venues::{
+            ChainflipQuoteProvider, GardenQuoteProvider, MayanQuoteProvider,
+            NearIntentsQuoteProvider, RelayQuoteProvider, SingleHopQuoteProvider,
+            SingleHopVenueRegistry,
+        },
         upstream_proxy::{
             effective_proxy, normalize_optional_string as normalize_proxy_string, ProxyUrl,
         },
@@ -118,6 +123,7 @@ pub async fn initialize_components_with_action_providers(
         action_providers.clone(),
     )?);
     let address_screener = initialize_address_screener(args)?;
+    let single_hop_venues = Arc::new(initialize_single_hop_venues(args)?);
     let order_manager = Arc::new(
         OrderManager::with_action_providers(
             db.clone(),
@@ -125,10 +131,15 @@ pub async fn initialize_components_with_action_providers(
             chain_registry.clone(),
             action_providers.clone(),
         )
+        .with_single_hop_venues(single_hop_venues)
         .with_route_costs(Some(route_costs.clone()))
         .with_provider_policies(Some(provider_policies.clone()))
         .with_provider_health(Some(provider_health.clone()))
-        .with_paymasters(quote_paymaster_registry(args)?),
+        .with_paymasters(quote_paymaster_registry(args)?)
+        .with_quote_timeouts(
+            Duration::from_millis(args.router_market_order_quote_timeout_ms),
+            Duration::from_millis(args.router_single_hop_quote_timeout_ms),
+        ),
     );
     let vault_manager = Arc::new(match worker_id {
         Some(worker_id) => VaultManager::with_worker_id(
@@ -161,6 +172,11 @@ struct ResolvedUpstreamProxies {
     hyperunit: Option<ProxyUrl>,
     hyperliquid: Option<ProxyUrl>,
     velora: Option<ProxyUrl>,
+    relay: Option<ProxyUrl>,
+    near_intents: Option<ProxyUrl>,
+    mayan: Option<ProxyUrl>,
+    chainflip: Option<ProxyUrl>,
+    garden: Option<ProxyUrl>,
     chainalysis: Option<ProxyUrl>,
     coinbase: Option<ProxyUrl>,
     ethereum_rpc: Option<ProxyUrl>,
@@ -197,6 +213,28 @@ fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedUpstreamP
         velora: effective_proxy(
             args.velora_proxy_url.as_deref(),
             "VELORA_PROXY_URL",
+            upstream,
+        )
+        .map_err(invalid_proxy_config)?,
+        relay: effective_proxy(args.relay_proxy_url.as_deref(), "RELAY_PROXY_URL", upstream)
+            .map_err(invalid_proxy_config)?,
+        near_intents: effective_proxy(
+            args.near_intents_proxy_url.as_deref(),
+            "NEAR_INTENTS_PROXY_URL",
+            upstream,
+        )
+        .map_err(invalid_proxy_config)?,
+        mayan: effective_proxy(args.mayan_proxy_url.as_deref(), "MAYAN_PROXY_URL", upstream)
+            .map_err(invalid_proxy_config)?,
+        chainflip: effective_proxy(
+            args.chainflip_proxy_url.as_deref(),
+            "CHAINFLIP_PROXY_URL",
+            upstream,
+        )
+        .map_err(invalid_proxy_config)?,
+        garden: effective_proxy(
+            args.garden_proxy_url.as_deref(),
+            "GARDEN_PROXY_URL",
             upstream,
         )
         .map_err(invalid_proxy_config)?,
@@ -313,6 +351,48 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
     );
     optional_http_url(
         &mut errors,
+        "RELAY_API_URL",
+        "Relay API URL",
+        args.relay_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
+        "NEAR_INTENTS_API_URL",
+        "NEAR Intents API URL",
+        args.near_intents_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
+        "MAYAN_API_URL",
+        "Mayan API URL",
+        args.mayan_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
+        "CHAINFLIP_API_URL",
+        "Chainflip API URL",
+        args.chainflip_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
+        "GARDEN_API_URL",
+        "Garden API URL",
+        args.garden_api_url.as_deref(),
+    );
+    if args
+        .garden_api_url
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        require_present(
+            &mut errors,
+            "GARDEN_API_KEY",
+            "Garden API key",
+            args.garden_api_key.as_deref(),
+        );
+    }
+    optional_http_url(
+        &mut errors,
         "CHAINALYSIS_HOST",
         "Chainalysis host",
         args.chainalysis_host.as_deref(),
@@ -410,6 +490,46 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             "ARBITRUM_RPC_PROXY_URL",
             &proxies.arbitrum_rpc,
         );
+        if args.relay_api_url.is_some() {
+            require_proxy(
+                &mut errors,
+                "RELAY_API_URL",
+                "RELAY_PROXY_URL",
+                &proxies.relay,
+            );
+        }
+        if args.near_intents_api_url.is_some() {
+            require_proxy(
+                &mut errors,
+                "NEAR_INTENTS_API_URL",
+                "NEAR_INTENTS_PROXY_URL",
+                &proxies.near_intents,
+            );
+        }
+        if args.mayan_api_url.is_some() {
+            require_proxy(
+                &mut errors,
+                "MAYAN_API_URL",
+                "MAYAN_PROXY_URL",
+                &proxies.mayan,
+            );
+        }
+        if args.chainflip_api_url.is_some() {
+            require_proxy(
+                &mut errors,
+                "CHAINFLIP_API_URL",
+                "CHAINFLIP_PROXY_URL",
+                &proxies.chainflip,
+            );
+        }
+        if args.garden_api_url.is_some() {
+            require_proxy(
+                &mut errors,
+                "GARDEN_API_URL",
+                "GARDEN_PROXY_URL",
+                &proxies.garden,
+            );
+        }
 
         require_proxy(
             &mut errors,
@@ -739,6 +859,72 @@ async fn initialize_chain_registry(
     Ok(chain_registry)
 }
 
+fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenueRegistry> {
+    let proxies = resolve_upstream_proxies(args)?;
+    let mut providers: Vec<Arc<dyn SingleHopQuoteProvider>> = Vec::new();
+
+    if let Some(base_url) = normalize_optional_url(args.relay_api_url.as_deref(), "Relay API URL")?
+    {
+        providers.push(Arc::new(
+            RelayQuoteProvider::new(
+                base_url,
+                normalize_proxy_string(args.relay_api_key.as_deref()),
+                proxies.relay.as_ref(),
+            )
+            .map_err(invalid_config)?,
+        ));
+    }
+
+    if let Some(base_url) =
+        normalize_optional_url(args.near_intents_api_url.as_deref(), "NEAR Intents API URL")?
+    {
+        providers.push(Arc::new(
+            NearIntentsQuoteProvider::new(
+                base_url,
+                normalize_proxy_string(args.near_intents_api_key.as_deref()),
+                normalize_proxy_string(args.near_intents_bearer_token.as_deref()),
+                proxies.near_intents.as_ref(),
+            )
+            .map_err(invalid_config)?,
+        ));
+    }
+
+    if let Some(base_url) = normalize_optional_url(args.mayan_api_url.as_deref(), "Mayan API URL")?
+    {
+        providers.push(Arc::new(
+            MayanQuoteProvider::new(
+                base_url,
+                normalize_proxy_string(args.mayan_api_key.as_deref()),
+                proxies.mayan.as_ref(),
+            )
+            .map_err(invalid_config)?,
+        ));
+    }
+
+    if let Some(base_url) =
+        normalize_optional_url(args.chainflip_api_url.as_deref(), "Chainflip API URL")?
+    {
+        providers.push(Arc::new(
+            ChainflipQuoteProvider::new(base_url, proxies.chainflip.as_ref())
+                .map_err(invalid_config)?,
+        ));
+    }
+
+    if let Some(base_url) =
+        normalize_optional_url(args.garden_api_url.as_deref(), "Garden API URL")?
+    {
+        let api_key = normalize_proxy_string(args.garden_api_key.as_deref()).ok_or_else(|| {
+            invalid_config("GARDEN_API_KEY is required when GARDEN_API_URL is configured")
+        })?;
+        providers.push(Arc::new(
+            GardenQuoteProvider::new(base_url, api_key, proxies.garden.as_ref())
+                .map_err(invalid_config)?,
+        ));
+    }
+
+    Ok(SingleHopVenueRegistry::new(providers))
+}
+
 fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProviderRegistry> {
     let proxies = resolve_upstream_proxies(args)?;
     let across_api_url = normalize_optional_url(args.across_api_url.as_deref(), "Across API URL")?;
@@ -999,16 +1185,34 @@ mod tests {
             velora_api_url: None,
             velora_proxy_url: None,
             velora_partner: None,
+            relay_api_url: None,
+            relay_api_key: None,
+            relay_proxy_url: None,
+            near_intents_api_url: None,
+            near_intents_api_key: None,
+            near_intents_bearer_token: None,
+            near_intents_proxy_url: None,
+            mayan_api_url: None,
+            mayan_api_key: None,
+            mayan_proxy_url: None,
+            chainflip_api_url: None,
+            chainflip_proxy_url: None,
+            garden_api_url: None,
+            garden_api_key: None,
+            garden_proxy_url: None,
             hyperliquid_paymaster_private_key: None,
             temporal_address: "http://127.0.0.1:7233".to_string(),
             temporal_namespace: "default".to_string(),
             temporal_task_queue: router_temporal::DEFAULT_TASK_QUEUE.to_string(),
             router_detector_api_key: None,
             router_gateway_api_key: None,
+            router_orders_disabled: false,
             router_admin_api_key: None,
             hyperliquid_network:
                 router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
             hyperliquid_order_timeout_ms: 30_000,
+            router_market_order_quote_timeout_ms: 60_000,
+            router_single_hop_quote_timeout_ms: 5_000,
             worker_id: None,
             worker_refund_poll_seconds: 60,
             worker_order_execution_poll_seconds: 5,
@@ -1101,6 +1305,15 @@ mod tests {
 
         assert!(error.contains("ETH_RPC_PROXY_URL or UPSTREAM_PROXY_URL"));
         assert!(error.contains("COINBASE_PROXY_URL or UPSTREAM_PROXY_URL"));
+    }
+
+    #[test]
+    fn blank_garden_url_does_not_require_api_key() {
+        let mut args = base_args();
+        args.garden_api_url = Some(" ".to_string());
+        args.garden_api_key = None;
+
+        validate_upstream_config(&args).unwrap();
     }
 
     #[test]

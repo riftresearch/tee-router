@@ -53,6 +53,7 @@ pub(super) fn refreshed_market_order_quote_exact_in(
         }),
         usd_valuation: json!({}),
         expected_swap_time_ms: original_quote.expected_swap_time_ms,
+        quote_candidates: None,
         expires_at,
         created_at,
     }

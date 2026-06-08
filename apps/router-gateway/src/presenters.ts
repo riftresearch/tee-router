@@ -21,6 +21,7 @@ export type PublicQuoteResponse = {
   fees?: PublicQuoteFee[]
   expectedSwapTimeMs?: number
   venues: string[]
+  quoteCandidates?: unknown
   amountFormat: AmountFormat
 }
 
@@ -191,6 +192,9 @@ function presentQuote(
     quote.expected_swap_time_ms === undefined
       ? {}
       : { expectedSwapTimeMs: quote.expected_swap_time_ms }),
+    ...(quote.quote_candidates === undefined
+      ? {}
+      : { quoteCandidates: quote.quote_candidates }),
     venues,
     ...quoteFees(quote.provider_quote, amountFormat),
     amountFormat
@@ -206,6 +210,10 @@ function presentOrderStatus(status: string): string {
 
 function quoteVenues(providerQuote: unknown): string[] {
   const quote = isRecord(providerQuote) ? providerQuote : undefined
+  const directVenues = Array.isArray(quote?.venues) ? quote.venues : []
+  if (directVenues.length > 0) {
+    return directVenues.filter((venue): venue is string => typeof venue === 'string' && venue.length > 0)
+  }
   const transitions = Array.isArray(quote?.transitions)
     ? quote.transitions
     : []

@@ -227,6 +227,8 @@ pub struct MarketOrderQuote {
     pub usd_valuation: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_swap_time_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_candidates: Option<Value>,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }

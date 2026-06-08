@@ -77,8 +77,8 @@ export const QuoteResponseSchema = z
       example: '100000'
     }),
     venues: z.array(z.string()).openapi({
-      description: 'Ordered provider ids for the route transitions used by this quote.',
-      example: ['velora', 'across', 'hyperliquid_bridge', 'hyperliquid_spot', 'unit']
+      description: 'Provider ids for the winning quote. Multihop quotes list route transition providers; single-hop quotes list the selected whole-route venue.',
+      example: ['relay']
     }),
     fees: z
       .array(
@@ -103,6 +103,10 @@ export const QuoteResponseSchema = z
       .optional(),
     expectedSwapTimeMs: z.number().int().nonnegative().optional().openapi({
       example: 63000
+    }),
+    quoteCandidates: z.array(z.unknown()).optional().openapi({
+      description:
+        'Debug-only quote candidate records returned when includeQuoteCandidates is true. Each record includes family, status, venues, latency_ms, and raw_quote for successful candidates.'
     }),
     amountFormat: AmountFormatSchema
   })
@@ -146,8 +150,8 @@ export const OrderResponseSchema = z
       example: '100000'
     }),
     venues: z.array(z.string()).openapi({
-      description: 'Ordered provider ids for the route transitions used by this quote.',
-      example: ['velora', 'across', 'hyperliquid_bridge', 'hyperliquid_spot', 'unit']
+      description: 'Provider ids for the winning quote. Multihop quotes list route transition providers; single-hop quotes list the selected whole-route venue.',
+      example: ['relay']
     }),
     fees: z
       .array(

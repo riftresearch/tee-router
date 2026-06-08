@@ -233,7 +233,13 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:1", ETHEREUM_USDC_ADDRESS),
         amount_in: "60000000000000000",
-        provider_sequence: &["across", "unit", "hyperliquid_spot", "hyperliquid_bridge", "cctp"],
+        provider_sequence: &[
+            "across",
+            "unit",
+            "hyperliquid_spot",
+            "hyperliquid_bridge",
+            "cctp",
+        ],
         expected_provider_fragments: &[
             "across_bridge:across",
             "unit_deposit:unit",
@@ -689,7 +695,7 @@ async fn spawn_mock_router_runtime() -> RouterRuntimeHarness {
         },
         bitcoin_observer_urls,
         mocks.hyperunit_url(), // hyperunit_api_url
-        mocks.cctp_url(), // cctp_api_url (one mock server hosts the Iris path too)
+        mocks.cctp_url(),      // cctp_api_url (one mock server hosts the Iris path too)
     )
     .await;
     timing_log!("spawn_sauron", _t);
@@ -1346,15 +1352,33 @@ fn router_args(
         velora_api_url: Some(mocks.velora_url()),
         velora_proxy_url: None,
         velora_partner: Some("router-e2e".to_string()),
+        relay_api_url: None,
+        relay_api_key: None,
+        relay_proxy_url: None,
+        near_intents_api_url: None,
+        near_intents_api_key: None,
+        near_intents_bearer_token: None,
+        near_intents_proxy_url: None,
+        mayan_api_url: None,
+        mayan_api_key: None,
+        mayan_proxy_url: None,
+        chainflip_api_url: None,
+        chainflip_proxy_url: None,
+        garden_api_url: None,
+        garden_api_key: None,
+        garden_proxy_url: None,
         hyperliquid_paymaster_private_key: Some(test_hyperliquid_paymaster_private_key()),
         temporal_address: temporal_address.to_string(),
         temporal_namespace: "default".to_string(),
         temporal_task_queue: format!("{DEFAULT_TASK_QUEUE}-{}", Uuid::now_v7()),
         router_detector_api_key: Some(ROUTER_DETECTOR_API_KEY.to_string()),
         router_gateway_api_key: None,
+        router_orders_disabled: false,
         router_admin_api_key: Some(ROUTER_ADMIN_API_KEY.to_string()),
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
+        router_market_order_quote_timeout_ms: 60_000,
+        router_single_hop_quote_timeout_ms: 5_000,
         worker_id: Some(format!("router-runtime-e2e-{}", Uuid::now_v7())),
         worker_refund_poll_seconds: 1,
         worker_order_execution_poll_seconds: 1,
