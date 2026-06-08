@@ -53,6 +53,7 @@ railway/env/*.env
 *.swo
 *~
 tmp/
+.tmp/
 paymaster-system-overview.html
 .cache/
 
