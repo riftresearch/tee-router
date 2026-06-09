@@ -31,6 +31,14 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 const DEFAULT_REFRESH_TTL: Duration = Duration::from_secs(600);
+/// How long a sampled route-cost snapshot stays valid for ranking. This is
+/// intentionally decoupled from [`DEFAULT_REFRESH_TTL`] (which only gates
+/// pricing-oracle freshness): the paced refresher spreads one full sweep over
+/// the ~30 min `window`, so a snapshot must stay "active" until its next
+/// refresh or the ranker would treat freshly-curated legs as uncached for most
+/// of every window. We set this to the refresh window plus margin so the last
+/// sampled value for each `(transition, tier)` is always considered valid.
+const DEFAULT_ROUTE_COST_SNAPSHOT_TTL: Duration = Duration::from_secs(2400);
 /// Tier label corresponding to [`DEFAULT_SAMPLE_AMOUNT_USD_MICROS`].
 /// Used by tests and by callers that intentionally pin to a single anchor
 /// (V1 limit orders, temporal boundary requote, offline trace harness).
@@ -381,7 +389,11 @@ pub struct RouteCostService {
     db: Database,
     action_providers: Arc<ActionProviderRegistry>,
     asset_registry: Arc<AssetRegistry>,
+    /// Freshness window for the pricing-oracle snapshot only.
     ttl: Duration,
+    /// Validity window for sampled route-cost rows (`expires_at`). Decoupled
+    /// from `ttl` so snapshots survive the full paced refresh window.
+    snapshot_ttl: Duration,
     pricing: Arc<RwLock<PricingSnapshot>>,
     pricing_refresh: Arc<Mutex<()>>,
     pricing_oracle: Option<Arc<MarketPricingOracle>>,
@@ -403,6 +415,7 @@ impl RouteCostService {
             action_providers,
             asset_registry,
             ttl: DEFAULT_REFRESH_TTL,
+            snapshot_ttl: DEFAULT_ROUTE_COST_SNAPSHOT_TTL,
             pricing: Arc::new(RwLock::new(PricingSnapshot::static_bootstrap(Utc::now()))),
             pricing_refresh: Arc::new(Mutex::new(())),
             pricing_oracle: None,
@@ -425,6 +438,15 @@ impl RouteCostService {
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    /// Override the validity window for sampled route-cost rows. Used by tests
+    /// that need short-lived snapshots; production relies on the default which
+    /// outlives the paced refresh window.
+    #[must_use]
+    pub fn with_snapshot_ttl(mut self, snapshot_ttl: Duration) -> Self {
+        self.snapshot_ttl = snapshot_ttl;
         self
     }
 
@@ -553,7 +575,8 @@ impl RouteCostService {
     }
 
     fn expiry_from(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        now + chrono::Duration::from_std(self.ttl).unwrap_or_else(|_| chrono::Duration::seconds(600))
+        now + chrono::Duration::from_std(self.snapshot_ttl)
+            .unwrap_or_else(|_| chrono::Duration::seconds(2400))
     }
 
     /// Advance every provider's paced cursor independently and return the work
@@ -765,16 +788,60 @@ impl RouteCostService {
         paths: &mut [TransitionPath],
         request_usd_micros: u64,
     ) -> RouterCoreResult<Vec<RankedTransitionPath>> {
+        self.rank_transition_paths_for_request_with_overrides(
+            paths,
+            request_usd_micros,
+            &HashMap::new(),
+        )
+        .await
+    }
+
+    /// Same as [`rank_transition_paths_for_request`] but lets the caller inject
+    /// live-sampled snapshots that take precedence over the cached rows for
+    /// their transition ids. This is how the route explainer folds the cost of
+    /// uncached Velora (`UniversalRouterSwap`) wrap legs into the score when
+    /// live quoting is enabled, so a leg that was previously a `missing_edge`
+    /// with zero cost contributes its real value-loss bps and the cheapest
+    /// total (e.g. the best ERC20 entry/exit anchor) sorts to the top.
+    /// Active (non-expired) cached snapshots for the tier implied by
+    /// `request_usd_micros`, keyed by transition id. Exposed so the route
+    /// explainer can tell which legs already have a fresh cached cost and only
+    /// live-sample the ones that do not.
+    pub async fn active_snapshots_for_request(
+        &self,
+        request_usd_micros: u64,
+    ) -> RouterCoreResult<HashMap<String, RouteCostSnapshot>> {
         let tier = select_route_cost_tier(request_usd_micros);
         let snapshots = self
             .db
             .route_costs()
             .list_active(tier.label, Utc::now())
             .await?;
-        let by_transition_id = snapshots
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.transition_id.clone(), snapshot))
+            .collect())
+    }
+
+    pub async fn rank_transition_paths_for_request_with_overrides(
+        &self,
+        paths: &mut [TransitionPath],
+        request_usd_micros: u64,
+        overrides: &HashMap<String, RouteCostSnapshot>,
+    ) -> RouterCoreResult<Vec<RankedTransitionPath>> {
+        let tier = select_route_cost_tier(request_usd_micros);
+        let snapshots = self
+            .db
+            .route_costs()
+            .list_active(tier.label, Utc::now())
+            .await?;
+        let mut by_transition_id = snapshots
             .into_iter()
             .map(|snapshot| (snapshot.transition_id.clone(), snapshot))
             .collect::<HashMap<_, _>>();
+        for (transition_id, snapshot) in overrides {
+            by_transition_id.insert(transition_id.clone(), snapshot.clone());
+        }
 
         let pricing = self.current_or_refresh_pricing_snapshot().await;
         rank_paths_in_place(paths, &by_transition_id, &pricing, request_usd_micros);
@@ -791,6 +858,30 @@ impl RouteCostService {
             })
             .collect();
         Ok(ranked)
+    }
+
+    /// Live-sample the cost of a single transition at the tier implied by
+    /// `request_usd_micros`, returning the snapshot on success. Used by the
+    /// route explainer to price uncached legs (notably runtime Velora wrap
+    /// legs for arbitrary ERC20s) on demand. Benign skips, provider failures,
+    /// and unsupported legs return `None` so the caller leaves the edge as a
+    /// `missing_edge` rather than fabricating a cost.
+    pub async fn sample_transition_cost(
+        &self,
+        transition: &TransitionDecl,
+        request_usd_micros: u64,
+    ) -> Option<RouteCostSnapshot> {
+        let tier = select_route_cost_tier(request_usd_micros);
+        let pricing = self.current_or_refresh_pricing_snapshot().await;
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::minutes(5);
+        match self
+            .live_cost_snapshot(transition, now, expires_at, tier, &pricing)
+            .await
+        {
+            LiveCostSnapshotOutcome::Succeeded { snapshot } => Some(*snapshot),
+            _ => None,
+        }
     }
 
     async fn refresh_pricing_snapshot(&self) -> PricingSnapshot {
@@ -1388,10 +1479,12 @@ pub fn rank_transition_paths_structurally(paths: &mut [TransitionPath], request_
         path_sort_key(
             left,
             amount_aware_path_score(left, &snapshots, &pricing, request_usd_micros),
+            request_usd_micros,
         )
         .cmp(&path_sort_key(
             right,
             amount_aware_path_score(right, &snapshots, &pricing, request_usd_micros),
+            request_usd_micros,
         ))
     });
 }
@@ -1435,11 +1528,11 @@ pub fn path_score(
 ///   floored by the request-size re-derivation from `estimated_fee_bps` so a
 ///   stale lower-tier row cannot under-price a much larger request;
 /// - otherwise (Velora runtime edges, uncached legs, or a transient refresh
-///   miss for this tier) the leg contributes **zero fabricated cost** and
-///   bumps `missing_edges`. We no longer guess a structural estimate; ranking
-///   leans on the real cached legs plus the hop/latency tiebreak, and the
-///   [`confidence_band`] fanout live-quotes any path with `missing_edges > 0`
-///   for the final pick.
+///   miss for this tier) the leg contributes **zero fabricated cost** here and
+///   bumps `missing_edges`. We no longer guess a structural estimate. Ranking
+///   ([`path_sort_key`]) then adds a notional-scaled penalty per unknown leg so
+///   a fully-priced cheaper route always wins, and the live-quote fanout fills
+///   those legs with real values when live quoting is enabled.
 ///
 /// Gas costs stay absolute (USD micros / leg). Latency stays absolute (ms).
 /// `pricing` is retained for signature stability with structural callers but
@@ -1453,18 +1546,15 @@ pub fn amount_aware_path_score(
 ) -> RoutePathCostScore {
     let _ = pricing;
     let mut missing_edges = 0_usize;
-    let mut total_fee_usd_micros = 0_u64;
-    let mut total_gas_usd_micros = 0_u64;
+    let mut total_effective_cost_usd_micros = 0_u64;
     let mut total_latency_ms = 0_u64;
     for transition in &path.transitions {
         match snapshots.get(&transition.id) {
             Some(snapshot) => {
-                let bps_derived =
-                    fee_usd_micros_from_bps(snapshot.estimated_fee_bps, request_usd_micros);
-                let fee = snapshot.estimated_fee_usd_micros.max(bps_derived);
-                total_fee_usd_micros = capped_add_u64(total_fee_usd_micros, fee);
-                total_gas_usd_micros =
-                    capped_add_u64(total_gas_usd_micros, snapshot.estimated_gas_usd_micros);
+                total_effective_cost_usd_micros = capped_add_u64(
+                    total_effective_cost_usd_micros,
+                    effective_leg_cost_usd_micros(snapshot, request_usd_micros),
+                );
                 total_latency_ms =
                     capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
             }
@@ -1475,9 +1565,25 @@ pub fn amount_aware_path_score(
     }
     RoutePathCostScore {
         missing_edges,
-        total_effective_cost_usd_micros: capped_add_u64(total_fee_usd_micros, total_gas_usd_micros),
+        total_effective_cost_usd_micros,
         total_latency_ms,
     }
+}
+
+/// Effective per-leg cost in USD micros at `request_usd_micros`: the leg fee
+/// (cached USD micros floored by the request-size re-derivation from
+/// `estimated_fee_bps`, so a stale lower-tier row cannot under-price a larger
+/// request) plus absolute gas. This is the exact per-leg quantity
+/// [`amount_aware_path_score`] sums, exposed so the route explainer can render
+/// per-leg and total bps that match the ranking metric.
+#[must_use]
+pub fn effective_leg_cost_usd_micros(
+    snapshot: &RouteCostSnapshot,
+    request_usd_micros: u64,
+) -> u64 {
+    let bps_derived = fee_usd_micros_from_bps(snapshot.estimated_fee_bps, request_usd_micros);
+    let fee = snapshot.estimated_fee_usd_micros.max(bps_derived);
+    capped_add_u64(fee, snapshot.estimated_gas_usd_micros)
 }
 
 /// Sort `paths` in place by the amount-aware score, with deterministic
@@ -1491,17 +1597,45 @@ fn rank_paths_in_place(
     paths.sort_by(|left, right| {
         let left_score = amount_aware_path_score(left, snapshots, pricing, request_usd_micros);
         let right_score = amount_aware_path_score(right, snapshots, pricing, request_usd_micros);
-        path_sort_key(left, left_score).cmp(&path_sort_key(right, right_score))
+        path_sort_key(left, left_score, request_usd_micros)
+            .cmp(&path_sort_key(right, right_score, request_usd_micros))
     });
 }
 
+/// Per-unknown-leg penalty as a fraction of the request notional. A leg with no
+/// fresh snapshot (and no live override) has genuinely unknown cost, so we must
+/// not let it count as free or an unpriced path would always "win". We add this
+/// penalty per unknown leg when ranking so a fully-priced cheaper path beats a
+/// partially-unknown one, while two paths with the *same* unknown count still
+/// compare on their real known cost. `10` == 10% of notional (~1000 bps) per
+/// unknown leg, which dwarfs any realistic single-leg fee.
+const UNKNOWN_LEG_PENALTY_DIVISOR: u64 = 10;
+
+/// Floor for the unknown-leg penalty so it stays meaningful even for tiny or
+/// zero request notionals (e.g. structural callers).
+const UNKNOWN_LEG_PENALTY_FLOOR_USD_MICROS: u64 = 100 * USD_MICRO;
+
+#[must_use]
+fn unknown_leg_penalty_usd_micros(request_usd_micros: u64) -> u64 {
+    (request_usd_micros / UNKNOWN_LEG_PENALTY_DIVISOR).max(UNKNOWN_LEG_PENALTY_FLOOR_USD_MICROS)
+}
+
+/// Sort key for least-cost ranking. The primary key is the path's total cost in
+/// USD micros (monotonic with total bps at a fixed notional) plus a penalty for
+/// any unknown leg, so the cheapest *real* route sorts first. Latency is a soft
+/// secondary factor (only breaks exact cost ties), then hop count, then the
+/// deterministic `path.id`. `missing_edges` is no longer a leading key; it is
+/// folded into the cost via the penalty and otherwise kept only for display.
 fn path_sort_key(
     path: &TransitionPath,
     score: RoutePathCostScore,
-) -> (usize, u64, u64, usize, &str) {
+    request_usd_micros: u64,
+) -> (u64, u64, usize, &str) {
+    let penalty = unknown_leg_penalty_usd_micros(request_usd_micros)
+        .saturating_mul(score.missing_edges as u64);
+    let sort_cost = capped_add_u64(score.total_effective_cost_usd_micros, penalty);
     (
-        score.missing_edges,
-        score.total_effective_cost_usd_micros,
+        sort_cost,
         score.total_latency_ms,
         path.transitions.len(),
         path.id.as_str(),
@@ -1598,6 +1732,33 @@ pub struct LiveQuoteOutcome {
     pub path_id: String,
     pub hop_count: usize,
     pub estimated_amount_out: U256,
+}
+
+/// Strict-drop routes that still have an unpriced leg, with a cold-cache
+/// safety fallback. Given the ranked candidate set (after Velora legs were
+/// live-priced and folded into the cached hop costs), a route with
+/// `missing_edges > 0` has a leg whose cost is genuinely unknown - a
+/// broken/unavailable provider - so it must not be ranked or counted as free
+/// and is dropped.
+///
+/// If that drop empties the set even though candidates existed (e.g. a
+/// momentarily cold cache where every route has an unpriced curated hop), the
+/// original input is returned unchanged so the downstream live-quote stage can
+/// still try to price a route end-to-end rather than failing outright.
+#[must_use]
+pub fn retain_viable_ranked(
+    ranked: Vec<RankedTransitionPath>,
+) -> Vec<RankedTransitionPath> {
+    let viable: Vec<RankedTransitionPath> = ranked
+        .iter()
+        .filter(|ranked_path| ranked_path.score.missing_edges == 0)
+        .cloned()
+        .collect();
+    if viable.is_empty() {
+        ranked
+    } else {
+        viable
+    }
 }
 
 /// Pick the best-output live quote, deterministically tie-breaking by
@@ -2796,6 +2957,183 @@ mod tests {
     #[test]
     fn select_best_quote_returns_none_on_empty() {
         assert_eq!(select_best_quote(&[]), None);
+    }
+
+    // -- effective_leg_cost_usd_micros ------------------------------------
+
+    #[test]
+    fn effective_leg_cost_uses_bps_floor_when_cached_usd_is_stale_low() {
+        // Cached USD fee was sampled at a tiny notional (so it is ~$0), but the
+        // request is $1000. The bps re-derivation must floor the cost so a stale
+        // low-tier row cannot under-price a large request: 20 bps of $1000 = $2.
+        let request = 1_000 * USD_MICRO;
+        let snapshot = make_snapshot("leg", 20, 1, 0, 0, 1);
+        assert_eq!(effective_leg_cost_usd_micros(&snapshot, request), 2 * USD_MICRO);
+    }
+
+    #[test]
+    fn effective_leg_cost_keeps_cached_usd_over_bps_floor_and_adds_gas() {
+        // bps floor = 5 bps of $1000 = $0.50; cached fee $0.90 wins; plus $0.10 gas.
+        let request = 1_000 * USD_MICRO;
+        let snapshot = make_snapshot("leg", 5, 900_000, 100_000, 0, request);
+        assert_eq!(effective_leg_cost_usd_micros(&snapshot, request), 1_000_000);
+    }
+
+    #[test]
+    fn effective_leg_cost_zero_notional_is_safe() {
+        let snapshot = make_snapshot("leg", 20, 0, 0, 0, 0);
+        assert_eq!(effective_leg_cost_usd_micros(&snapshot, 0), 0);
+    }
+
+    // -- path_sort_key -----------------------------------------------------
+
+    fn score_of(missing: usize, cost: u64, latency: u64) -> RoutePathCostScore {
+        RoutePathCostScore {
+            missing_edges: missing,
+            total_effective_cost_usd_micros: cost,
+            total_latency_ms: latency,
+        }
+    }
+
+    #[test]
+    fn path_sort_key_orders_by_total_cost_before_latency() {
+        let req = 1_000 * USD_MICRO;
+        let cheap = path("z", vec![transition("e", MarketOrderTransitionKind::CctpBridge)]);
+        let pricey = path("a", vec![transition("f", MarketOrderTransitionKind::CctpBridge)]);
+        // Cheaper total cost wins even with much higher latency.
+        assert!(
+            path_sort_key(&cheap, score_of(0, 100, 9_999), req)
+                < path_sort_key(&pricey, score_of(0, 200, 0), req)
+        );
+    }
+
+    #[test]
+    fn path_sort_key_penalizes_unknown_legs_so_fully_priced_route_wins() {
+        let req = 1_000 * USD_MICRO;
+        // A fully-priced route at $5 vs a partially-unknown route whose known
+        // cost is only $1: the unknown-leg penalty (10% of $1000 = $100) must
+        // make the fully-priced route sort first.
+        let priced = path("priced", vec![transition("p", MarketOrderTransitionKind::CctpBridge)]);
+        let missing = path("missing", vec![transition("m", MarketOrderTransitionKind::CctpBridge)]);
+        assert!(
+            path_sort_key(&priced, score_of(0, 5 * USD_MICRO, 0), req)
+                < path_sort_key(&missing, score_of(1, 1 * USD_MICRO, 0), req)
+        );
+    }
+
+    #[test]
+    fn path_sort_key_equal_missing_counts_compare_on_real_cost() {
+        let req = 1_000 * USD_MICRO;
+        let cheaper = path("a", vec![transition("x", MarketOrderTransitionKind::CctpBridge)]);
+        let pricier = path("b", vec![transition("y", MarketOrderTransitionKind::CctpBridge)]);
+        assert!(
+            path_sort_key(&cheaper, score_of(1, 1_000, 0), req)
+                < path_sort_key(&pricier, score_of(1, 2_000, 0), req)
+        );
+    }
+
+    // -- amount_aware_path_score ------------------------------------------
+
+    #[test]
+    fn amount_aware_score_marks_uncached_leg_missing_with_zero_cost() {
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let p = path("p", vec![transition("only", MarketOrderTransitionKind::CctpBridge)]);
+        let score = amount_aware_path_score(&p, &HashMap::new(), &pricing, 1_000 * USD_MICRO);
+        assert_eq!(score.missing_edges, 1);
+        assert_eq!(score.total_effective_cost_usd_micros, 0);
+    }
+
+    #[test]
+    fn amount_aware_score_prefers_cctp_over_across_when_one_bps_cheaper() {
+        // The PEPE case: identical routes apart from the bridge leg; CCTP at
+        // 1 bps must beat Across at 2 bps.
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let req = 1_000 * USD_MICRO;
+        let cctp = transition("cctp", MarketOrderTransitionKind::CctpBridge);
+        let across = transition("across", MarketOrderTransitionKind::AcrossBridge);
+        let mut snapshots = HashMap::new();
+        snapshots.insert(cctp.id.clone(), make_snapshot(&cctp.id, 1, 0, 0, 0, req));
+        snapshots.insert(across.id.clone(), make_snapshot(&across.id, 2, 0, 0, 0, req));
+        let cctp_score =
+            amount_aware_path_score(&path("c", vec![cctp]), &snapshots, &pricing, req);
+        let across_score =
+            amount_aware_path_score(&path("a", vec![across]), &snapshots, &pricing, req);
+        assert!(
+            cctp_score.total_effective_cost_usd_micros
+                < across_score.total_effective_cost_usd_micros
+        );
+    }
+
+    #[test]
+    fn velora_override_fold_reorders_anchor_choice_toward_cheaper_total() {
+        // PEPE -> USDC via Velora (57 bps) + CCTP (1 bps) = 58 bps, vs
+        // PEPE -> ETH via Velora (39 bps) + a 13 bps hop = 52 bps. Once the
+        // live Velora legs are folded in as snapshots, the ETH anchor wins.
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let req = 1_000 * USD_MICRO;
+        let v_usdc = transition("v_usdc", MarketOrderTransitionKind::UniversalRouterSwap);
+        let cctp = transition("cctp", MarketOrderTransitionKind::CctpBridge);
+        let v_eth = transition("v_eth", MarketOrderTransitionKind::UniversalRouterSwap);
+        let unit = transition("unit", MarketOrderTransitionKind::UnitDeposit);
+        let mut snapshots = HashMap::new();
+        snapshots.insert(v_usdc.id.clone(), make_snapshot(&v_usdc.id, 57, 0, 0, 0, req));
+        snapshots.insert(cctp.id.clone(), make_snapshot(&cctp.id, 1, 0, 0, 0, req));
+        snapshots.insert(v_eth.id.clone(), make_snapshot(&v_eth.id, 39, 0, 0, 0, req));
+        snapshots.insert(unit.id.clone(), make_snapshot(&unit.id, 13, 0, 0, 0, req));
+        let usdc_path =
+            amount_aware_path_score(&path("usdc", vec![v_usdc, cctp]), &snapshots, &pricing, req);
+        let eth_path =
+            amount_aware_path_score(&path("eth", vec![v_eth, unit]), &snapshots, &pricing, req);
+        assert!(
+            eth_path.total_effective_cost_usd_micros
+                < usdc_path.total_effective_cost_usd_micros,
+            "cheaper Velora->ETH total (52 bps) must beat Velora->USDC (58 bps)"
+        );
+    }
+
+    #[test]
+    fn ranker_total_equals_sum_of_displayed_leg_costs() {
+        // The dashboard renders each leg's bps from effective_leg_cost_usd_micros
+        // and the path total from the ranker score; they must be the same data.
+        // The score is exactly the sum of the per-leg effective costs.
+        let pricing = PricingSnapshot::static_bootstrap(Utc::now());
+        let req = 1_000 * USD_MICRO;
+        let a = transition("a", MarketOrderTransitionKind::CctpBridge);
+        let b = transition("b", MarketOrderTransitionKind::HyperliquidTrade);
+        let mut snapshots = HashMap::new();
+        snapshots.insert(a.id.clone(), make_snapshot(&a.id, 3, 0, 25_000, 0, req));
+        snapshots.insert(b.id.clone(), make_snapshot(&b.id, 9, 0, 0, 0, req));
+        let p = path("p", vec![a.clone(), b.clone()]);
+        let score = amount_aware_path_score(&p, &snapshots, &pricing, req);
+        let leg_sum = effective_leg_cost_usd_micros(snapshots.get(&a.id).unwrap(), req)
+            + effective_leg_cost_usd_micros(snapshots.get(&b.id).unwrap(), req);
+        assert_eq!(score.total_effective_cost_usd_micros, leg_sum);
+    }
+
+    // -- retain_viable_ranked ---------------------------------------------
+
+    #[test]
+    fn retain_viable_ranked_drops_missing_when_viable_peer_exists() {
+        let mut broken = ranked_at(1, 1, "broken");
+        broken.score.missing_edges = 1;
+        let viable = ranked_at(10_000, 1, "viable");
+        let kept = retain_viable_ranked(vec![broken, viable]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path.id, "viable");
+    }
+
+    #[test]
+    fn retain_viable_ranked_keeps_all_when_none_viable_cold_cache() {
+        let mut a = ranked_at(1, 1, "a");
+        a.score.missing_edges = 1;
+        let mut b = ranked_at(2, 1, "b");
+        b.score.missing_edges = 2;
+        let kept = retain_viable_ranked(vec![a, b]);
+        assert_eq!(
+            kept.len(),
+            2,
+            "cold-cache fallback keeps the set when every route has a missing leg"
+        );
     }
 
     // -- unit fee schedule parsing ----------------------------------------

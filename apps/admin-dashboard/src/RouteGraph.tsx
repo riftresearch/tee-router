@@ -9,16 +9,18 @@ import {
   type Node
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { Play, RefreshCw, Zap } from 'lucide-react'
+import { Play, RefreshCw } from 'lucide-react'
 
 import { fetchRouteCosts, fetchRouteGraph, postRouteExplain } from './api'
 import type {
   RouteExplain,
   RouteExplainGraph,
   RouteExplainGraphNode,
+  RouteExplainWinner,
   RouteGraphEdge,
   RouteGraphNode,
-  RouteGraphResponse
+  RouteGraphResponse,
+  SingleHopVenueView
 } from './types'
 
 // USD tier ladder mirrored from `route_costs::ROUTE_COST_TIERS`. The dropdown
@@ -174,7 +176,6 @@ export function RouteGraphView() {
   const [fromKey, setFromKey] = useState('')
   const [toKey, setToKey] = useState('')
   const [amountIn, setAmountIn] = useState('')
-  const [liveQuote, setLiveQuote] = useState(false)
 
   const [explain, setExplain] = useState<RouteExplain | null>(null)
   const [explainError, setExplainError] = useState<string | null>(null)
@@ -268,24 +269,48 @@ export function RouteGraphView() {
   // result is present we render its candidate subgraph (source leftmost,
   // destination rightmost, laid out by hop depth). The static full graph is
   // only a brief fallback before the first dry run completes.
-  const flowNodes = useMemo<Node[]>(
-    () =>
-      explain
-        ? layoutExplainNodes(explain.graph)
-        : graph
-          ? layoutNodes(graph.nodes)
-          : [],
-    [explain, graph]
-  )
+  const flowNodes = useMemo<Node[]>(() => {
+    if (explain) {
+      // Nodes on the best route are elevated alongside the best edges so the
+      // highlighted line reads continuously and is not covered by faint edges.
+      const bestNodeKeys = new Set<string>()
+      for (const edge of explain.graph.edges) {
+        if (edgeRanks.get(edge.id)?.isBest) {
+          bestNodeKeys.add(edge.from)
+          bestNodeKeys.add(edge.to)
+        }
+      }
+      return layoutExplainNodes(explain.graph, bestNodeKeys)
+    }
+    return graph ? layoutNodes(graph.nodes) : []
+  }, [explain, graph, edgeRanks])
+
+  // Edge-label bps map. The authoritative per-leg cost the ranker used comes
+  // back on each ranked path's transitions (`cost_bps`); overlay those onto the
+  // cached tier map so ranked edges (incl. live-sampled Velora wraps) show the
+  // exact bps that drove ranking, while non-ranked corridor edges keep their
+  // cached value.
+  const explainBps = useMemo(() => {
+    if (!explain) return bpsByTransition
+    const merged = new Map(bpsByTransition)
+    for (const path of explain.ranked) {
+      for (const transition of path.transitions) {
+        if (typeof transition.cost_bps === 'number') {
+          merged.set(transition.id, transition.cost_bps)
+        }
+      }
+    }
+    return merged
+  }, [explain, bpsByTransition])
 
   const flowEdges = useMemo<Edge[]>(
     () =>
       explain
-        ? buildExplainEdges(explain.graph, bpsByTransition, edgeRanks)
+        ? buildExplainEdges(explain.graph, explainBps, edgeRanks)
         : graph
           ? buildEdges(graph.edges, bpsByTransition, new Map())
           : [],
-    [explain, graph, bpsByTransition, edgeRanks]
+    [explain, graph, bpsByTransition, explainBps, edgeRanks]
   )
 
   // Remount ReactFlow (and thus re-run fitView) whenever the subgraph shape
@@ -295,7 +320,7 @@ export function RouteGraphView() {
     : 'static'
 
   const runExplain = useCallback(
-    async (live: boolean) => {
+    async () => {
       if (!fromNode) return
       const toNode = selectableAssets.find((node) => node.key === toKey)
       if (!toNode) return
@@ -305,8 +330,7 @@ export function RouteGraphView() {
         const result = await postRouteExplain({
           from_asset: { chain: fromNode.chain, asset: fromNode.asset },
           to_asset: { chain: toNode.chain, asset: toNode.asset },
-          amount_in: amountIn.trim() || '0',
-          live_quote: live
+          amount_in: amountIn.trim() || '0'
         })
         setExplain(result)
       } catch (error) {
@@ -321,14 +345,15 @@ export function RouteGraphView() {
     [fromNode, toKey, selectableAssets, amountIn]
   )
 
-  const onRank = useCallback(() => runExplain(liveQuote), [runExplain, liveQuote])
+  const onRank = useCallback(() => runExplain(), [runExplain])
 
-  // Keep the graph in sync with the source/destination/amount selection by
-  // auto-running a cache-only dry run (debounced). Live quoting stays manual
-  // behind the Rank button so we never hit provider APIs unprompted.
+  // Keep the graph and ranking in sync with the source/destination/amount
+  // selection by auto-running the real quote pipeline (debounced). This is the
+  // exact same code a user's `/quote` runs - it live-quotes the top 3
+  // end-to-end - so every run reflects real outputs, not a dry run.
   useEffect(() => {
     if (!fromNode || !toKey) return
-    const handle = setTimeout(() => void runExplain(false), 300)
+    const handle = setTimeout(() => void runExplain(), 300)
     return () => clearTimeout(handle)
   }, [fromNode, toKey, amountIn, runExplain])
 
@@ -389,15 +414,6 @@ export function RouteGraphView() {
             <AssetOptions coreNodes={coreNodes} />
           </select>
         </label>
-        <label className="rg-toggle">
-          <input
-            type="checkbox"
-            checked={liveQuote}
-            onChange={(event) => setLiveQuote(event.target.checked)}
-          />
-          <Zap size={13} />
-          <span>Live quote</span>
-        </label>
         <button
           type="button"
           className="rg-btn rg-btn-primary"
@@ -433,11 +449,7 @@ export function RouteGraphView() {
           <div className="route-graph-panel-error">{explainError}</div>
         ) : null}
         {explain ? (
-          <ExplainPanel
-            explain={explain}
-            nodes={labelNodes}
-            bps={bpsByTransition}
-          />
+          <ExplainPanel explain={explain} nodes={labelNodes} />
         ) : (
           <div className="route-graph-panel-hint">
             Pick a start and end asset and a tier — the graph redraws for that
@@ -445,10 +457,11 @@ export function RouteGraphView() {
             <strong>Example ERC20</strong> (PEPE, LINK, DEGEN…) as the source or
             destination to see the runtime <strong>Velora</strong> wrap: the
             token swaps to/from an anchor (USDC/USDT/ETH) on its chain, then
-            routes through the cached graph. Press <strong>Rank</strong> with{' '}
-            <strong>Live quote</strong> on to fetch real per-path outputs and the
-            best route. Edge labels show the venue and cached bps; Velora legs are
-            live-priced and drawn dashed.
+            routes through the cached graph. This runs the{' '}
+            <strong>real quote pipeline</strong> — the cached ranking, the top 3
+            routes it live-quotes end-to-end, and the best real output — exactly
+            what a user's quote does. Edge labels show the venue and cached bps;
+            Velora legs are live-priced and drawn dashed.
           </div>
         )}
       </section>
@@ -458,17 +471,18 @@ export function RouteGraphView() {
 
 function ExplainPanel({
   explain,
-  nodes,
-  bps
+  nodes
 }: {
   explain: RouteExplain
   nodes: RouteGraphNode[]
-  bps: Map<string, number>
 }) {
   const { counts, timings } = explain
   const fromLabel = assetDisplayLabel(explain.from_asset, nodes)
   const toLabel = assetDisplayLabel(explain.to_asset, nodes)
   const bestPathId = bestPathIdFor(explain)
+  const overallWinner = explain.overall_winner ?? null
+  const isOverallMultiHopWinner = (pathId: string) =>
+    overallWinner?.family === 'multi_hop' && overallWinner.label === pathId
   return (
     <div className="route-graph-explain">
       <header className="rg-explain-header">
@@ -492,16 +506,42 @@ function ExplainPanel({
       <div className="rg-timings">
         <span>bfs {timings.bfs_ms}ms</span>
         <span>rank {timings.rank_ms}ms</span>
-        {explain.live_quote ? <span>live {timings.live_quote_ms}ms</span> : null}
+        <span>live {timings.live_quote_ms}ms</span>
         <span>total {timings.total_ms}ms</span>
       </div>
+
+      {overallWinner ? (
+        <div className={`rg-winner rg-winner-${overallWinner.family}`}>
+          <span className="rg-winner-tag">Winner</span>
+          <span className="rg-winner-family">
+            {overallWinner.family === 'single_hop'
+              ? 'Single-hop'
+              : 'Multi-hop'}
+          </span>
+          <span className="rg-winner-route">
+            {winnerShortLabel(overallWinner, explain)}
+          </span>
+          <span className="rg-winner-out">
+            out {overallWinner.estimated_amount_out}
+          </span>
+        </div>
+      ) : null}
+
+      {explain.ranked.length === 0 ? (
+        <div className="route-graph-panel-hint">
+          No viable route right now: every candidate has a leg with no fresh or
+          live price (an erroring/unavailable provider), so none can be ranked.
+          Such legs are excluded rather than counted as free — try again once the
+          provider recovers.
+        </div>
+      ) : null}
 
       <ol className="rg-ranked">
         {explain.ranked.map((path) => {
           const rankClass =
             path.rank <= 3 ? ` rg-rank-${path.rank}` : ''
           const isBest = path.path_id === bestPathId
-          const summary = pathBpsSummary(path.transitions, bps)
+          const summary = pathBpsSummary(path)
           return (
             <li
               key={path.path_id}
@@ -519,14 +559,18 @@ function ExplainPanel({
                     </span>
                   ))}
                 </span>
-                {isBest ? <span className="rg-badge rg-badge-best">best</span> : null}
+                {isOverallMultiHopWinner(path.path_id) ? (
+                  <span className="rg-badge rg-badge-winner">winner</span>
+                ) : isBest ? (
+                  <span className="rg-badge rg-badge-best">best</span>
+                ) : null}
                 <span className="rg-ranked-summary">
                   <span
                     className={`rg-sum-bps${summary.allKnown ? '' : ' rg-sum-partial'}`}
                     title={
                       summary.allKnown
-                        ? 'Total cached cost summed across every leg'
-                        : 'Sum of cached legs only; live/uncached legs are not included, so the true total is higher'
+                        ? 'Total path cost (fee + gas) the ranker minimized, summed across every leg'
+                        : 'Sum of priced legs only; some legs had no fresh or live cost, so the true total is higher'
                     }
                   >
                     {formatPathBpsTotal(summary)}
@@ -555,13 +599,21 @@ function ExplainPanel({
                   )}
                 </span>
                 {path.transitions.map((transition) => {
-                  const bpsValue = bps.get(transition.id)
+                  const bpsValue =
+                    typeof transition.cost_bps === 'number'
+                      ? transition.cost_bps
+                      : undefined
                   const isVelora = transition.provider === 'velora'
-                  const stepBps = isVelora
-                    ? 'live'
-                    : bpsValue !== undefined
+                  // The leg's authoritative cost (fee + gas) in bps, exactly as
+                  // the ranker scored it. Velora wrap legs are live-sampled;
+                  // other legs come from the active cache. A leg without a value
+                  // had no fresh/live cost ('live' for Velora, em-dash else).
+                  const stepBps =
+                    bpsValue !== undefined
                       ? `${formatBps(bpsValue)} bps`
-                      : '—'
+                      : isVelora
+                        ? 'live'
+                        : '—'
                   const bpsClass = isVelora
                     ? ' rg-hop-live'
                     : bpsValue === undefined
@@ -592,6 +644,103 @@ function ExplainPanel({
           )
         })}
       </ol>
+
+      <SingleHopVenues
+        venues={explain.single_hop ?? []}
+        winner={overallWinner}
+      />
+    </div>
+  )
+}
+
+// Short, human label for the cross-family winner banner: the venue name for a
+// single-hop win, or the multi-hop route's provider sequence.
+function winnerShortLabel(
+  winner: RouteExplainWinner,
+  explain: RouteExplain
+): string {
+  if (winner.family === 'single_hop') return providerLabel(winner.label)
+  const path = explain.ranked.find((entry) => entry.path_id === winner.label)
+  if (path && path.transitions.length > 0) {
+    return path.transitions
+      .map((transition) => providerLabel(transition.provider))
+      .join(' › ')
+  }
+  return winner.label
+}
+
+// Status -> short human label for a single-hop venue probe result.
+const SINGLE_HOP_STATUS_LABEL: Record<string, string> = {
+  success: 'quote',
+  no_route: 'no route',
+  disabled: 'disabled',
+  timeout: 'timeout',
+  error: 'error',
+  invalid: 'invalid'
+}
+
+// Single-hop venue checks: the cross-family alternative to the multi-hop routes.
+// Each configured venue is quoted in parallel for the full source->destination
+// route; we surface every outcome (incl. failures) so the dashboard shows the
+// complete picture a real /quote compared against.
+function SingleHopVenues({
+  venues,
+  winner
+}: {
+  venues: SingleHopVenueView[]
+  winner: RouteExplainWinner | null
+}) {
+  if (venues.length === 0) return null
+  return (
+    <div className="rg-single-hop">
+      <div className="rg-single-hop-head">
+        <span className="rg-single-hop-title">Single-hop venues</span>
+        <span className="rg-single-hop-sub">
+          full-route quotes compared cross-family against the routes above
+        </span>
+      </div>
+      <ul className="rg-venues">
+        {venues.map((venue) => {
+          const statusLabel =
+            SINGLE_HOP_STATUS_LABEL[venue.status] ?? venue.status
+          const isOverallWinner =
+            winner?.family === 'single_hop' && winner.label === venue.provider
+          return (
+            <li
+              key={venue.provider}
+              className={`rg-venue rg-venue-${venue.status}${
+                venue.best ? ' rg-venue-best' : ''
+              }`}
+            >
+              <span
+                className="rg-venue-name"
+                style={{ color: providerColor(venue.provider) }}
+              >
+                {providerLabel(venue.provider)}
+              </span>
+              <span className={`rg-venue-status rg-venue-status-${venue.status}`}>
+                {statusLabel}
+              </span>
+              {isOverallWinner ? (
+                <span className="rg-badge rg-badge-winner">winner</span>
+              ) : venue.best ? (
+                <span className="rg-badge rg-badge-best">best</span>
+              ) : null}
+              <span className="rg-venue-meta">
+                {venue.estimated_amount_out ? (
+                  <span className="rg-out">out {venue.estimated_amount_out}</span>
+                ) : null}
+                {venue.latency_ms > 0 ? <span>{venue.latency_ms}ms</span> : null}
+                {venue.error ? (
+                  <span className="rg-venue-error" title={venue.error}>
+                    {venue.error}
+                  </span>
+                ) : null}
+              </span>
+            </li>
+          )
+        })}
+      </ul>
     </div>
   )
 }
@@ -724,7 +873,10 @@ function buildEdges(
 // Lay out the source -> destination subgraph in depth columns: source pinned
 // left (depth 0), destination pinned right (max_depth), everything else by its
 // BFS hop distance. Columns are vertically centered for readability.
-function layoutExplainNodes(graph: RouteExplainGraph): Node[] {
+function layoutExplainNodes(
+  graph: RouteExplainGraph,
+  bestNodeKeys: Set<string> = new Set()
+): Node[] {
   const byDepth = new Map<number, RouteExplainGraphNode[]>()
   for (const node of graph.nodes) {
     const column = byDepth.get(node.depth) ?? []
@@ -739,14 +891,28 @@ function layoutExplainNodes(graph: RouteExplainGraph): Node[] {
     )
     const offset = ((tallest - column.length) * ROW_GAP) / 2
     column.forEach((node, rowIdx) => {
+      // A node sits on the winning route when it's an endpoint of a best edge.
+      // Such nodes (including intermediate hops) read green to match the best
+      // edges; the source keeps its cyan start marker so the route origin is
+      // still distinct. Off-route nodes keep the faint venue/gray styling.
+      const onBest = bestNodeKeys.has(node.key)
       const accent =
         node.role === 'source'
           ? '#38bdf8'
-          : node.role === 'destination'
+          : onBest || node.role === 'destination'
             ? '#34d399'
             : node.kind === 'venue'
               ? '#14b8a6'
               : '#3a423d'
+      const background =
+        node.role === 'source'
+          ? 'rgba(56,189,248,0.12)'
+          : onBest || node.role === 'destination'
+            ? 'rgba(52,211,153,0.12)'
+            : node.kind === 'venue'
+              ? 'rgba(20,184,166,0.12)'
+              : '#161b18'
+      const emphasized = onBest || node.role === 'source' || node.role === 'destination'
       flow.push({
         id: node.key,
         position: {
@@ -756,19 +922,15 @@ function layoutExplainNodes(graph: RouteExplainGraph): Node[] {
         data: { label: explainNodeLabel(node) },
         sourcePosition: Position.Right,
         targetPosition: Position.Left,
+        // Best-path nodes sit just above the best edges (zIndex 1000); all
+        // other nodes stay above the faint edges but below the winner.
+        zIndex: bestNodeKeys.has(node.key) ? 1001 : 1,
         style: {
           width: 168,
           fontSize: 11,
           borderRadius: 8,
-          border: `${node.role === 'source' || node.role === 'destination' ? 2 : 1}px solid ${accent}`,
-          background:
-            node.role === 'source'
-              ? 'rgba(56,189,248,0.12)'
-              : node.role === 'destination'
-                ? 'rgba(52,211,153,0.12)'
-                : node.kind === 'venue'
-                  ? 'rgba(20,184,166,0.12)'
-                  : '#161b18',
+          border: `${emphasized ? 2 : 1}px solid ${accent}`,
+          background,
           color: '#e6ebe8',
           padding: 6
         }
@@ -794,17 +956,24 @@ function buildExplainEdges(
     const color = isBest ? RANK_COLORS[0] : EDGE_FAINT
     const venue = providerLabel(edge.provider)
     const bpsValue = bps.get(edge.id)
-    const label = isVelora
-      ? `${venue} · live`
-      : bpsValue !== undefined
+    // A live-sampled Velora edge carries a bps value this run; show it (still
+    // dashed). Without one it's an unpriced live leg.
+    const label =
+      bpsValue !== undefined
         ? `${venue} · ${formatBps(bpsValue)} bps`
-        : venue
+        : isVelora
+          ? `${venue} · live`
+          : venue
     return {
       id: edge.id,
       source: edge.from,
       target: edge.to,
       label,
       animated: isBest,
+      // Elevate the winner above the faint corridor edges (and the node layer)
+      // so its stroke, arrowhead, and label are never painted over. Matches the
+      // zIndex React Flow uses for elevated/selected edges.
+      zIndex: isBest ? 1000 : 0,
       style: {
         stroke: color,
         strokeWidth: isBest ? 3.5 : 1.5,
@@ -817,6 +986,8 @@ function buildExplainEdges(
       markerEnd: { type: MarkerType.ArrowClosed, color, width: 14, height: 14 }
     }
   })
+  // Best edge(s) last so they paint on top even within the same z-layer.
+  .sort((a, b) => Number(a.zIndex ?? 0) - Number(b.zIndex ?? 0))
 }
 
 // For each subgraph edge, record the lowest rank of any path using it and
@@ -953,27 +1124,21 @@ function formatBps(bps: number): string {
   return bps >= 100 ? bps.toFixed(0) : bps.toFixed(1)
 }
 
-// Sum the per-leg cached bps for a ranked path. `velora` legs are live-priced
-// and uncached legs (e.g. HyperCore trades, HL bridge) have no measured cost,
-// so the total only reflects legs with a cached snapshot. When some legs are
-// unknown the sum is a lower bound, surfaced as `>=` in the label.
-function pathBpsSummary(
-  transitions: { id: string; provider: string }[],
-  bps: Map<string, number>
-): { total: number; allKnown: boolean; anyKnown: boolean } {
-  let total = 0
-  let known = 0
-  for (const transition of transitions) {
-    const value = bps.get(transition.id)
-    if (value !== undefined) {
-      total += value
-      known += 1
-    }
-  }
+// Total path cost for a ranked card, taken straight from the backend so the
+// displayed total is exactly the value the ranker minimized (sum of every
+// leg's `cost_bps` = `total_bps`). `missing_edges` flags legs with no fresh or
+// live cost, which are excluded from `total_bps`, so the total is a lower bound
+// (surfaced as `>=`) whenever any leg is unpriced.
+function pathBpsSummary(path: {
+  total_bps: number
+  missing_edges: number
+  hop_count: number
+}): { total: number; allKnown: boolean; anyKnown: boolean } {
+  const knownLegs = path.hop_count - path.missing_edges
   return {
-    total,
-    allKnown: transitions.length > 0 && known === transitions.length,
-    anyKnown: known > 0
+    total: path.total_bps,
+    allKnown: path.hop_count > 0 && path.missing_edges === 0,
+    anyKnown: knownLegs > 0
   }
 }
 

@@ -3709,6 +3709,187 @@ code,
   font-weight: 700;
 }
 
+.rg-badge-winner {
+  background: rgba(250, 204, 21, 0.18);
+  color: #fde68a;
+  border: 1px solid rgba(250, 204, 21, 0.65);
+  box-shadow: 0 0 10px rgba(250, 204, 21, 0.35);
+  font-weight: 700;
+}
+
+/* Cross-family winner banner: the higher-output of best multi-hop vs best
+   single-hop, i.e. what a real /quote returns. */
+.rg-winner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(250, 204, 21, 0.5);
+  border-left-width: 4px;
+  border-left-color: #facc15;
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      90deg,
+      rgba(250, 204, 21, 0.12),
+      rgba(250, 204, 21, 0.02) 60%
+    ),
+    var(--surface-raised);
+  font-size: 12.5px;
+}
+
+.rg-winner-tag {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  color: #fde68a;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(250, 204, 21, 0.6);
+  background: rgba(250, 204, 21, 0.15);
+}
+
+.rg-winner-family {
+  font-weight: 700;
+  color: #f4f0d8;
+}
+
+.rg-winner-route {
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", Menlo, ui-monospace, monospace;
+  color: #d9dedb;
+}
+
+.rg-winner-out {
+  margin-left: auto;
+  color: #fde68a;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Single-hop venue checks (cross-family alternative to the ranked routes). */
+.rg-single-hop {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rg-single-hop-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rg-single-hop-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #c5ccc8;
+}
+
+.rg-single-hop-sub {
+  font-size: 11px;
+  color: #7d847f;
+}
+
+.rg-venues {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rg-venue {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-left-color: var(--border);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: var(--surface-raised);
+}
+
+.rg-venue-best {
+  border-color: #34d399;
+  border-left-color: #34d399;
+  box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.4);
+}
+
+.rg-venue-no_route,
+.rg-venue-disabled {
+  opacity: 0.62;
+}
+
+.rg-venue-name {
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", Menlo, ui-monospace, monospace;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.rg-venue-status {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: #9aa6a0;
+}
+
+.rg-venue-status-success {
+  background: rgba(52, 211, 153, 0.12);
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.4);
+}
+
+.rg-venue-status-no_route {
+  color: #9aa6a0;
+}
+
+.rg-venue-status-disabled {
+  color: #b9a14a;
+  border-color: rgba(185, 161, 74, 0.4);
+}
+
+.rg-venue-status-timeout,
+.rg-venue-status-error,
+.rg-venue-status-invalid {
+  background: rgba(248, 113, 113, 0.1);
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.rg-venue-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  font-size: 12px;
+  color: #9aa6a0;
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-venue-error {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #c98b8b;
+  font-size: 11px;
+}
+
 @media (max-width: 720px) {
   .rg-ranked-summary {
     margin-left: 0;

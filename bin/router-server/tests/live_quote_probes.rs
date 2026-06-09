@@ -18,7 +18,10 @@ use router_core::{
     },
 };
 use router_primitives::ChainType;
-use router_server::{api::MarketOrderQuoteRequest, services::order_manager::OrderManager};
+use router_server::{
+    api::{MarketOrderQuoteRequest, RouteExplainRequest},
+    services::order_manager::OrderManager,
+};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use testcontainers::{
@@ -374,6 +377,68 @@ async fn live_router_quote_probe_ethereum_eth_to_bitcoin() -> TestResult<()> {
         quote.provider_quote["path_id"].as_str().unwrap_or("<missing>")
     );
 
+    Ok(())
+}
+
+/// Proves the dashboard explainer and the real `/quote` share one selection
+/// pipeline: for the same request, `explain_market_order_route` must pick the
+/// same winning `path_id` as `quote_market_order`. If these ever diverge, the
+/// dashboard is no longer "exactly what a user's quote does".
+#[tokio::test]
+#[ignore = "proves dashboard explain and /quote share one pipeline (no spend)"]
+async fn dashboard_explain_matches_quote_winner() -> TestResult<()> {
+    if !live_probes_enabled() {
+        eprintln!("set {RUN_FLAG}=1 to run live quote probes");
+        return Ok(());
+    }
+
+    let ctx = LiveRouterQuoteContext::new().await?;
+    let source_asset = deposit_asset("bitcoin", AssetId::Native);
+    let destination_asset = deposit_asset("evm:8453", AssetId::Native);
+    let amount_in = env_var_any(&["ROUTER_LIVE_BTC_AMOUNT_IN_SATS"])
+        .unwrap_or_else(|| DEFAULT_BTC_AMOUNT_IN_SATS.to_string());
+
+    // Dashboard explainer: runs the exact shared pipeline (live-quotes top 3).
+    let explain = ctx
+        .order_manager
+        .explain_market_order_route(RouteExplainRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset.clone(),
+            amount_in: amount_in.clone(),
+        })
+        .await
+        .map_err(|error| format!("route explain failed: {error}"))?;
+    let explain_winner = explain
+        .winner_path_id
+        .clone()
+        .ok_or("explain returned no winner path id")?;
+
+    // Real /quote for the same request.
+    let response = ctx
+        .order_manager
+        .quote_market_order(MarketOrderQuoteRequest {
+            from_asset: source_asset.clone(),
+            to_asset: destination_asset.clone(),
+            amount_in: amount_in.clone(),
+        })
+        .await
+        .map_err(|error| format!("quote_market_order failed: {error}"))?;
+    let quote = response
+        .quote
+        .as_market_order()
+        .expect("market order quote");
+    let quote_winner = quote.provider_quote["path_id"]
+        .as_str()
+        .ok_or("quote provider_quote missing path_id")?;
+
+    assert_eq!(
+        explain_winner, quote_winner,
+        "dashboard explain winner ({explain_winner}) must equal /quote winner ({quote_winner}) - one shared pipeline"
+    );
+
+    eprintln!(
+        "dashboard_explain_matches_quote_winner winner={explain_winner} amount_in={amount_in}"
+    );
     Ok(())
 }
 

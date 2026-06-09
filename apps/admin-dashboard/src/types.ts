@@ -437,7 +437,6 @@ export type RouteExplainRequest = {
   from_asset: RouteExplainAsset
   to_asset: RouteExplainAsset
   amount_in: string
-  live_quote?: boolean
 }
 
 export type RouteTransitionView = {
@@ -449,6 +448,10 @@ export type RouteTransitionView = {
   from_asset: string
   to_chain: string
   to_asset: string
+  /** This leg's effective cost (fee + gas) in bps of the request notional,
+   * exactly as the ranker scored it. `null`/absent when the leg had no fresh
+   * cost and was not live-sampled. */
+  cost_bps?: number | null
 }
 
 export type RankedPathView = {
@@ -459,6 +462,9 @@ export type RankedPathView = {
   hop_count: number
   missing_edges: number
   total_effective_cost_usd_micros: number
+  /** Total path cost in bps; equals the sum of every leg's `cost_bps` and is
+   * the value the ranker minimizes. */
+  total_bps: number
   total_latency_ms: number
   transitions: RouteTransitionView[]
   estimated_amount_out: string | null
@@ -506,17 +512,56 @@ export type RouteExplainGraph = {
   max_depth: number
 }
 
+export type SingleHopVenueStatus =
+  | 'success'
+  | 'no_route'
+  | 'disabled'
+  | 'timeout'
+  | 'error'
+  | 'invalid'
+
+/** One single-hop venue's result in a route-explain: the cross-family
+ * alternative the router compared against the multi-hop `ranked` routes. */
+export type SingleHopVenueView = {
+  provider: string
+  status: SingleHopVenueStatus | string
+  latency_ms: number
+  estimated_amount_out?: string | null
+  best: boolean
+  error?: string | null
+}
+
+/** Cross-family winner: which family (and route/venue) produced the highest
+ * output, i.e. what a real /quote would return. */
+export type RouteExplainWinner = {
+  family: 'multi_hop' | 'single_hop' | string
+  /** Winning transition-path id (multi_hop) or provider id (single_hop). */
+  label: string
+  estimated_amount_out: string
+}
+
 export type RouteExplain = {
   from_asset: RouteExplainAsset
   to_asset: RouteExplainAsset
   amount_in: string
   request_usd_micros: number
   tier_label: string
-  live_quote: boolean
   counts: RouteExplainCounts
   timings: RouteExplainTimings
   ranked: RankedPathView[]
   winner_path_id: string | null
+  /** Per-transition value-loss bps for legs live-sampled during this explain
+   * (notably uncached runtime Velora wrap legs). Keyed by transition id.
+   * Overlaid onto the cached bps map. */
+  live_bps_by_transition: Record<string, number>
+  /** Single-hop venue checks queried in parallel alongside the multi-hop
+   * routes (the full cross-family comparison a real /quote makes). Empty when
+   * no single-hop venues are configured. */
+  single_hop: SingleHopVenueView[]
+  /** The cross-family winner (higher output of best multi-hop vs best
+   * single-hop), i.e. what a real /quote would return. Null when neither
+   * family produced a quote. */
+  overall_winner?: RouteExplainWinner | null
   graph: RouteExplainGraph
 }
 

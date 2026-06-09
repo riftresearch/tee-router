@@ -44,8 +44,8 @@ use router_core::{
             execution_step_type_for_transition_kind, QuoteLeg, QuoteLegAsset, QuoteLegSpec,
         },
         route_costs::{
-            confidence_band, rank_transition_paths_structurally, raw_amount_to_usd_micros,
-            select_best_quote, LiveQuoteOutcome, RankedTransitionPath, RouteCostService,
+            rank_transition_paths_structurally, raw_amount_to_usd_micros, select_best_quote,
+            LiveQuoteOutcome, RankedTransitionPath, RouteCostService, RouteCostSnapshot,
             DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
         },
         single_hop_venues::{SingleHopQuote, SingleHopQuoteRequest, SingleHopVenueRegistry},
@@ -224,6 +224,55 @@ struct ComposeLimitTransitionPathQuoteRequest<'a> {
     provider_health_snapshot: Option<&'a crate::services::ProviderHealthSnapshot>,
     unit: Option<&'a dyn UnitProvider>,
     exchange: &'a dyn ExchangeProvider,
+}
+
+/// Per-filter-stage survivor counts captured while the shared quote pipeline
+/// narrows the candidate path set. Surfaced by the dashboard explainer; the
+/// real `/quote` path ignores it.
+#[derive(Debug, Clone, Default)]
+struct SelectionCounts {
+    paths_enumerated: usize,
+    paths_after_executable: usize,
+    paths_after_provider: usize,
+    paths_after_hyperevm: usize,
+    paths_after_same_chain: usize,
+    ranked_count: usize,
+    top_paths: usize,
+}
+
+/// Per-stage timings captured while running the shared quote pipeline.
+/// Surfaced by the dashboard explainer; the real `/quote` path ignores it.
+#[derive(Debug, Clone, Default)]
+struct SelectionTimings {
+    bfs_ms: u64,
+    rank_ms: u64,
+    live_quote_ms: u64,
+}
+
+/// Full trace of one run of the shared market-quote pipeline
+/// ([`OrderManager::run_market_quote_pipeline`]). `quote_market_order` reads
+/// only `chosen`/`last_error`; the dashboard explainer renders the whole trace
+/// so it shows exactly what a real user's quote did (cached ranking, the top-N
+/// actually live-quoted, their real outputs, and the best-output winner).
+struct MarketQuotePipelineOutcome {
+    /// The winning composed quote (best real output), if any survived.
+    chosen: Option<ComposedMarketOrderQuote>,
+    /// Last error seen while live-quoting / filtering, used to produce a
+    /// specific `NoRoute` when nothing survived.
+    last_error: Option<MarketOrderError>,
+    request_usd_micros: u64,
+    /// Full ranked candidate set (cached hops + live Velora), post strict-drop.
+    ranked: Vec<RankedTransitionPath>,
+    /// Live-sampled Velora wrap-leg snapshots folded into the ranking.
+    velora_overrides: std::collections::HashMap<String, RouteCostSnapshot>,
+    /// Path ids that were live-quoted end-to-end (the top-N of `ranked`).
+    live_quoted_path_ids: Vec<String>,
+    /// Real `estimated_amount_out` per live-quoted survivor, keyed by path id.
+    outputs_by_path: std::collections::HashMap<String, String>,
+    /// Winning path id (highest real output), if any survived.
+    winner_path_id: Option<String>,
+    counts: SelectionCounts,
+    timings: SelectionTimings,
 }
 
 pub struct OrderManager {
@@ -1009,6 +1058,11 @@ impl OrderManager {
         }
     }
 
+    /// Multi-hop branch of [`Self::best_provider_quote`]. Thin wrapper over the
+    /// shared [`Self::run_market_quote_pipeline`] (BFS -> filters -> Velora-aware
+    /// ranking -> top-N end-to-end live quote) that maps the pipeline trace into
+    /// a [`MarketOrderQuoteSelection`]. The cross-family selector compares this
+    /// against the single-hop branch.
     async fn best_multi_hop_provider_quote(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
@@ -1016,122 +1070,191 @@ impl OrderManager {
         source_depositor_address: &str,
         include_candidates: bool,
     ) -> MarketOrderResult<MarketOrderQuoteSelection> {
-        const MAX_PATH_DEPTH: usize = 5;
-        const TOP_K_PATHS: usize = 12;
+        let outcome = self
+            .run_market_quote_pipeline(request, quote_id, source_depositor_address)
+            .await?;
+        let chosen = match outcome.chosen {
+            Some(chosen) => chosen,
+            None => {
+                return Err(outcome.last_error.unwrap_or_else(|| {
+                    MarketOrderError::NoRoute {
+                        reason: "no executable transition path satisfied the requested constraints"
+                            .to_string(),
+                    }
+                }));
+            }
+        };
+        // Multi-hop contributes exactly ONE quote-candidate: the winning path.
+        let candidates = include_candidates.then(|| {
+            let winning = outcome
+                .winner_path_id
+                .as_deref()
+                .and_then(|id| outcome.ranked.iter().find(|ranked| ranked.path.id == id))
+                .map(|ranked| &ranked.path);
+            let label = winning
+                .map(quote_candidate_path_label)
+                .unwrap_or_else(|| chosen.provider_id.clone());
+            let venues = winning.map(quote_candidate_path_venues).unwrap_or_default();
+            vec![quote_candidate_success(
+                QuoteCandidateFamily::MultiHop,
+                label,
+                venues,
+                Duration::from_millis(outcome.timings.live_quote_ms),
+                &chosen,
+            )]
+        });
+        Ok(MarketOrderQuoteSelection {
+            quote: chosen,
+            candidates,
+        })
+    }
 
+    /// The single market-quote selection pipeline shared by the real `/quote`
+    /// path ([`Self::best_multi_hop_provider_quote`]) and the dashboard explainer
+    /// ([`Self::explain_market_order_route`]). There is no second system: both
+    /// run this exact code, so the dashboard shows precisely what a user's quote
+    /// does. Stages:
+    ///
+    /// 1. enumerate candidate paths (BFS, depth 5);
+    /// 2. filter: executable -> configured providers -> unpriceable HyperEVM ->
+    ///    same-chain preference (no provider sequence) -> provider sequence;
+    /// 3. live-quote the Velora wrap legs, fold them into the cached hop costs,
+    ///    rank by lowest combined bps, strict-drop routes with an unpriced leg;
+    /// 4. live-quote the top-N ranked routes end-to-end (the real broken-leg
+    ///    filter) and pick the best real output via [`select_best_quote`].
+    ///
+    /// Returns the full trace (ranked set, the top-N actually live-quoted, their
+    /// real outputs, the winner, plus per-stage counts/timings). The `/quote`
+    /// caller reads only `chosen`/`last_error`.
+    async fn run_market_quote_pipeline(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+    ) -> MarketOrderResult<MarketQuotePipelineOutcome> {
+        const MAX_PATH_DEPTH: usize = 5;
+        // Live-quote the cheapest-ranked candidates end-to-end and pick the best
+        // real output.
+        const LIVE_QUOTE_TOP_N: usize = 3;
+
+        let mut counts = SelectionCounts::default();
+        let mut timings = SelectionTimings::default();
+
+        let bfs_started = Instant::now();
         let mut paths = self.asset_registry.select_transition_paths(
             &request.source_asset,
             &request.destination_asset,
             MAX_PATH_DEPTH,
         );
+        counts.paths_enumerated = paths.len();
+        timings.bfs_ms = bfs_started.elapsed().as_millis() as u64;
+
         paths.retain(is_executable_transition_path);
+        counts.paths_after_executable = paths.len();
         paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
+        counts.paths_after_provider = paths.len();
+        self.filter_unpriceable_hyperevm_paths(&mut paths).await;
+        counts.paths_after_hyperevm = paths.len();
         let provider_sequence = request.routing.transition_provider_sequence();
         if provider_sequence.is_none() {
             prefer_same_chain_evm_paths(request, &mut paths);
         }
+        counts.paths_after_same_chain = paths.len();
         let provider_sequence_paths_filtered =
             filter_provider_sequence_paths(&mut paths, provider_sequence);
+
+        let request_usd_micros = self.market_request_usd_micros(request).await;
+
         if paths.is_empty() {
-            return Err(MarketOrderError::NoRoute {
-                reason: if provider_sequence_paths_filtered {
-                    format!(
-                        "no executable transition path matches providerSequence {}",
-                        format_provider_sequence(
-                            provider_sequence
-                                .expect("provider sequence filter only runs when configured"),
-                        )
+            let reason = if provider_sequence_paths_filtered {
+                format!(
+                    "no executable transition path matches providerSequence {}",
+                    format_provider_sequence(
+                        provider_sequence
+                            .expect("provider sequence filter only runs when configured"),
                     )
-                } else {
-                    format!(
-                        "no executable transition path from {} {} to {} {}",
-                        request.source_asset.chain,
-                        request.source_asset.asset,
-                        request.destination_asset.chain,
-                        request.destination_asset.asset
-                    )
-                },
+                )
+            } else {
+                format!(
+                    "no executable transition path from {} {} to {} {}",
+                    request.source_asset.chain,
+                    request.source_asset.asset,
+                    request.destination_asset.chain,
+                    request.destination_asset.asset
+                )
+            };
+            return Ok(MarketQuotePipelineOutcome {
+                chosen: None,
+                last_error: Some(MarketOrderError::NoRoute { reason }),
+                request_usd_micros,
+                ranked: Vec::new(),
+                velora_overrides: std::collections::HashMap::new(),
+                live_quoted_path_ids: Vec::new(),
+                outputs_by_path: std::collections::HashMap::new(),
+                winner_path_id: None,
+                counts,
+                timings,
             });
         }
 
-        let request_usd_micros = self.market_request_usd_micros(request).await;
-        let mut ranked = self
-            .rank_market_paths(&mut paths, request_usd_micros)
+        // Live-quote the Velora wrap legs, fold them into the cached
+        // primary-asset hop costs, rank by lowest combined bps, and strict-drop
+        // routes with an unpriced leg.
+        let rank_started = Instant::now();
+        let (ranked, velora_overrides) = self
+            .select_ranked_candidates(request, &mut paths, request_usd_micros)
             .await;
-        // Truncate both the path list and the ranked summary in lockstep
-        // so confidence_band sees the same set we will quote against.
-        if ranked.len() > TOP_K_PATHS {
-            ranked.truncate(TOP_K_PATHS);
-        }
-        if paths.len() > TOP_K_PATHS {
-            paths.truncate(TOP_K_PATHS);
-        }
-        let band_count = confidence_band(&ranked, request_usd_micros, TOP_K_PATHS);
-        telemetry::record_route_select_band_size(band_count);
+        timings.rank_ms = rank_started.elapsed().as_millis() as u64;
+        counts.ranked_count = ranked.len();
+        counts.top_paths = ranked.len().min(LIVE_QUOTE_TOP_N);
 
         let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
-            Some(
-                service
-                    .snapshot()
-                    .await
-                    .map_err(MarketOrderError::database)?,
-            )
+            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
         } else {
             None
         };
         let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
-            Some(
-                service
-                    .snapshot()
-                    .await
-                    .map_err(MarketOrderError::database)?,
-            )
+            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
         } else {
             None
         };
 
-        // Confidence-band fanout: live-quote `band_count` paths in parallel
-        // and pick the highest `estimated_amount_out`. Outside the band we
-        // trust the cached/structural leader because we have no evidence
-        // any deeper peer will beat it. Each future is timed individually so
-        // the optional quote-candidate list can carry per-path latency.
-        let band_paths: Vec<&TransitionPath> = ranked
+        // Live-quote the top-N ranked candidates end-to-end in parallel and pick
+        // the highest `estimated_amount_out`. The Velora legs were already
+        // priced into the ranking; this stage prices each whole route (incl. the
+        // same Velora leg) for execution and is the real broken-leg filter (a
+        // path whose end-to-end quote fails is simply dropped).
+        let live_started = Instant::now();
+        let top_paths: Vec<&TransitionPath> = ranked
             .iter()
-            .take(band_count)
+            .take(LIVE_QUOTE_TOP_N)
             .map(|ranked_path| &ranked_path.path)
             .collect();
-        let band_quote_futures = band_paths.iter().map(|path| {
-            let started = Instant::now();
-            let quote_future = self.quote_transition_path(
+        let live_quoted_path_ids: Vec<String> =
+            top_paths.iter().map(|path| path.id.clone()).collect();
+        let top_quote_futures = top_paths.iter().map(|path| {
+            self.quote_transition_path(
                 request,
                 quote_id,
                 source_depositor_address,
                 path,
                 provider_policy_snapshot.as_ref(),
                 provider_health_snapshot.as_ref(),
-            );
-            async move {
-                let result = quote_future.await;
-                (result, started.elapsed())
-            }
+            )
         });
-        let band_results = join_all(band_quote_futures).await;
+        let top_results = join_all(top_quote_futures).await;
 
-        let mut outcomes: Vec<LiveQuoteOutcome> = Vec::with_capacity(band_results.len());
-        let mut survivors: Vec<ComposedMarketOrderQuote> = Vec::with_capacity(band_results.len());
-        // Per-survivor path + latency, kept so we can emit a single
-        // quote-candidate for the WINNING multi-hop path. The multi-hop router
-        // contributes only its best candidate; single-hop contributes all of
-        // its venue candidates (in best_single_hop_provider_quote).
-        let mut survivor_paths: Vec<&TransitionPath> = Vec::with_capacity(band_results.len());
-        let mut survivor_latencies: Vec<Duration> = Vec::with_capacity(band_results.len());
-        let mut candidates = include_candidates.then(Vec::new);
+        let mut outcomes: Vec<LiveQuoteOutcome> = Vec::with_capacity(top_results.len());
+        let mut survivors: Vec<ComposedMarketOrderQuote> = Vec::with_capacity(top_results.len());
+        let mut outputs_by_path: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut last_error: Option<MarketOrderError> = None;
-        for ((candidate, latency), path) in band_results.into_iter().zip(band_paths.iter()) {
+        for (candidate, path) in top_results.into_iter().zip(top_paths.iter()) {
             let quote = match candidate {
                 Ok(Some(quote)) => quote,
                 Ok(None) => continue,
                 Err(err) => {
+                    warn!(error = %err, path_id = %path.id, "transition-path live quote failed");
                     last_error = Some(err);
                     continue;
                 }
@@ -1143,85 +1266,79 @@ impl OrderManager {
             }
             let estimated_amount_out =
                 U256::from_str(&quote.estimated_amount_out).unwrap_or_default();
+            outputs_by_path.insert(path.id.clone(), quote.estimated_amount_out.clone());
             outcomes.push(LiveQuoteOutcome {
                 quote_index: survivors.len(),
                 path_id: path.id.clone(),
                 hop_count: path.transitions.len(),
                 estimated_amount_out,
             });
-            survivor_paths.push(*path);
-            survivor_latencies.push(latency);
             survivors.push(quote);
         }
+        timings.live_quote_ms = live_started.elapsed().as_millis() as u64;
 
-        if survivors.is_empty() {
-            return match last_error {
-                Some(err) => Err(err),
-                None => Err(MarketOrderError::NoRoute {
-                    reason: "no executable transition path satisfied the requested constraints"
-                        .to_string(),
-                }),
-            };
-        }
-
-        let winning_index = select_best_quote(&outcomes).unwrap_or(0);
-        let winning_outcome = outcomes[winning_index].clone();
-        let chosen = survivors[winning_outcome.quote_index].clone();
-        // Multi-hop contributes exactly ONE quote-candidate: the winning path.
-        if let Some(list) = candidates.as_mut() {
-            let winning_path = survivor_paths[winning_outcome.quote_index];
-            list.push(quote_candidate_success(
-                QuoteCandidateFamily::MultiHop,
-                quote_candidate_path_label(winning_path),
-                quote_candidate_path_venues(winning_path),
-                survivor_latencies[winning_outcome.quote_index],
-                &chosen,
-            ));
-        }
-        if let Some(leader_outcome) = outcomes.first() {
-            if leader_outcome.path_id != winning_outcome.path_id {
-                telemetry::record_route_select_best_path_not_leader();
+        let (chosen, winner_path_id) = match select_best_quote(&outcomes) {
+            Some(index) => {
+                let winning_outcome = outcomes[index].clone();
+                let chosen = survivors[winning_outcome.quote_index].clone();
+                if let Some(leader_outcome) = outcomes.first() {
+                    if leader_outcome.path_id != winning_outcome.path_id {
+                        telemetry::record_route_select_best_path_not_leader();
+                    }
+                    let delta_bps = compute_route_select_delta_bps(
+                        leader_outcome.estimated_amount_out,
+                        winning_outcome.estimated_amount_out,
+                    );
+                    telemetry::record_route_select_best_output_delta_bps(delta_bps);
+                    info!(
+                        quote_id = %quote_id,
+                        request_usd_micros,
+                        live_quoted = live_quoted_path_ids.len(),
+                        ranked_count = ranked.len(),
+                        leader_path_id = %leader_outcome.path_id,
+                        chosen_path_id = %winning_outcome.path_id,
+                        delta_bps,
+                        "best_provider_quote selected"
+                    );
+                }
+                (Some(chosen), Some(winning_outcome.path_id))
             }
-            let leader_out = leader_outcome.estimated_amount_out;
-            let chosen_out = winning_outcome.estimated_amount_out;
-            let delta_bps = compute_route_select_delta_bps(leader_out, chosen_out);
-            telemetry::record_route_select_best_output_delta_bps(delta_bps);
-            info!(
-                quote_id = %quote_id,
-                request_usd_micros,
-                band_size = band_count,
-                ranked_count = ranked.len(),
-                leader_path_id = %leader_outcome.path_id,
-                chosen_path_id = %winning_outcome.path_id,
-                delta_bps,
-                "best_provider_quote selected"
-            );
-        }
-        Ok(MarketOrderQuoteSelection {
-            quote: chosen,
-            candidates,
+            None => (None, None),
+        };
+
+        Ok(MarketQuotePipelineOutcome {
+            chosen,
+            last_error,
+            request_usd_micros,
+            ranked,
+            velora_overrides,
+            live_quoted_path_ids,
+            outputs_by_path,
+            winner_path_id,
+            counts,
+            timings,
         })
     }
 
-    /// Dry-run explainer used by the admin dashboard route-graph visualizer.
-    /// Mirrors the staged pipeline of [`Self::best_provider_quote`] (BFS ->
-    /// filters -> rank) but persists nothing and is instrumented with per-stage
-    /// counts and timings. When `live_quote` is set it additionally live-quotes
-    /// the hardcoded top-N ranked paths to report real per-path outputs and the
-    /// winning path. Cache-only by default.
+    /// Route explainer used by the admin dashboard route-graph visualizer. It
+    /// runs the *exact* shared market-quote pipeline a real `/quote` runs
+    /// ([`Self::run_market_quote_pipeline`]) against a throwaway deposit address
+    /// (so it persists nothing and never funds anything), then renders the full
+    /// trace: the cached ranking, which top-N routes were live-quoted, their
+    /// real outputs, and the best-output winner. There is no separate dashboard
+    /// code path - what you see here is exactly what a user's quote does.
     pub async fn explain_market_order_route(
         &self,
         request: crate::api::RouteExplainRequest,
     ) -> MarketOrderResult<crate::api::RouteExplain> {
         use crate::api::{
             RankedPathView, RouteExplain, RouteExplainCounts, RouteExplainTimings,
-            RouteTransitionView,
+            RouteExplainWinner, RouteTransitionView,
         };
 
-        const MAX_PATH_DEPTH: usize = 5;
+        // Display cap for the ranked list; the pipeline itself live-quotes only
+        // the top 3 regardless.
         const TOP_K_PATHS: usize = 8;
-        // Live quoting (when requested) always targets the top-N ranked paths.
-        const LIVE_QUOTE_TOP_N: usize = 3;
 
         let total_started = Instant::now();
         validate_positive_amount("amount_in", &request.amount_in)?;
@@ -1229,19 +1346,7 @@ impl OrderManager {
         let destination_asset = self.validate_and_normalize_asset(&request.to_asset)?;
         ensure_distinct_source_and_destination(&source_asset, &destination_asset)?;
 
-        let bfs_started = Instant::now();
-        let mut paths = self.asset_registry.select_transition_paths(
-            &source_asset,
-            &destination_asset,
-            MAX_PATH_DEPTH,
-        );
-        let paths_enumerated = paths.len();
-        let bfs_ms = bfs_started.elapsed().as_millis() as u64;
-
-        // Apply the same retain filters as `best_provider_quote`, capturing the
-        // surviving count after each stage so the UI can show how the candidate
-        // set narrows.
-        let mut normalized_request = NormalizedMarketOrderQuoteRequest {
+        let normalized_request = NormalizedMarketOrderQuoteRequest {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
             amount_in: request.amount_in.clone(),
@@ -1249,66 +1354,82 @@ impl OrderManager {
             routing: NormalizedMarketOrderRouting::default(),
         };
 
-        paths.retain(|path| is_executable_transition_path(path));
-        let paths_after_executable = paths.len();
-        paths.retain(|path| path_has_configured_provider_set(self.action_providers.as_ref(), path));
-        let paths_after_provider = paths.len();
-        self.filter_unpriceable_hyperevm_paths(&mut paths).await;
-        let paths_after_hyperevm = paths.len();
-        prefer_same_chain_evm_paths(&normalized_request, &mut paths);
-        let paths_after_same_chain = paths.len();
+        // Throwaway deposit address: the explainer runs the real pipeline (it
+        // live-quotes the top-N end-to-end, exactly like a user) but never
+        // persists an order, so this derived address is never funded.
+        let quote_id = Uuid::now_v7();
+        let (source_depositor_address, _) = derive_deposit_address_for_quote(
+            self.chain_registry.as_ref(),
+            &self.settings.master_key_bytes(),
+            quote_id,
+            &normalized_request.source_asset.chain,
+        )
+        .map_err(MarketOrderError::deposit_address)?;
 
-        let request_usd_micros = self
-            .request_usd_micros(&source_asset, &request.amount_in)
-            .await;
+        // Run the multi-hop pipeline and the single-hop venue checks together so
+        // the dashboard shows the full cross-family comparison a real `/quote`
+        // makes (production runs both branches in parallel too).
+        let (outcome, single_hop) = tokio::join!(
+            self.run_market_quote_pipeline(&normalized_request, quote_id, &source_depositor_address),
+            self.explain_single_hop_venues(&normalized_request, quote_id, &source_depositor_address),
+        );
+        let outcome = outcome?;
+
+        let request_usd_micros = outcome.request_usd_micros;
         let tier_label =
             router_core::services::route_costs::select_route_cost_tier(request_usd_micros)
                 .label
                 .to_string();
 
-        let rank_started = Instant::now();
-        let mut ranked = self.rank_market_paths(&mut paths, request_usd_micros).await;
+        let mut ranked = outcome.ranked;
         if ranked.len() > TOP_K_PATHS {
             ranked.truncate(TOP_K_PATHS);
         }
-        if paths.len() > TOP_K_PATHS {
-            paths.truncate(TOP_K_PATHS);
-        }
-        let rank_ms = rank_started.elapsed().as_millis() as u64;
         let ranked_count = ranked.len();
-        // Top-N ranked paths are the live-quote set (hardcoded), replacing the
-        // old variable-width confidence band.
-        let top_paths = ranked_count.min(LIVE_QUOTE_TOP_N);
+        let live_quoted_ids: std::collections::HashSet<&str> = outcome
+            .live_quoted_path_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let winner_path_id = outcome.winner_path_id.clone();
+        let estimated_out_by_path = &outcome.outputs_by_path;
+
+        // Surface the live Velora per-leg bps for the visualizer overlay.
+        let mut live_bps_by_transition: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (transition_id, snapshot) in &outcome.velora_overrides {
+            live_bps_by_transition.insert(transition_id.clone(), snapshot.estimated_fee_bps as f64);
+        }
 
         // Source->destination corridor for the visualizer: the full declared
         // topology (incl. curated same-chain Velora swaps) restricted to the
-        // nodes between source and destination. The ranked routes above are
-        // overlaid as highlights by the dashboard; this is purely what we draw.
+        // nodes between source and destination. The ranked routes are overlaid
+        // as highlights by the dashboard; this is purely what we draw.
         let graph = self.build_explain_corridor(&source_asset, &destination_asset);
 
-        // Optional live-quote stage: fan out real quotes for the top-N paths.
-        // Failures here are non-fatal for the explainer (we still return the
-        // ranked dry-run view).
-        let mut estimated_out_by_path: std::collections::HashMap<String, String> =
+        // Authoritative per-leg cost source for display: the same active cached
+        // snapshots the ranker read at this tier, with the live Velora overrides
+        // folded on top. Rendering per-leg/total bps from this exact map (the
+        // same data the pipeline ranked on) guarantees the dashboard's per-step
+        // bps, the card total, and the chosen winner are all the same numbers.
+        let mut cost_snapshots: std::collections::HashMap<String, RouteCostSnapshot> =
             std::collections::HashMap::new();
-        let mut winner_path_id: Option<String> = None;
-        let mut live_quote_ms = 0_u64;
-        if request.live_quote && top_paths > 0 {
-            let live_started = Instant::now();
-            match self
-                .live_quote_top_paths(&mut normalized_request, &ranked, top_paths)
+        if let Some(route_costs) = self.route_costs.as_ref() {
+            cost_snapshots = route_costs
+                .active_snapshots_for_request(request_usd_micros)
                 .await
-            {
-                Ok((outputs, winner)) => {
-                    estimated_out_by_path = outputs;
-                    winner_path_id = winner;
-                }
-                Err(err) => {
-                    warn!(error = %err, "route-explain live quote failed; returning dry-run ranking");
-                }
-            }
-            live_quote_ms = live_started.elapsed().as_millis() as u64;
+                .unwrap_or_default();
         }
+        for (transition_id, snapshot) in &outcome.velora_overrides {
+            cost_snapshots.insert(transition_id.clone(), snapshot.clone());
+        }
+        let cost_bps_of = |usd_micros: u64| -> f64 {
+            if request_usd_micros == 0 {
+                0.0
+            } else {
+                (usd_micros as f64 / request_usd_micros as f64) * 10_000.0
+            }
+        };
 
         let ranked_views = ranked
             .iter()
@@ -1318,27 +1439,39 @@ impl OrderManager {
                 let transitions = path
                     .transitions
                     .iter()
-                    .map(|transition| RouteTransitionView {
-                        id: transition.id.clone(),
-                        provider: transition.provider.as_str().to_string(),
-                        kind: transition.kind.as_str().to_string(),
-                        edge_kind: transition.route_edge_kind().as_str().to_string(),
-                        from_chain: transition.input.asset.chain.as_str().to_string(),
-                        from_asset: transition.input.asset.asset.as_str().to_string(),
-                        to_chain: transition.output.asset.chain.as_str().to_string(),
-                        to_asset: transition.output.asset.asset.as_str().to_string(),
+                    .map(|transition| {
+                        let cost_bps = cost_snapshots.get(&transition.id).map(|snapshot| {
+                            cost_bps_of(
+                                router_core::services::route_costs::effective_leg_cost_usd_micros(
+                                    snapshot,
+                                    request_usd_micros,
+                                ),
+                            )
+                        });
+                        RouteTransitionView {
+                            id: transition.id.clone(),
+                            provider: transition.provider.as_str().to_string(),
+                            kind: transition.kind.as_str().to_string(),
+                            edge_kind: transition.route_edge_kind().as_str().to_string(),
+                            from_chain: transition.input.asset.chain.as_str().to_string(),
+                            from_asset: transition.input.asset.asset.as_str().to_string(),
+                            to_chain: transition.output.asset.chain.as_str().to_string(),
+                            to_asset: transition.output.asset.asset.as_str().to_string(),
+                            cost_bps,
+                        }
                     })
                     .collect();
                 RankedPathView {
                     rank: index + 1,
                     path_id: path.id.clone(),
-                    top_path: index < top_paths,
+                    top_path: live_quoted_ids.contains(path.id.as_str()),
                     winner: winner_path_id.as_deref() == Some(path.id.as_str()),
                     hop_count: path.transitions.len(),
                     missing_edges: ranked_path.score.missing_edges,
                     total_effective_cost_usd_micros: ranked_path
                         .score
                         .total_effective_cost_usd_micros,
+                    total_bps: cost_bps_of(ranked_path.score.total_effective_cost_usd_micros),
                     total_latency_ms: ranked_path.score.total_latency_ms,
                     transitions,
                     estimated_amount_out: estimated_out_by_path.get(&path.id).cloned(),
@@ -1346,31 +1479,469 @@ impl OrderManager {
             })
             .collect();
 
+        // Cross-family winner: the higher of the best multi-hop route's output
+        // and the best single-hop venue's output (production's
+        // `choose_better_quote` is higher-output-wins). This is what a real
+        // `/quote` would return for this request.
+        let multi_hop_best = winner_path_id.as_deref().and_then(|id| {
+            estimated_out_by_path
+                .get(id)
+                .map(|out| (id.to_string(), out.clone()))
+        });
+        let single_hop_best = single_hop.iter().find(|venue| venue.best).and_then(|venue| {
+            venue
+                .estimated_amount_out
+                .clone()
+                .map(|out| (venue.provider.clone(), out))
+        });
+        let overall_winner = match (multi_hop_best, single_hop_best) {
+            (Some((mh_label, mh_out)), Some((sh_label, sh_out))) => {
+                let mh_value = U256::from_str(&mh_out).unwrap_or_default();
+                let sh_value = U256::from_str(&sh_out).unwrap_or_default();
+                Some(if sh_value > mh_value {
+                    RouteExplainWinner {
+                        family: "single_hop".to_string(),
+                        label: sh_label,
+                        estimated_amount_out: sh_out,
+                    }
+                } else {
+                    RouteExplainWinner {
+                        family: "multi_hop".to_string(),
+                        label: mh_label,
+                        estimated_amount_out: mh_out,
+                    }
+                })
+            }
+            (Some((mh_label, mh_out)), None) => Some(RouteExplainWinner {
+                family: "multi_hop".to_string(),
+                label: mh_label,
+                estimated_amount_out: mh_out,
+            }),
+            (None, Some((sh_label, sh_out))) => Some(RouteExplainWinner {
+                family: "single_hop".to_string(),
+                label: sh_label,
+                estimated_amount_out: sh_out,
+            }),
+            (None, None) => None,
+        };
+
         Ok(RouteExplain {
             from_asset: source_asset,
             to_asset: destination_asset,
             amount_in: request.amount_in,
             request_usd_micros,
             tier_label,
-            live_quote: request.live_quote,
             counts: RouteExplainCounts {
-                paths_enumerated,
-                paths_after_executable,
-                paths_after_provider,
-                paths_after_hyperevm,
-                paths_after_same_chain,
+                paths_enumerated: outcome.counts.paths_enumerated,
+                paths_after_executable: outcome.counts.paths_after_executable,
+                paths_after_provider: outcome.counts.paths_after_provider,
+                paths_after_hyperevm: outcome.counts.paths_after_hyperevm,
+                paths_after_same_chain: outcome.counts.paths_after_same_chain,
                 ranked_count,
-                top_paths,
+                top_paths: outcome.counts.top_paths,
             },
             timings: RouteExplainTimings {
-                bfs_ms,
-                rank_ms,
-                live_quote_ms,
+                bfs_ms: outcome.timings.bfs_ms,
+                rank_ms: outcome.timings.rank_ms,
+                live_quote_ms: outcome.timings.live_quote_ms,
                 total_ms: total_started.elapsed().as_millis() as u64,
             },
             ranked: ranked_views,
             winner_path_id,
+            live_bps_by_transition,
+            single_hop,
+            overall_winner,
             graph,
+        })
+    }
+
+    /// Explain-only single-hop venue probe. Queries every configured single-hop
+    /// quote provider in parallel and reports each one's outcome
+    /// (`success`/`no_route`/`disabled`/`timeout`/`error`/`invalid`) for the
+    /// dashboard. Unlike [`Self::best_single_hop_provider_quote`] this never
+    /// returns an error and always yields the full per-venue list (including
+    /// failures), and it flags the highest-output venue with `best`.
+    async fn explain_single_hop_venues(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        quote_id: Uuid,
+        source_depositor_address: &str,
+    ) -> Vec<crate::api::SingleHopVenueView> {
+        use crate::api::SingleHopVenueView;
+
+        let providers = self.single_hop_venues.providers().to_vec();
+        if providers.is_empty() {
+            return Vec::new();
+        }
+
+        let provider_policy_snapshot = match self.provider_policies.as_ref() {
+            Some(service) => service.snapshot().await.ok(),
+            None => None,
+        };
+        let provider_health_snapshot = match self.provider_health.as_ref() {
+            Some(service) => service.snapshot().await.ok(),
+            None => None,
+        };
+
+        let (Ok(destination_recipient_address), Ok(refund_address)) = (
+            self.quote_address_for_chain(quote_id, &request.destination_asset.chain),
+            self.quote_address_for_chain(quote_id, &request.source_asset.chain),
+        ) else {
+            return Vec::new();
+        };
+
+        let mut views: Vec<SingleHopVenueView> = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for provider in providers {
+            let provider_id = provider.id();
+            if !provider_allowed_for_new_routes(
+                provider_policy_snapshot.as_ref(),
+                provider_health_snapshot.as_ref(),
+                provider_id.as_str(),
+            ) {
+                views.push(SingleHopVenueView {
+                    provider: provider_id.as_str().to_string(),
+                    status: "disabled".to_string(),
+                    latency_ms: 0,
+                    estimated_amount_out: None,
+                    best: false,
+                    error: Some("provider is disabled for new routes".to_string()),
+                });
+                continue;
+            }
+            let provider_request = SingleHopQuoteRequest {
+                source_asset: request.source_asset.clone(),
+                destination_asset: request.destination_asset.clone(),
+                amount_in: request.amount_in.clone(),
+                source_depositor_address: source_depositor_address.to_string(),
+                destination_recipient_address: destination_recipient_address.clone(),
+                refund_address: refund_address.clone(),
+            };
+            let timeout = self.single_hop_quote_timeout;
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let result =
+                    tokio::time::timeout(timeout, provider.quote_market_order(provider_request))
+                        .await
+                        .map_err(|_| {
+                            format!(
+                                "single-hop quote provider {} timed out after {}ms",
+                                provider_id.as_str(),
+                                timeout.as_millis()
+                            )
+                        })
+                        .and_then(|result| result);
+                (provider_id, started.elapsed(), result)
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            let (provider_id, latency, result) = match joined {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let provider = provider_id.as_str().to_string();
+            let latency_ms = duration_millis_u64(latency);
+            let view = match result {
+                Ok(Some(quote)) => {
+                    // Validate exactly like production so the dashboard shows the
+                    // same accept/reject verdict a real quote would.
+                    let composed = composed_single_hop_quote(request, quote);
+                    match self.validate_provider_quote(request, &composed) {
+                        Ok(()) => SingleHopVenueView {
+                            provider,
+                            status: "success".to_string(),
+                            latency_ms,
+                            estimated_amount_out: Some(composed.estimated_amount_out),
+                            best: false,
+                            error: None,
+                        },
+                        Err(err) => SingleHopVenueView {
+                            provider,
+                            status: "invalid".to_string(),
+                            latency_ms,
+                            estimated_amount_out: Some(composed.estimated_amount_out),
+                            best: false,
+                            error: Some(err.to_string()),
+                        },
+                    }
+                }
+                Ok(None) => SingleHopVenueView {
+                    provider,
+                    status: "no_route".to_string(),
+                    latency_ms,
+                    estimated_amount_out: None,
+                    best: false,
+                    error: None,
+                },
+                Err(err) => {
+                    let status = if err.contains("timed out") {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
+                    SingleHopVenueView {
+                        provider,
+                        status: status.to_string(),
+                        latency_ms,
+                        estimated_amount_out: None,
+                        best: false,
+                        error: Some(err),
+                    }
+                }
+            };
+            views.push(view);
+        }
+
+        // Flag the highest-output successful venue (the single-hop family's best,
+        // matching `choose_better_quote`'s higher-output-wins rule).
+        let mut best_idx: Option<usize> = None;
+        let mut best_out: Option<U256> = None;
+        for (idx, view) in views.iter().enumerate() {
+            if view.status != "success" {
+                continue;
+            }
+            let Some(out) = view
+                .estimated_amount_out
+                .as_deref()
+                .and_then(|value| U256::from_str(value).ok())
+            else {
+                continue;
+            };
+            if best_out.is_none_or(|best| out > best) {
+                best_out = Some(out);
+                best_idx = Some(idx);
+            }
+        }
+        if let Some(idx) = best_idx {
+            views[idx].best = true;
+        }
+
+        // Stable display order: best first, then successes, then alphabetical.
+        views.sort_by(|a, b| {
+            (!a.best, a.status != "success", a.provider.as_str()).cmp(&(
+                !b.best,
+                b.status != "success",
+                b.provider.as_str(),
+            ))
+        });
+        views
+    }
+
+    /// Live-sample the value-loss bps of every Velora (`UniversalRouterSwap`)
+    /// leg that appears across `paths`, deduplicated by transition id. These are
+    /// the runtime wrap legs that swap an arbitrary ERC20 (e.g. PEPE) into/out
+    /// of a primary anchor (USDC/USDT/ETH); they are never in the curated cache,
+    /// so they must be priced live whenever a niche ERC20 is involved.
+    ///
+    /// The internal pricing oracle has no price for such a token, so we read
+    /// Velora's own `srcUSD`/`destUSD`/`gasCostUSD` from the quote's
+    /// `price_route` and derive `(srcUSD - destUSD) / srcUSD * 10_000` bps. This
+    /// is what lets us compare "PEPE -> ETH" against "PEPE -> USDC" and fold the
+    /// real cost into the ranking alongside the cached primary-asset hops.
+    ///
+    /// Legs that fail or are unpriceable are simply absent from the returned map
+    /// (left as `missing_edges`).
+    async fn sample_live_velora_overrides(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        paths: &[TransitionPath],
+        request_usd_micros: u64,
+        pricing: &router_core::services::pricing::PricingSnapshot,
+    ) -> std::collections::HashMap<String, RouteCostSnapshot> {
+        let mut unique: std::collections::HashMap<String, TransitionDecl> =
+            std::collections::HashMap::new();
+        for path in paths {
+            for transition in &path.transitions {
+                if transition.kind != MarketOrderTransitionKind::UniversalRouterSwap {
+                    continue;
+                }
+                unique
+                    .entry(transition.id.clone())
+                    .or_insert_with(|| transition.clone());
+            }
+        }
+        if unique.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let tier_label = router_core::services::route_costs::select_route_cost_tier(
+            request_usd_micros,
+        )
+        .label
+        .to_string();
+        let sample_futures = unique.into_values().map(|decl| {
+            let tier_label = tier_label.clone();
+            async move {
+                self.sample_one_velora_leg(
+                    request,
+                    &decl,
+                    request_usd_micros,
+                    pricing,
+                    &tier_label,
+                )
+                .await
+                .map(|snapshot| (decl.id.clone(), snapshot))
+            }
+        });
+        join_all(sample_futures).await.into_iter().flatten().collect()
+    }
+
+    /// Shared candidate-selection pipeline used by both the real `/quote` path
+    /// and the dashboard explainer so they always agree. Given the filtered
+    /// candidate `paths`:
+    ///
+    /// 1. live-quote the Velora wrap legs (niche ERC20 -> primary asset) and
+    ///    fold them in as ranking overrides;
+    /// 2. rank by lowest combined cost (cached primary-asset hops + the live
+    ///    Velora legs), monotonic with total bps;
+    /// 3. drop any route that still has an unpriced leg (a broken/unavailable
+    ///    provider) so an unknown leg is never counted as free.
+    ///
+    /// If the exclusion empties the set even though candidates existed (e.g. a
+    /// momentarily cold cache), it falls back to the penalty-ranked set so a
+    /// genuinely quotable route still reaches the live-quote stage rather than
+    /// failing outright. Returns the ranked candidates plus the Velora overrides
+    /// (so callers can surface the live per-leg bps).
+    async fn select_ranked_candidates(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        paths: &mut Vec<TransitionPath>,
+        request_usd_micros: u64,
+    ) -> (
+        Vec<RankedTransitionPath>,
+        std::collections::HashMap<String, RouteCostSnapshot>,
+    ) {
+        let mut velora_overrides: std::collections::HashMap<String, RouteCostSnapshot> =
+            std::collections::HashMap::new();
+
+        let ranked = if let Some(route_costs) = self.route_costs.as_ref() {
+            let pricing = route_costs.current_or_refresh_pricing_snapshot().await;
+            velora_overrides = self
+                .sample_live_velora_overrides(request, paths, request_usd_micros, &pricing)
+                .await;
+            match route_costs
+                .rank_transition_paths_for_request_with_overrides(
+                    paths,
+                    request_usd_micros,
+                    &velora_overrides,
+                )
+                .await
+            {
+                Ok(ranked) => ranked,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "route-cost ranking failed; falling back to structural route ordering"
+                    );
+                    self.rank_market_paths(paths, request_usd_micros).await
+                }
+            }
+        } else {
+            self.rank_market_paths(paths, request_usd_micros).await
+        };
+
+        // Drop routes that still have an unpriced leg: with Velora priced above
+        // and the curated hops kept fresh in cache, a remaining missing edge
+        // means that leg is genuinely unavailable right now, so the route is not
+        // viable and must not be ranked or counted as free. Cold-cache safety
+        // (keep the set when the drop empties it) lives in the shared helper.
+        let selected = router_core::services::route_costs::retain_viable_ranked(ranked);
+        (selected, velora_overrides)
+    }
+
+    /// Live-quote a single Velora leg and turn Velora's `srcUSD`/`destUSD` into
+    /// a `RouteCostSnapshot`. The leg's input amount is the real order amount
+    /// when the leg starts from the request's source asset (the common
+    /// source-side ERC20 wrap), otherwise a tier-notional amount derived from
+    /// the (priced) anchor input. Returns `None` if the provider is missing,
+    /// the quote fails/has no route, or Velora reports no usable USD valuation.
+    async fn sample_one_velora_leg(
+        &self,
+        request: &NormalizedMarketOrderQuoteRequest,
+        transition: &TransitionDecl,
+        request_usd_micros: u64,
+        pricing: &router_core::services::pricing::PricingSnapshot,
+        tier_label: &str,
+    ) -> Option<RouteCostSnapshot> {
+        const VELORA_PROBE_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
+
+        let exchange = self.action_providers.exchange(transition.provider.as_str())?;
+
+        // Determine the input amount to quote.
+        let amount_in = if transition.input.asset.chain == request.source_asset.chain
+            && transition.input.asset.asset == request.source_asset.asset
+        {
+            U256::from_str(&request.amount_in).ok()?
+        } else {
+            let chain_asset = self.asset_registry.chain_asset(&transition.input.asset)?;
+            let price = pricing.canonical_asset_usd_micro(chain_asset.canonical)?;
+            if price == 0 {
+                return None;
+            }
+            let pow = U256::from(10u64).checked_pow(U256::from(chain_asset.decimals as u64))?;
+            U256::from(request_usd_micros).checked_mul(pow)? / U256::from(price)
+        };
+        if amount_in.is_zero() {
+            return None;
+        }
+
+        let input_decimals = self
+            .exchange_asset_decimals(&transition.input.asset)
+            .await
+            .ok()
+            .flatten();
+        let output_decimals = self
+            .exchange_asset_decimals(&transition.output.asset)
+            .await
+            .ok()
+            .flatten();
+
+        let quote = quote_exchange(
+            exchange.as_ref(),
+            ExchangeQuoteRequest {
+                input_asset: transition.input.asset.clone(),
+                output_asset: transition.output.asset.clone(),
+                input_decimals,
+                output_decimals,
+                order_kind: ProviderOrderKind::ExactIn {
+                    amount_in: amount_in.to_string(),
+                    min_amount_out: Some("1".to_string()),
+                },
+                sender_address: Some(VELORA_PROBE_ADDRESS.to_string()),
+                recipient_address: VELORA_PROBE_ADDRESS.to_string(),
+            },
+        )
+        .await
+        .ok()
+        .flatten()?;
+
+        // Velora's quote carries its own USD valuation of both sides under
+        // `price_route`, which works even for tokens our oracle cannot price.
+        let price_route = quote.provider_quote.get("price_route")?;
+        let src_usd = parse_velora_usd_field(price_route.get("srcUSD"))?;
+        let dest_usd = parse_velora_usd_field(price_route.get("destUSD"))?;
+        let gas_usd = parse_velora_usd_field(price_route.get("gasCostUSD")).unwrap_or(0.0);
+        if src_usd <= 0.0 {
+            return None;
+        }
+        let loss_usd = (src_usd - dest_usd).max(0.0);
+        let fee_bps = ((loss_usd / src_usd) * 10_000.0).round() as u64;
+        let now = Utc::now();
+        Some(RouteCostSnapshot {
+            transition_id: transition.id.clone(),
+            amount_bucket: tier_label.to_string(),
+            provider: transition.provider.as_str().to_string(),
+            edge_kind: transition.route_edge_kind().as_str().to_string(),
+            source_asset: transition.input.asset.clone(),
+            destination_asset: transition.output.asset.clone(),
+            estimated_fee_bps: fee_bps,
+            estimated_fee_usd_micros: (loss_usd * 1_000_000.0).round() as u64,
+            estimated_gas_usd_micros: (gas_usd.max(0.0) * 1_000_000.0).round() as u64,
+            estimated_latency_ms: 0,
+            sample_amount_usd_micros: (src_usd * 1_000_000.0).round() as u64,
+            quote_source: format!("velora_live_explain:{}", quote.provider_id),
+            refreshed_at: now,
+            expires_at: now + chrono::Duration::minutes(5),
         })
     }
 
@@ -1547,85 +2118,6 @@ impl OrderManager {
                 )
             }
         }
-    }
-
-    /// Live-quote the top `top_count` ranked paths (mirroring the
-    /// `best_provider_quote` fan-out) and return a map of `path_id ->
-    /// estimated_amount_out` plus the winning path id. Used only by the
-    /// route-explain dry run; it derives throwaway deposit/recipient addresses
-    /// so it never touches persisted order state.
-    async fn live_quote_top_paths(
-        &self,
-        request: &mut NormalizedMarketOrderQuoteRequest,
-        ranked: &[RankedTransitionPath],
-        top_count: usize,
-    ) -> MarketOrderResult<(std::collections::HashMap<String, String>, Option<String>)> {
-        let quote_id = Uuid::now_v7();
-        let (source_depositor_address, _) = derive_deposit_address_for_quote(
-            self.chain_registry.as_ref(),
-            &self.settings.master_key_bytes(),
-            quote_id,
-            &request.source_asset.chain,
-        )
-        .map_err(MarketOrderError::deposit_address)?;
-
-        let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
-            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
-        } else {
-            None
-        };
-        let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
-            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
-        } else {
-            None
-        };
-
-        let top_paths: Vec<&TransitionPath> = ranked
-            .iter()
-            .take(top_count)
-            .map(|ranked_path| &ranked_path.path)
-            .collect();
-        let top_quote_futures = top_paths.iter().map(|path| {
-            self.quote_transition_path(
-                request,
-                quote_id,
-                &source_depositor_address,
-                path,
-                provider_policy_snapshot.as_ref(),
-                provider_health_snapshot.as_ref(),
-            )
-        });
-        let top_results = join_all(top_quote_futures).await;
-
-        let mut outputs: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut outcomes: Vec<LiveQuoteOutcome> = Vec::new();
-        for (candidate, path) in top_results.into_iter().zip(top_paths.iter()) {
-            let quote = match candidate {
-                Ok(Some(quote)) => quote,
-                Ok(None) => continue,
-                Err(err) => {
-                    warn!(error = %err, path_id = %path.id, "route-explain top-path leg failed");
-                    continue;
-                }
-            };
-            if self.validate_provider_quote(request, &quote).is_err() {
-                continue;
-            }
-            let estimated_amount_out =
-                U256::from_str(&quote.estimated_amount_out).unwrap_or_default();
-            outputs.insert(path.id.clone(), quote.estimated_amount_out.clone());
-            outcomes.push(LiveQuoteOutcome {
-                quote_index: outcomes.len(),
-                path_id: path.id.clone(),
-                hop_count: path.transitions.len(),
-                estimated_amount_out,
-            });
-        }
-
-        let winner_path_id =
-            select_best_quote(&outcomes).map(|index| outcomes[index].path_id.clone());
-        Ok((outputs, winner_path_id))
     }
 
     /// Best-effort conversion of `request.amount_in` to USD micros for
@@ -4315,6 +4807,18 @@ async fn quote_exchange(
         .map_err(|err| MarketOrderError::NoRoute {
             reason: format!("exchange provider {} failed: {err}", exchange.id()),
         })
+}
+
+/// Parse a Velora `price_route` USD field (`srcUSD`/`destUSD`/`gasCostUSD`),
+/// which the upstream API returns as a decimal string (e.g. `"2.81"`) but may
+/// occasionally surface as a JSON number. Returns `None` when absent or
+/// unparseable.
+fn parse_velora_usd_field(value: Option<&serde_json::Value>) -> Option<f64> {
+    let value = value?;
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    value.as_str().and_then(|text| text.parse::<f64>().ok())
 }
 
 fn reserve_hyperliquid_spot_send_quote_gas(

@@ -274,17 +274,15 @@ pub struct RouteGraphEdge {
     pub curated: bool,
 }
 
-/// Request body for `POST /internal/v1/route-explain`.
+/// Request body for `POST /internal/v1/route-explain`. The explainer always
+/// runs the real shared quote pipeline (live-quoting the top 3 end-to-end,
+/// exactly like a user's `/quote`); there is no dry-run toggle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteExplainRequest {
     pub from_asset: DepositAsset,
     pub to_asset: DepositAsset,
     pub amount_in: String,
-    /// When true, additionally live-quotes the top ranked paths to report real
-    /// per-path outputs and the true winner. Defaults to cache-only dry run.
-    #[serde(default)]
-    pub live_quote: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,15 +297,69 @@ pub struct RouteExplain {
     pub amount_in: String,
     pub request_usd_micros: u64,
     pub tier_label: String,
-    pub live_quote: bool,
     pub counts: RouteExplainCounts,
     pub timings: RouteExplainTimings,
     pub ranked: Vec<RankedPathView>,
     pub winner_path_id: Option<String>,
+    /// Per-transition value-loss bps for legs that were live-sampled during this
+    /// explain (notably uncached runtime Velora `UniversalRouterSwap` wrap legs
+    /// for arbitrary ERC20s). Keyed by transition id. The dashboard overlays
+    /// these onto the cached bps map so Velora legs show real per-step bps and
+    /// contribute to the path total.
+    #[serde(default)]
+    pub live_bps_by_transition: std::collections::HashMap<String, f64>,
+    /// Single-hop venue checks: the cross-family alternative to the multi-hop
+    /// `ranked` routes above. Every configured single-hop quote provider is
+    /// queried in parallel (exactly as a real `/quote` does) and its per-venue
+    /// outcome is reported here, so the dashboard shows the full picture the
+    /// router compared against. Empty when no single-hop venues are configured.
+    #[serde(default)]
+    pub single_hop: Vec<SingleHopVenueView>,
+    /// The cross-family winner the router would actually return: the higher of
+    /// the best multi-hop route's output and the best single-hop venue's output
+    /// (mirroring production's `choose_better_quote`). `None` when neither
+    /// family produced a quote.
+    #[serde(default)]
+    pub overall_winner: Option<RouteExplainWinner>,
     /// Source->destination candidate subgraph: exactly the nodes and edges that
     /// participate in a viable ranked path, laid out left-to-right by hop depth
     /// from the source (source at depth 0, destination forced to `max_depth`).
     pub graph: RouteExplainGraph,
+}
+
+/// The cross-family winner of a route-explain: which family (and route/venue)
+/// produced the highest output, i.e. what a real `/quote` would return.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainWinner {
+    /// `multi_hop` or `single_hop`.
+    pub family: String,
+    /// For `multi_hop`: the winning transition-path id. For `single_hop`: the
+    /// winning provider id.
+    pub label: String,
+    /// Winning output in destination base units.
+    pub estimated_amount_out: String,
+}
+
+/// One single-hop venue's result in a route-explain. Mirrors a single
+/// cross-family alternative the router would have considered alongside the
+/// multi-hop paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleHopVenueView {
+    /// Provider id (e.g. `relay`, `mayan`, `chainflip`, `garden`,
+    /// `near_intents`).
+    pub provider: String,
+    /// One of `success`, `no_route`, `disabled`, `timeout`, `error`, `invalid`.
+    pub status: String,
+    /// Wall-clock latency of this venue's quote call (0 for `disabled`).
+    pub latency_ms: u64,
+    /// Quoted output in destination base units (present for `success`/`invalid`).
+    #[serde(default)]
+    pub estimated_amount_out: Option<String>,
+    /// True for the single-hop venue with the highest valid output.
+    pub best: bool,
+    /// Human-readable reason for non-success statuses.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Source->destination corridor for the route-explain visualizer: the full
@@ -379,6 +431,12 @@ pub struct RankedPathView {
     pub hop_count: usize,
     pub missing_edges: usize,
     pub total_effective_cost_usd_micros: u64,
+    /// Total path cost expressed in basis points of the request notional
+    /// (`total_effective_cost_usd_micros / request_usd_micros * 10_000`). This
+    /// is the value the ranker minimizes (monotonic with cost), and equals the
+    /// sum of every leg's `cost_bps`, so the dashboard's per-card total and the
+    /// chosen winner are always consistent.
+    pub total_bps: f64,
     pub total_latency_ms: u64,
     pub transitions: Vec<RouteTransitionView>,
     /// Present only when `live_quote` was requested and this path was quoted.
@@ -395,6 +453,12 @@ pub struct RouteTransitionView {
     pub from_asset: String,
     pub to_chain: String,
     pub to_asset: String,
+    /// This leg's effective cost (fee + gas) expressed in basis points of the
+    /// request notional, exactly as the ranker scored it. `None` when the leg
+    /// has no fresh cached cost and was not live-sampled (an unknown leg). The
+    /// dashboard renders this per step and sums it into the card total.
+    #[serde(default)]
+    pub cost_bps: Option<f64>,
 }
 
 /// Response body for the admin manual-refund endpoint

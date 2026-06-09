@@ -36,6 +36,10 @@ use std::collections::HashMap;
 
 const USDC_BASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const USDC_ARBITRUM: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+const USDC_ETHEREUM: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+/// A niche ERC20 not in the static registry, so it must be routed via the
+/// runtime Velora wrap into/out of a primary anchor (USDC/USDT/ETH).
+const PEPE_ETHEREUM: &str = "0x6982508145454ce325ddbe47a25d4ec3d2311933";
 
 fn asset(chain: &str, asset: AssetId) -> DepositAsset {
     DepositAsset {
@@ -133,6 +137,129 @@ fn bfs_finds_base_usdc_to_arbitrum_usdc_via_cctp() {
         }),
         "expected a direct CCTP path Base.USDC -> Arbitrum.USDC; got: {paths:#?}"
     );
+}
+
+#[test]
+fn bfs_routes_same_canonical_across_chains_as_distinct_corridor() {
+    // Same canonical (USDC) on two different chains is a legitimate cross-chain
+    // route, not a no-op: BFS must find a direct CCTP corridor.
+    let registry = AssetRegistry::default();
+    let source = evm_token("evm:8453", USDC_BASE);
+    let destination = evm_token("evm:1", USDC_ETHEREUM);
+
+    let paths = registry.select_transition_paths(&source, &destination, 5);
+    assert!(
+        paths.iter().any(|p| {
+            p.transitions.len() == 1
+                && p.transitions[0].kind == MarketOrderTransitionKind::CctpBridge
+        }),
+        "expected a direct CCTP corridor Base.USDC -> Ethereum.USDC; got: {paths:#?}"
+    );
+}
+
+#[test]
+fn bfs_wraps_arbitrary_erc20_into_anchor_for_pepe_to_btc() {
+    // A niche ERC20 source (PEPE) must begin every route with a Velora wrap
+    // (UniversalRouterSwap) into a primary anchor, then route the anchor through
+    // the cached graph to BTC.
+    let registry = AssetRegistry::default();
+    let source = evm_token("evm:1", PEPE_ETHEREUM);
+    let destination = asset("bitcoin", AssetId::Native);
+
+    let paths = registry.select_transition_paths(&source, &destination, 5);
+    assert!(!paths.is_empty(), "expected at least one PEPE -> BTC path");
+
+    let executable: Vec<_> = paths
+        .into_iter()
+        .filter(|p| is_executable_transition_path(&registry, p))
+        .collect();
+    assert!(
+        !executable.is_empty(),
+        "expected at least one executable PEPE -> BTC path"
+    );
+
+    for path in &executable {
+        assert!(
+            path.transitions.len() <= 5,
+            "PEPE route exceeds max depth 5: {path:#?}"
+        );
+        let first = &path.transitions[0];
+        assert_eq!(
+            first.kind,
+            MarketOrderTransitionKind::UniversalRouterSwap,
+            "PEPE route must start with a Velora wrap; got {:?}",
+            path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(first.input.asset, source, "wrap leg input must be PEPE");
+        let anchor = registry
+            .chain_asset(&first.output.asset)
+            .expect("Velora wrap must land on a registry anchor asset");
+        assert!(
+            matches!(
+                anchor.canonical,
+                CanonicalAsset::Usdc | CanonicalAsset::Usdt | CanonicalAsset::Eth
+            ),
+            "anchor must be USDC/USDT/ETH; got {:?}",
+            anchor.canonical
+        );
+    }
+
+    assert!(
+        executable.iter().any(|p| {
+            p.transitions
+                .last()
+                .map(|t| t.output.asset == destination)
+                .unwrap_or(false)
+        }),
+        "expected a PEPE -> ... -> BTC route terminating at bitcoin native"
+    );
+}
+
+#[test]
+fn bfs_wraps_arbitrary_erc20_at_tail_for_btc_to_pepe() {
+    // The reverse direction: a niche ERC20 destination must end every route with
+    // a Velora wrap out of a primary anchor into PEPE.
+    let registry = AssetRegistry::default();
+    let source = asset("bitcoin", AssetId::Native);
+    let destination = evm_token("evm:1", PEPE_ETHEREUM);
+
+    let paths = registry.select_transition_paths(&source, &destination, 5);
+    let executable: Vec<_> = paths
+        .into_iter()
+        .filter(|p| is_executable_transition_path(&registry, p))
+        .collect();
+    assert!(
+        !executable.is_empty(),
+        "expected at least one executable BTC -> PEPE path"
+    );
+
+    for path in &executable {
+        let last = path
+            .transitions
+            .last()
+            .expect("executable path has at least one transition");
+        assert_eq!(
+            last.kind,
+            MarketOrderTransitionKind::UniversalRouterSwap,
+            "BTC -> PEPE route must end with a Velora wrap into PEPE; got {:?}",
+            path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            last.output.asset, destination,
+            "final wrap output must be PEPE"
+        );
+        let anchor = registry
+            .chain_asset(&last.input.asset)
+            .expect("Velora wrap input must be a registry anchor asset");
+        assert!(
+            matches!(
+                anchor.canonical,
+                CanonicalAsset::Usdc | CanonicalAsset::Usdt | CanonicalAsset::Eth
+            ),
+            "anchor must be USDC/USDT/ETH; got {:?}",
+            anchor.canonical
+        );
+    }
 }
 
 #[test]

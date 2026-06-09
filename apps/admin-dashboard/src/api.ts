@@ -665,7 +665,6 @@ function isRouteExplain(value: unknown): value is RouteExplain {
     typeof value.amount_in === 'string' &&
     typeof value.request_usd_micros === 'number' &&
     typeof value.tier_label === 'string' &&
-    typeof value.live_quote === 'boolean' &&
     isRecord(counts) &&
     typeof counts.paths_enumerated === 'number' &&
     typeof counts.paths_after_executable === 'number' &&
@@ -682,7 +681,40 @@ function isRouteExplain(value: unknown): value is RouteExplain {
     Array.isArray(value.ranked) &&
     value.ranked.every(isRankedPathView) &&
     (value.winner_path_id === null || typeof value.winner_path_id === 'string') &&
+    (value.live_bps_by_transition === undefined ||
+      isRecord(value.live_bps_by_transition)) &&
+    (value.single_hop === undefined ||
+      (Array.isArray(value.single_hop) &&
+        value.single_hop.every(isSingleHopVenueView))) &&
+    (value.overall_winner === undefined ||
+      value.overall_winner === null ||
+      isRouteExplainWinner(value.overall_winner)) &&
     isRouteExplainGraph(value.graph)
+  )
+}
+
+function isRouteExplainWinner(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.family === 'string' &&
+    typeof value.label === 'string' &&
+    typeof value.estimated_amount_out === 'string'
+  )
+}
+
+function isSingleHopVenueView(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.provider === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.latency_ms === 'number' &&
+    typeof value.best === 'boolean' &&
+    (value.estimated_amount_out === undefined ||
+      value.estimated_amount_out === null ||
+      typeof value.estimated_amount_out === 'string') &&
+    (value.error === undefined ||
+      value.error === null ||
+      typeof value.error === 'string')
   )
 }
 
@@ -734,6 +766,7 @@ function isRankedPathView(value: unknown): value is RankedPathView {
     typeof value.hop_count === 'number' &&
     typeof value.missing_edges === 'number' &&
     typeof value.total_effective_cost_usd_micros === 'number' &&
+    (value.total_bps === undefined || typeof value.total_bps === 'number') &&
     typeof value.total_latency_ms === 'number' &&
     Array.isArray(value.transitions) &&
     value.transitions.every(isRouteTransitionView) &&
@@ -752,7 +785,10 @@ function isRouteTransitionView(value: unknown): value is RouteTransitionView {
     typeof value.from_chain === 'string' &&
     typeof value.from_asset === 'string' &&
     typeof value.to_chain === 'string' &&
-    typeof value.to_asset === 'string'
+    typeof value.to_asset === 'string' &&
+    (value.cost_bps === undefined ||
+      value.cost_bps === null ||
+      typeof value.cost_bps === 'number')
   )
 }
 
