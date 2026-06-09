@@ -964,7 +964,7 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 
 [[package]]
 name = "api-key-gen"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "argon2",
  "blockchain-utils",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-indexer"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "axum 0.7.9",
  "bitcoin",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-indexer-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -1905,7 +1905,7 @@ checksum = "0b47c4ab7a93edb0c7198c5535ed9b52b63095f4e9b45279c6736cec4b856baf"
 
 [[package]]
 name = "bitcoin-receipt-watcher"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "axum 0.7.9",
  "bitcoin",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-receipt-watcher-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "async-trait",
  "bitcoin",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "blockchain-utils"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "chainalysis-address-screener"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "metrics",
  "observability",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "chains"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2922,7 +2922,7 @@ dependencies = [
 
 [[package]]
 name = "devnet"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "devnet-cli"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "axum 0.7.9",
  "blockchain-utils",
@@ -3086,21 +3086,21 @@ dependencies = [
 
 [[package]]
 name = "eip3009-erc20-contract"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
 ]
 
 [[package]]
 name = "eip7702-delegator-contract"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
 ]
 
 [[package]]
 name = "eip7702-paymaster"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "eip7702-delegator-contract",
@@ -3283,7 +3283,7 @@ dependencies = [
 
 [[package]]
 name = "evm-indexer-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -3302,7 +3302,7 @@ dependencies = [
 
 [[package]]
 name = "evm-receipt-watcher"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "evm-receipt-watcher-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "evm-token-indexer-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "metrics",
@@ -3911,7 +3911,7 @@ dependencies = [
 
 [[package]]
 name = "hl-shim-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -3929,7 +3929,7 @@ dependencies = [
 
 [[package]]
 name = "hl-shim-indexer"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -4143,7 +4143,7 @@ dependencies = [
 
 [[package]]
 name = "hyperliquid-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "metrics",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "hyperunit-client"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "base64 0.22.1",
@@ -4709,7 +4709,7 @@ dependencies = [
 
 [[package]]
 name = "market-pricing"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "chrono",
  "metrics",
@@ -5137,7 +5137,7 @@ dependencies = [
 
 [[package]]
 name = "observability"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
@@ -5264,7 +5264,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "otc-models"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "chrono",
@@ -6044,7 +6044,7 @@ dependencies = [
 
 [[package]]
 name = "rand-wallet"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -6333,7 +6333,7 @@ dependencies = [
 
 [[package]]
 name = "router-core"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -6368,7 +6368,7 @@ dependencies = [
 
 [[package]]
 name = "router-gateway-cli"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -6386,7 +6386,7 @@ dependencies = [
 
 [[package]]
 name = "router-gateway-sdk"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "reqwest",
  "serde",
@@ -6398,7 +6398,7 @@ dependencies = [
 
 [[package]]
 name = "router-integration-tests"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "axum 0.7.9",
@@ -6432,7 +6432,7 @@ dependencies = [
 
 [[package]]
 name = "router-loadgen"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "bitcoin",
@@ -6451,7 +6451,7 @@ dependencies = [
 
 [[package]]
 name = "router-primitives"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "argon2",
@@ -6464,7 +6464,7 @@ dependencies = [
 
 [[package]]
 name = "router-server"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "arc-swap",
@@ -6512,7 +6512,7 @@ dependencies = [
 
 [[package]]
 name = "router-temporal"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "chrono",
  "serde",
@@ -6525,7 +6525,7 @@ dependencies = [
 
 [[package]]
 name = "router-test-support"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "testcontainers",
  "tokio",
@@ -6749,7 +6749,7 @@ dependencies = [
 
 [[package]]
 name = "sauron"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "async-trait",
@@ -7561,7 +7561,7 @@ dependencies = [
 
 [[package]]
 name = "temporal-worker"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "alloy",
  "anyhow",
@@ -8545,7 +8545,7 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utc"
-version = "0.2.31"
+version = "0.2.33"
 dependencies = [
  "chrono",
  "mock_instant",
@@ -8601,7 +8601,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "venue-fixtures"
-version = "0.2.31"
+version = "0.2.33"
 
 [[package]]
 name = "version_check"
