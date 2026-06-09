@@ -4,6 +4,7 @@ import {
   GatewayConflictError,
   GatewayValidationError,
   UpstreamHttpError,
+  UpstreamInsufficientLiquidityError,
   normalizeError
 } from '../errors'
 
@@ -55,4 +56,16 @@ test('normalizeError preserves actionable upstream 422 errors', () => {
     'balance 0 below required 40125000000000'
   )
   expect(normalized.body.error.details).toEqual({ upstreamStatus: 422 })
+})
+
+test('normalizeError renders insufficient liquidity with its dedicated code', () => {
+  const normalized = normalizeError(new UpstreamInsufficientLiquidityError())
+
+  expect(normalized.status).toBe(422)
+  expect(normalized.body).toEqual({
+    error: {
+      code: 'INSUFFICIENT_LIQUIDITY',
+      message: 'insufficient liquidity for the requested size'
+    }
+  })
 })

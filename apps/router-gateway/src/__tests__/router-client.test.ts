@@ -62,3 +62,46 @@ test('RouterClient strips trailing slashes before appending API paths', async ()
     `https://router.internal/api/v1/quotes/${encodeURIComponent(QUOTE_ID)}`
   ])
 })
+
+test('RouterClient maps insufficient_liquidity upstream kind to the dedicated error', async () => {
+  const fetcher: FetchLike = async () =>
+    Response.json(
+      {
+        error: {
+          code: 422,
+          kind: 'insufficient_liquidity',
+          message: 'insufficient liquidity for the requested size'
+        }
+      },
+      { status: 422 }
+    )
+  const client = new RouterClient({
+    baseUrl: 'https://router.internal',
+    fetch: fetcher,
+    timeoutMs: 1_000
+  })
+
+  expect(client.getQuote(QUOTE_ID)).rejects.toMatchObject({
+    code: 'INSUFFICIENT_LIQUIDITY',
+    status: 422,
+    message: 'insufficient liquidity for the requested size'
+  })
+})
+
+test('RouterClient keeps plain 422s as generic upstream errors', async () => {
+  const fetcher: FetchLike = async () =>
+    Response.json(
+      { error: { code: 422, message: 'No route found: nothing matched' } },
+      { status: 422 }
+    )
+  const client = new RouterClient({
+    baseUrl: 'https://router.internal',
+    fetch: fetcher,
+    timeoutMs: 1_000
+  })
+
+  expect(client.getQuote(QUOTE_ID)).rejects.toMatchObject({
+    code: 'UPSTREAM_ERROR',
+    upstreamStatus: 422
+  })
+})

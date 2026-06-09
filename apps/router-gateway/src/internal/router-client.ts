@@ -1,4 +1,8 @@
-import { GatewayConfigurationError, UpstreamHttpError } from '../errors'
+import {
+  GatewayConfigurationError,
+  UpstreamHttpError,
+  UpstreamInsufficientLiquidityError
+} from '../errors'
 import { readLimitedResponseText } from './http-body'
 
 const MAX_UPSTREAM_SUCCESS_BODY_BYTES = 1024 * 1024
@@ -191,6 +195,9 @@ export class RouterClient {
 
       const responseBody = await readResponseBody(response)
       if (!response.ok) {
+        if (upstreamErrorKind(responseBody) === 'insufficient_liquidity') {
+          throw new UpstreamInsufficientLiquidityError()
+        }
         throw new UpstreamHttpError(
           response.status,
           upstreamErrorMessage(response.status, responseBody),
@@ -201,6 +208,7 @@ export class RouterClient {
       return responseBody
     } catch (error) {
       if (error instanceof UpstreamHttpError) throw error
+      if (error instanceof UpstreamInsufficientLiquidityError) throw error
       if (isAbortError(error)) {
         throw new UpstreamHttpError(
           504,
@@ -398,6 +406,18 @@ async function readResponseBody(response: Response): Promise<unknown> {
   } catch {
     return text
   }
+}
+
+/** The internal API's machine-readable error discriminator, when present. */
+function upstreamErrorKind(body: unknown): string | undefined {
+  if (
+    isObject(body) &&
+    isObject(body.error) &&
+    typeof body.error.kind === 'string'
+  ) {
+    return body.error.kind
+  }
+  return undefined
 }
 
 function upstreamErrorMessage(status: number, body: unknown): string {

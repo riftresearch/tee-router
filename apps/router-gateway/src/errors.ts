@@ -5,6 +5,7 @@ export type ErrorCode =
   | 'BAD_GATEWAY'
   | 'CONFLICT'
   | 'CONFIGURATION_ERROR'
+  | 'INSUFFICIENT_LIQUIDITY'
   | 'PAYLOAD_TOO_LARGE'
   | 'UPSTREAM_ERROR'
   | 'VALIDATION_ERROR'
@@ -44,6 +45,21 @@ export class GatewayAuthenticationError extends Error {
 export class GatewayConflictError extends Error {
   readonly status = 409
   readonly code = 'CONFLICT' as const
+}
+
+/**
+ * Upstream classified the failure as liquidity exhaustion
+ * (`error.kind === "insufficient_liquidity"` on the internal API). Surfaced
+ * with a dedicated public code and a generic, venue-agnostic message — the
+ * caller learns the one thing that changes their behavior: reduce size.
+ */
+export class UpstreamInsufficientLiquidityError extends Error {
+  readonly status = 422
+  readonly code = 'INSUFFICIENT_LIQUIDITY' as const
+
+  constructor() {
+    super('insufficient liquidity for the requested size')
+  }
 }
 
 export class UpstreamHttpError extends Error {
@@ -104,6 +120,13 @@ export function normalizeError(error: unknown): {
   }
 
   if (error instanceof GatewayConflictError) {
+    return {
+      status: error.status,
+      body: errorBody(error.code, error.message)
+    }
+  }
+
+  if (error instanceof UpstreamInsufficientLiquidityError) {
     return {
       status: error.status,
       body: errorBody(error.code, error.message)

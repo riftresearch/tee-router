@@ -111,6 +111,14 @@ pub enum MarketOrderError {
     #[snafu(display("No market-order route found: {}", reason))]
     NoRoute { reason: String },
 
+    /// Venue-agnostic classification of a no-route outcome where the
+    /// representative path failure was liquidity exhaustion. Deliberately
+    /// carries no provider detail: the per-venue failures stay in the WARN
+    /// logs, the caller learns the one thing that changes their behavior
+    /// (reduce size).
+    #[snafu(display("insufficient liquidity for the requested size"))]
+    InsufficientLiquidity,
+
     #[snafu(display(
         "Estimated output {} is below the viable floor {} for {} {} (the order is too small to clear route fees)",
         estimated_amount_out,
@@ -142,6 +150,47 @@ pub enum MarketOrderError {
 }
 
 pub type MarketOrderResult<T> = Result<T, MarketOrderError>;
+
+/// Conservative substring classifier for venue liquidity-exhaustion
+/// failures. Provider errors are plain strings today, so this is the
+/// pragmatic bridge until they are typed; a missed pattern degrades to the
+/// generic no-route response, never misclassifies.
+fn is_insufficient_liquidity_failure(error: &MarketOrderError) -> bool {
+    match error {
+        MarketOrderError::InsufficientLiquidity => true,
+        MarketOrderError::NoRoute { reason } => {
+            // Hyperliquid stitched book walk (exact-in / exact-out).
+            reason.contains("could not absorb remaining input")
+                || reason.contains("could not produce remaining output")
+                // Across.
+                || reason.contains("AMOUNT_TOO_HIGH")
+                // near_intents.
+                || reason.contains("No liquidity available")
+        }
+        _ => false,
+    }
+}
+
+/// Keep the most representative no-route failure across candidate paths:
+/// the first error in arrival (rank) order, upgraded only when a later
+/// liquidity-class error arrives and the kept one is not liquidity-class.
+/// "A size reduction can plausibly fix this" beats venue weather from a
+/// lower-ranked path; among same-class errors the better-ranked path wins.
+fn keep_representative_error(
+    kept: &mut Option<MarketOrderError>,
+    candidate: MarketOrderError,
+) {
+    let upgrade = match kept {
+        None => true,
+        Some(kept) => {
+            !is_insufficient_liquidity_failure(kept)
+                && is_insufficient_liquidity_failure(&candidate)
+        }
+    };
+    if upgrade {
+        *kept = Some(candidate);
+    }
+}
 
 impl MarketOrderError {
     fn gas_reimbursement(source: GasReimbursementError) -> Self {
@@ -251,15 +300,16 @@ struct SelectionTimings {
 
 /// Full trace of one run of the shared market-quote pipeline
 /// ([`OrderManager::run_market_quote_pipeline`]). `quote_market_order` reads
-/// only `chosen`/`last_error`; the dashboard explainer renders the whole trace
+/// only `chosen`/`representative_error`; the dashboard explainer renders the whole trace
 /// so it shows exactly what a real user's quote did (cached ranking, the top-N
 /// actually live-quoted, their real outputs, and the best-output winner).
 struct MarketQuotePipelineOutcome {
     /// The winning composed quote (best real output), if any survived.
     chosen: Option<ComposedMarketOrderQuote>,
-    /// Last error seen while live-quoting / filtering, used to produce a
+    /// Most representative error seen while live-quoting / filtering
+    /// (liquidity-class preferred, then path rank), used to produce a
     /// specific `NoRoute` when nothing survived.
-    last_error: Option<MarketOrderError>,
+    representative_error: Option<MarketOrderError>,
     request_usd_micros: u64,
     /// Full ranked candidate set (cached hops + live Velora), post strict-drop.
     ranked: Vec<RankedTransitionPath>,
@@ -1011,7 +1061,7 @@ impl OrderManager {
             tokio::join!(multi_hop_result, single_hop_result);
         let mut best: Option<ComposedMarketOrderQuote> = None;
         let mut candidates = include_candidates.then(Vec::new);
-        let mut last_error: Option<MarketOrderError> = None;
+        let mut representative_error: Option<MarketOrderError> = None;
         for result in [multi_hop_result, single_hop_result].into_iter().flatten() {
             match result {
                 Ok(selection) => {
@@ -1022,7 +1072,7 @@ impl OrderManager {
                     }
                     best = choose_better_quote(request, selection.quote, best);
                 }
-                Err(err) => last_error = Some(err),
+                Err(err) => keep_representative_error(&mut representative_error, err),
             }
         }
 
@@ -1049,7 +1099,12 @@ impl OrderManager {
                 }
                 Ok(MarketOrderQuoteSelection { quote, candidates })
             }
-            None => match last_error {
+            None => match representative_error {
+                // The response is the venue-agnostic classification; the
+                // per-venue failure text stays in the WARN logs above.
+                Some(err) if is_insufficient_liquidity_failure(&err) => {
+                    Err(MarketOrderError::InsufficientLiquidity)
+                }
                 Some(err) => Err(err),
                 None => Err(MarketOrderError::NoRoute {
                     reason: "no quote venue matched the requested constraints".to_string(),
@@ -1076,7 +1131,7 @@ impl OrderManager {
         let chosen = match outcome.chosen {
             Some(chosen) => chosen,
             None => {
-                return Err(outcome.last_error.unwrap_or_else(|| {
+                return Err(outcome.representative_error.unwrap_or_else(|| {
                     MarketOrderError::NoRoute {
                         reason: "no executable transition path satisfied the requested constraints"
                             .to_string(),
@@ -1125,7 +1180,7 @@ impl OrderManager {
     ///
     /// Returns the full trace (ranked set, the top-N actually live-quoted, their
     /// real outputs, the winner, plus per-stage counts/timings). The `/quote`
-    /// caller reads only `chosen`/`last_error`.
+    /// caller reads only `chosen`/`representative_error`.
     async fn run_market_quote_pipeline(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
@@ -1185,7 +1240,7 @@ impl OrderManager {
             };
             return Ok(MarketQuotePipelineOutcome {
                 chosen: None,
-                last_error: Some(MarketOrderError::NoRoute { reason }),
+                representative_error: Some(MarketOrderError::NoRoute { reason }),
                 request_usd_micros,
                 ranked: Vec::new(),
                 velora_overrides: std::collections::HashMap::new(),
@@ -1248,20 +1303,20 @@ impl OrderManager {
         let mut survivors: Vec<ComposedMarketOrderQuote> = Vec::with_capacity(top_results.len());
         let mut outputs_by_path: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let mut last_error: Option<MarketOrderError> = None;
+        let mut representative_error: Option<MarketOrderError> = None;
         for (candidate, path) in top_results.into_iter().zip(top_paths.iter()) {
             let quote = match candidate {
                 Ok(Some(quote)) => quote,
                 Ok(None) => continue,
                 Err(err) => {
                     warn!(error = %err, path_id = %path.id, "transition-path live quote failed");
-                    last_error = Some(err);
+                    keep_representative_error(&mut representative_error, err);
                     continue;
                 }
             };
             if let Err(err) = self.validate_provider_quote(request, &quote) {
                 warn!(error = %err, "Ignoring invalid transition-path quote");
-                last_error = Some(err);
+                keep_representative_error(&mut representative_error, err);
                 continue;
             }
             let estimated_amount_out =
@@ -1308,7 +1363,7 @@ impl OrderManager {
 
         Ok(MarketQuotePipelineOutcome {
             chosen,
-            last_error,
+            representative_error,
             request_usd_micros,
             ranked,
             velora_overrides,
@@ -2323,14 +2378,17 @@ impl OrderManager {
         }
 
         let mut best: Option<ComposedMarketOrderQuote> = None;
-        let mut last_error: Option<MarketOrderError> = None;
+        let mut representative_error: Option<MarketOrderError> = None;
         while let Some(joined) = tasks.join_next().await {
             let (provider_id, latency, result) = match joined {
                 Ok(result) => result,
                 Err(err) => {
-                    last_error = Some(MarketOrderError::NoRoute {
-                        reason: format!("single-hop quote task failed: {err}"),
-                    });
+                    keep_representative_error(
+                        &mut representative_error,
+                        MarketOrderError::NoRoute {
+                            reason: format!("single-hop quote task failed: {err}"),
+                        },
+                    );
                     continue;
                 }
             };
@@ -2363,12 +2421,15 @@ impl OrderManager {
                             err.clone(),
                         ));
                     }
-                    last_error = Some(MarketOrderError::NoRoute {
-                        reason: format!(
-                            "single-hop quote provider {} failed: {err}",
-                            provider_id.as_str()
-                        ),
-                    });
+                    keep_representative_error(
+                        &mut representative_error,
+                        MarketOrderError::NoRoute {
+                            reason: format!(
+                                "single-hop quote provider {} failed: {err}",
+                                provider_id.as_str()
+                            ),
+                        },
+                    );
                     continue;
                 }
             };
@@ -2389,7 +2450,7 @@ impl OrderManager {
                         err.to_string(),
                     ));
                 }
-                last_error = Some(err);
+                keep_representative_error(&mut representative_error, err);
                 continue;
             }
             if let Some(candidate_list) = candidates.as_mut() {
@@ -2406,7 +2467,7 @@ impl OrderManager {
 
         match best {
             Some(quote) => Ok(MarketOrderQuoteSelection { quote, candidates }),
-            None => match last_error {
+            None => match representative_error {
                 Some(err) => Err(err),
                 None => Err(MarketOrderError::NoRoute {
                     reason: "no single-hop quote provider returned a route".to_string(),
@@ -2866,7 +2927,7 @@ impl OrderManager {
         }
 
         let mut best_for_path: Option<ComposedMarketOrderQuote> = None;
-        let mut last_error: Option<MarketOrderError> = None;
+        let mut representative_error: Option<MarketOrderError> = None;
         for unit in &unit_candidates {
             let order_kind = ProviderOrderKind::ExactIn {
                 amount_in: request.amount_in.clone(),
@@ -2890,14 +2951,14 @@ impl OrderManager {
                 Ok(None) => continue,
                 Err(err) => {
                     warn!(path_id = %path.id, error = %err, "transition-path bounded quote failed");
-                    last_error = Some(err);
+                    keep_representative_error(&mut representative_error, err);
                     continue;
                 }
             };
             best_for_path = choose_better_quote(request, quote, best_for_path);
         }
 
-        match (best_for_path, last_error) {
+        match (best_for_path, representative_error) {
             (Some(quote), _) => Ok(Some(quote)),
             (None, Some(err)) => Err(err),
             (None, None) => Ok(None),
@@ -5175,6 +5236,77 @@ fn quote_hop_count(quote: &ComposedMarketOrderQuote) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_route(reason: &str) -> MarketOrderError {
+        MarketOrderError::NoRoute {
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn insufficient_liquidity_classifier_matches_known_venue_patterns() {
+        // One real-shaped reason per venue pattern (from production logs).
+        for reason in [
+            "exchange provider hyperliquid_spot failed: hyperliquid quote: book side could not absorb remaining input 37193000",
+            "hyperliquid quote: book side could not produce remaining output 42",
+            "bridge provider across failed: Across returned HTTP 400: {\"code\":\"AMOUNT_TOO_HIGH\",...}",
+            "single-hop quote provider near_intents failed: {\"message\":\"No liquidity available\"}",
+        ] {
+            assert!(
+                is_insufficient_liquidity_failure(&no_route(reason)),
+                "{reason}"
+            );
+        }
+        assert!(is_insufficient_liquidity_failure(
+            &MarketOrderError::InsufficientLiquidity
+        ));
+
+        assert!(!is_insufficient_liquidity_failure(&no_route(
+            "bridge provider cctp failed: HTTP 503 upstream unavailable"
+        )));
+        assert!(!is_insufficient_liquidity_failure(
+            &MarketOrderError::QuoteExpired
+        ));
+    }
+
+    #[test]
+    fn representative_error_prefers_liquidity_class_then_arrival_order() {
+        // Liquidity-class arrives after venue weather: it upgrades.
+        let mut kept = None;
+        keep_representative_error(&mut kept, no_route("provider timed out"));
+        keep_representative_error(&mut kept, no_route("No liquidity available"));
+        assert!(matches!(
+            kept,
+            Some(MarketOrderError::NoRoute { ref reason }) if reason.contains("No liquidity")
+        ));
+
+        // A later same-class error never displaces the earlier (better-
+        // ranked) one — in rank order the leader's failure is kept...
+        keep_representative_error(
+            &mut kept,
+            no_route("book side could not absorb remaining input 1"),
+        );
+        assert!(matches!(
+            kept,
+            Some(MarketOrderError::NoRoute { ref reason }) if reason.contains("No liquidity")
+        ));
+
+        // ...and venue weather never displaces a kept liquidity error.
+        keep_representative_error(&mut kept, no_route("provider unreachable"));
+        assert!(matches!(
+            kept,
+            Some(MarketOrderError::NoRoute { ref reason }) if reason.contains("No liquidity")
+        ));
+
+        // Without any liquidity-class failure, the first error wins.
+        let mut kept = None;
+        keep_representative_error(&mut kept, no_route("first venue down"));
+        keep_representative_error(&mut kept, no_route("second venue down"));
+        assert!(matches!(
+            kept,
+            Some(MarketOrderError::NoRoute { ref reason }) if reason.contains("first")
+        ));
+    }
 
     fn floor_asset(chain: &str, asset: AssetId) -> DepositAsset {
         DepositAsset {

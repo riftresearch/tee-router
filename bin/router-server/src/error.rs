@@ -37,6 +37,13 @@ pub enum RouterServerError {
     #[snafu(display("No route found: {}", message))]
     NoRoute { message: String },
 
+    /// Venue-agnostic no-route classification: the representative path
+    /// failure was liquidity exhaustion. Carries no provider detail by
+    /// design; `kind: "insufficient_liquidity"` in the response body is the
+    /// machine-readable signal the gateway maps to its public error code.
+    #[snafu(display("insufficient liquidity for the requested size"))]
+    InsufficientLiquidity,
+
     #[snafu(display("Not ready: {}", message))]
     NotReady { message: String },
 
@@ -94,12 +101,16 @@ impl IntoResponse for RouterServerError {
             tracing::error!(error = %self, "router API request failed");
         }
 
-        let body = Json(json!({
-            "error": {
-                "code": status.as_u16(),
-                "message": self.public_message(),
-            }
-        }));
+        let mut error = json!({
+            "code": status.as_u16(),
+            "message": self.public_message(),
+        });
+        // Stable machine-readable discriminator for errors the gateway maps
+        // to a dedicated public error code (HTTP status alone is ambiguous).
+        if let Some(kind) = self.kind() {
+            error["kind"] = json!(kind);
+        }
+        let body = Json(json!({ "error": error }));
 
         (status, body).into_response()
     }
@@ -113,12 +124,21 @@ impl RouterServerError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
-            Self::NoRoute { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NoRoute { .. } | Self::InsufficientLiquidity => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::NotReady { .. } => StatusCode::TOO_EARLY,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+        }
+    }
+
+    fn kind(&self) -> Option<&'static str> {
+        match self {
+            Self::InsufficientLiquidity => Some("insufficient_liquidity"),
+            _ => None,
         }
     }
 
@@ -134,6 +154,7 @@ impl RouterServerError {
             | Self::Validation { .. }
             | Self::Conflict { .. }
             | Self::NoRoute { .. }
+            | Self::InsufficientLiquidity
             | Self::NotReady { .. } => self.to_string(),
         }
     }
@@ -241,6 +262,7 @@ impl From<crate::services::order_manager::MarketOrderError> for RouterServerErro
             }
             MarketOrderError::InvalidRouting { reason } => Self::Validation { message: reason },
             MarketOrderError::NoRoute { reason } => Self::NoRoute { message: reason },
+            MarketOrderError::InsufficientLiquidity => Self::InsufficientLiquidity,
             MarketOrderError::OutputBelowFloor {
                 estimated_amount_out,
                 output_floor,
@@ -292,6 +314,40 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["message"], "Internal server error");
         assert!(!body.to_string().contains("router_orders_private"));
+    }
+
+    #[tokio::test]
+    async fn insufficient_liquidity_carries_stable_kind_and_no_venue_detail() {
+        let response = RouterServerError::InsufficientLiquidity.into_response();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // The gateway maps this discriminator to its public error code.
+        assert_eq!(body["error"]["kind"], "insufficient_liquidity");
+        assert_eq!(
+            body["error"]["message"],
+            "insufficient liquidity for the requested size"
+        );
+        // Venue-agnostic by design: no provider names leak.
+        assert!(!body.to_string().contains("hyperliquid"));
+    }
+
+    #[tokio::test]
+    async fn no_route_errors_carry_no_kind_discriminator() {
+        let response = RouterServerError::NoRoute {
+            message: "nothing matched".to_string(),
+        }
+        .into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+
+        assert!(body["error"].get("kind").is_none());
     }
 
     #[test]
