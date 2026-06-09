@@ -13,6 +13,7 @@ import { Play, RefreshCw } from 'lucide-react'
 
 import { fetchRouteCosts, fetchRouteGraph, postRouteExplain } from './api'
 import type {
+  RankedPathView,
   RouteExplain,
   RouteExplainGraph,
   RouteExplainGraphNode,
@@ -20,6 +21,7 @@ import type {
   RouteGraphEdge,
   RouteGraphNode,
   RouteGraphResponse,
+  RouteTransitionView,
   SingleHopVenueView
 } from './types'
 
@@ -479,10 +481,16 @@ function ExplainPanel({
   const { counts, timings } = explain
   const fromLabel = assetDisplayLabel(explain.from_asset, nodes)
   const toLabel = assetDisplayLabel(explain.to_asset, nodes)
-  const bestPathId = bestPathIdFor(explain)
   const overallWinner = explain.overall_winner ?? null
-  const isOverallMultiHopWinner = (pathId: string) =>
-    overallWinner?.family === 'multi_hop' && overallWinner.label === pathId
+  // For a multi-hop win, surface the route's total fee+gas (bps) on the banner.
+  const winnerPath =
+    overallWinner?.family === 'multi_hop'
+      ? explain.ranked.find((path) => path.path_id === overallWinner.label) ??
+        null
+      : null
+  const winnerBps = winnerPath
+    ? formatPathBpsTotal(pathBpsSummary(winnerPath))
+    : null
   return (
     <div className="route-graph-explain">
       <header className="rg-explain-header">
@@ -521,6 +529,14 @@ function ExplainPanel({
           <span className="rg-winner-route">
             {winnerShortLabel(overallWinner, explain)}
           </span>
+          {winnerBps ? (
+            <span
+              className="rg-winner-bps"
+              title="Total route cost (fee + gas) in bps, summed across every leg"
+            >
+              {winnerBps}
+            </span>
+          ) : null}
           <span className="rg-winner-out">
             out {overallWinner.estimated_amount_out}
           </span>
@@ -536,120 +552,441 @@ function ExplainPanel({
         </div>
       ) : null}
 
-      <ol className="rg-ranked">
-        {explain.ranked.map((path) => {
-          const rankClass =
-            path.rank <= 3 ? ` rg-rank-${path.rank}` : ''
-          const isBest = path.path_id === bestPathId
-          const summary = pathBpsSummary(path)
-          return (
-            <li
-              key={path.path_id}
-              className={`rg-ranked-item${rankClass}${isBest ? ' rg-best' : ''}`}
-            >
-              <div className="rg-ranked-head">
-                <span className="rg-ranked-rank">#{path.rank}</span>
-                <span className="rg-ranked-venues">
-                  {path.transitions.map((transition, index) => (
-                    <span key={transition.id}>
-                      {index > 0 ? ' › ' : ''}
-                      <span style={{ color: providerColor(transition.provider) }}>
-                        {providerLabel(transition.provider)}
-                      </span>
-                    </span>
-                  ))}
-                </span>
-                {isOverallMultiHopWinner(path.path_id) ? (
-                  <span className="rg-badge rg-badge-winner">winner</span>
-                ) : isBest ? (
-                  <span className="rg-badge rg-badge-best">best</span>
-                ) : null}
-                <span className="rg-ranked-summary">
-                  <span
-                    className={`rg-sum-bps${summary.allKnown ? '' : ' rg-sum-partial'}`}
-                    title={
-                      summary.allKnown
-                        ? 'Total path cost (fee + gas) the ranker minimized, summed across every leg'
-                        : 'Sum of priced legs only; some legs had no fresh or live cost, so the true total is higher'
-                    }
-                  >
-                    {formatPathBpsTotal(summary)}
-                  </span>
-                  <span className="rg-sum-hops">{path.hop_count} hops</span>
-                  {path.missing_edges > 0 ? (
-                    <span className="rg-missing">{path.missing_edges} uncached</span>
-                  ) : null}
-                  {path.total_latency_ms > 0 ? (
-                    <span>{path.total_latency_ms}ms</span>
-                  ) : null}
-                  {path.estimated_amount_out ? (
-                    <span className="rg-out">out {path.estimated_amount_out}</span>
-                  ) : null}
-                </span>
-              </div>
-
-              <div className="rg-path-chain">
-                <span className="rg-chain-asset">
-                  {assetDisplayLabel(
-                    {
-                      chain: path.transitions[0]?.from_chain ?? '',
-                      asset: path.transitions[0]?.from_asset ?? ''
-                    },
-                    nodes
-                  )}
-                </span>
-                {path.transitions.map((transition) => {
-                  const bpsValue =
-                    typeof transition.cost_bps === 'number'
-                      ? transition.cost_bps
-                      : undefined
-                  const isVelora = transition.provider === 'velora'
-                  // The leg's authoritative cost (fee + gas) in bps, exactly as
-                  // the ranker scored it. Velora wrap legs are live-sampled;
-                  // other legs come from the active cache. A leg without a value
-                  // had no fresh/live cost ('live' for Velora, em-dash else).
-                  const stepBps =
-                    bpsValue !== undefined
-                      ? `${formatBps(bpsValue)} bps`
-                      : isVelora
-                        ? 'live'
-                        : '—'
-                  const bpsClass = isVelora
-                    ? ' rg-hop-live'
-                    : bpsValue === undefined
-                      ? ' rg-hop-missing'
-                      : ''
-                  return (
-                    <span className="rg-chain-step" key={`${transition.id}-step`}>
-                      <span
-                        className="rg-chain-hop"
-                        style={{ color: providerColor(transition.provider) }}
-                      >
-                        <span className="rg-hop-name">
-                          {providerLabel(transition.provider)}
-                        </span>
-                        <span className={`rg-hop-bps${bpsClass}`}>{stepBps}</span>
-                      </span>
-                      <span className="rg-chain-asset">
-                        {assetDisplayLabel(
-                          { chain: transition.to_chain, asset: transition.to_asset },
-                          nodes
-                        )}
-                      </span>
-                    </span>
-                  )
-                })}
-              </div>
-            </li>
-          )
-        })}
-      </ol>
+      <RouteRankings
+        explain={explain}
+        overallWinner={overallWinner}
+        nodes={nodes}
+      />
 
       <SingleHopVenues
         venues={explain.single_hop ?? []}
         winner={overallWinner}
       />
     </div>
+  )
+}
+
+// Provider sequence (colored, › separated) shared by both ranking sections.
+function VenueSequence({ transitions }: { transitions: RouteTransitionView[] }) {
+  return (
+    <span className="rg-ranked-venues">
+      {transitions.map((transition, index) => (
+        <span key={transition.id}>
+          {index > 0 ? ' › ' : ''}
+          <span style={{ color: providerColor(transition.provider) }}>
+            {providerLabel(transition.provider)}
+          </span>
+        </span>
+      ))}
+    </span>
+  )
+}
+
+// Per-route live-quote outcome: 'ok' = made the top-N live-quote cut and
+// returned an executable result; 'failed' = quoted but no executable route;
+// 'not_quoted' = outside the cut, never live-quoted.
+type LiveOutcome = 'ok' | 'failed' | 'not_quoted'
+
+type LiveRankedRoute = { path: RankedPathView; deltaBps: number }
+
+function liveAmountOut(path: RankedPathView): bigint {
+  try {
+    return BigInt(path.estimated_amount_out ?? '0')
+  } catch {
+    return 0n
+  }
+}
+
+// Re-rank the live-quoted routes by their real output. The backend winner
+// (`winner_path_id`) is pinned to #1 so this list always agrees with the
+// server's `select_best_quote` (no tiebreak drift); the rest follow by
+// descending output. Routes that were quoted but produced no executable result
+// are returned separately as failures.
+function liveRankedRoutes(explain: RouteExplain): {
+  successes: LiveRankedRoute[]
+  failures: RankedPathView[]
+} {
+  const quoted = explain.ranked.filter((path) => path.top_path)
+  const succeeded = quoted.filter((path) => !!path.estimated_amount_out)
+  const failures = quoted.filter((path) => !path.estimated_amount_out)
+  const winnerId = explain.winner_path_id
+
+  succeeded.sort((a, b) => {
+    if (winnerId) {
+      if (a.path_id === winnerId) return -1
+      if (b.path_id === winnerId) return 1
+    }
+    const diff = liveAmountOut(b) - liveAmountOut(a)
+    return diff > 0n ? 1 : diff < 0n ? -1 : 0
+  })
+
+  const best = succeeded.length > 0 ? liveAmountOut(succeeded[0]) : 0n
+  const successes = succeeded.map((path) => {
+    const out = liveAmountOut(path)
+    const deltaBps =
+      best > 0n ? Number(((best - out) * 10000n) / best) : 0
+    return { path, deltaBps }
+  })
+  return { successes, failures }
+}
+
+// The asset → leg → asset chain for a route, rendered as discrete pills so each
+// hop and its per-leg cost (fee + gas, in bps) read clearly. Each leg is a
+// bordered pill (provider-colored) with the venue name, a prominent bps badge,
+// and the absolute dollar cost; assets are separate node chips. Velora wrap
+// legs are live-sampled ('live'); a leg with no fresh/live cost shows '— bps'.
+// Cached legs also carry a muted `cache N bps` reconciler — the fee as bps of
+// the *tier sample* (the exact number the route-cost cache table shows) — so a
+// fixed-dollar leg that reads e.g. 25.8 bps against a $482 request visibly
+// matches the table's 13 bps at the $1k tier.
+function PathChain({
+  path,
+  nodes,
+  tierSampleUsdMicros
+}: {
+  path: RankedPathView
+  nodes: RouteGraphNode[]
+  tierSampleUsdMicros?: number
+}) {
+  return (
+    <div className="rg-path-chain">
+      <span className="rg-chain-node">
+        {assetDisplayLabel(
+          {
+            chain: path.transitions[0]?.from_chain ?? '',
+            asset: path.transitions[0]?.from_asset ?? ''
+          },
+          nodes
+        )}
+      </span>
+      {path.transitions.map((transition) => {
+        const bpsValue =
+          typeof transition.cost_bps === 'number'
+            ? transition.cost_bps
+            : undefined
+        const usdMicros =
+          typeof transition.cost_usd_micros === 'number'
+            ? transition.cost_usd_micros
+            : undefined
+        const tierFeeBps =
+          typeof transition.tier_fee_bps === 'number'
+            ? transition.tier_fee_bps
+            : undefined
+        const isVelora = transition.provider === 'velora'
+        const stepBps =
+          bpsValue !== undefined
+            ? `${formatBps(bpsValue)} bps`
+            : isVelora
+              ? 'live'
+              : '— bps'
+        const bpsClass = isVelora
+          ? ' rg-leg-bps-live'
+          : bpsValue === undefined
+            ? ' rg-leg-bps-missing'
+            : ''
+        const color = providerColor(transition.provider)
+        return (
+          <span className="rg-chain-step" key={`${transition.id}-step`}>
+            <span className="rg-chain-arrow">→</span>
+            <span className="rg-leg" style={{ borderColor: color }}>
+              <span className="rg-leg-name" style={{ color }}>
+                {providerLabel(transition.provider)}
+              </span>
+              <span className={`rg-leg-bps${bpsClass}`}>{stepBps}</span>
+              {usdMicros !== undefined ? (
+                <span
+                  className="rg-leg-usd"
+                  title="This leg's absolute cost (fee + gas). The bps figure is this amount divided by the request notional."
+                >
+                  {formatUsdMicros(usdMicros)}
+                </span>
+              ) : null}
+              {!isVelora && tierFeeBps !== undefined ? (
+                <span
+                  className="rg-leg-cache"
+                  title={`The route-cost cache table's number for this leg: fee as bps of the tier sample${
+                    tierSampleUsdMicros
+                      ? ` (${formatUsdMicros(tierSampleUsdMicros)})`
+                      : ''
+                  }. Same dollar cost, different denominator than the per-request bps.`}
+                >
+                  cache {tierFeeBps} bps
+                  {tierSampleUsdMicros
+                    ? ` @ ${formatUsdMicros(tierSampleUsdMicros)}`
+                    : ''}
+                </span>
+              ) : null}
+            </span>
+            <span className="rg-chain-arrow">→</span>
+            <span className="rg-chain-node">
+              {assetDisplayLabel(
+                { chain: transition.to_chain, asset: transition.to_asset },
+                nodes
+              )}
+            </span>
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
+type CombinedRoute = {
+  path: RankedPathView
+  outcome: LiveOutcome
+  // 1-based position among live-quoted successes; null when failed/not-quoted.
+  liveRank: number | null
+  // bps below the best live output; only meaningful for successes.
+  deltaBps: number
+}
+
+// One unified, live-ranked list. Order: live-quoted successes (by real output,
+// winner pinned #1), then live-quoted failures, then routes that never made the
+// live-quote cut (by cached cost rank). Each entry pairs its cached cost
+// estimate with its live result so the cached→live relationship is visible in
+// one place rather than across two separate lists.
+function combinedRoutes(explain: RouteExplain): CombinedRoute[] {
+  const { successes, failures } = liveRankedRoutes(explain)
+  const ok: CombinedRoute[] = successes.map(({ path, deltaBps }, index) => ({
+    path,
+    outcome: 'ok',
+    liveRank: index + 1,
+    deltaBps
+  }))
+  const failed: CombinedRoute[] = failures.map((path) => ({
+    path,
+    outcome: 'failed',
+    liveRank: null,
+    deltaBps: 0
+  }))
+  const notQuoted: CombinedRoute[] = explain.ranked
+    .filter((path) => !path.top_path)
+    .slice()
+    .sort((a, b) => a.rank - b.rank)
+    .map((path) => ({
+      path,
+      outcome: 'not_quoted' as const,
+      liveRank: null,
+      deltaBps: 0
+    }))
+  return [...ok, ...failed, ...notQuoted]
+}
+
+// The route list: ranked by live-quoted output, with each card stacking its
+// cached cost estimate (+ per-leg bps chain) against the live result and the
+// rank movement between the two.
+function RouteRankings({
+  explain,
+  overallWinner,
+  nodes
+}: {
+  explain: RouteExplain
+  overallWinner: RouteExplainWinner | null
+  nodes: RouteGraphNode[]
+}) {
+  if (explain.ranked.length === 0) return null
+  const routes = combinedRoutes(explain)
+  const okCount = routes.filter((route) => route.outcome === 'ok').length
+  const isOverallMultiHopWinner = (pathId: string) =>
+    overallWinner?.family === 'multi_hop' && overallWinner.label === pathId
+  return (
+    <section className="rg-section">
+      <div className="rg-section-head">
+        <span className="rg-section-title">Routes</span>
+        <span className="rg-section-sub">
+          ranked by live-quoted output — each card shows its cached cost
+          estimate, then the live result
+        </span>
+      </div>
+      <ol className="rg-ranked">
+        {routes.map(({ path, outcome, liveRank, deltaBps }) => {
+          const isFirst = outcome === 'ok' && liveRank === 1
+          const isWinner = isOverallMultiHopWinner(path.path_id)
+          const summary = pathBpsSummary(path)
+          // Realized live total cost vs the cached estimate (both in bps), plus
+          // the signed delta and its percentage of the cached estimate.
+          const liveCostBps = path.live_total_bps ?? null
+          const costDelta =
+            liveCostBps !== null ? liveCostBps - path.total_bps : null
+          const costPct =
+            costDelta !== null && path.total_bps !== 0
+              ? (costDelta / path.total_bps) * 100
+              : null
+          // The realized cost in absolute USD micros. The realized figure
+          // values the output at mid-market prices, so when the dollar cost is
+          // tiny (within pricing noise) or the order itself is small, the bps
+          // comparison against the cached estimate is not meaningful — flag it
+          // as low-confidence instead of showing a confident green/red delta.
+          const liveCostUsdMicros =
+            liveCostBps !== null
+              ? (explain.request_usd_micros * liveCostBps) / 10_000
+              : null
+          const liveCostIsNoise =
+            liveCostUsdMicros !== null &&
+            (Math.abs(liveCostUsdMicros) < 5_000_000 ||
+              explain.request_usd_micros < 2_000_000_000)
+          // Cost rank (cached) vs output rank (live): positive = promoted by
+          // live quoting, negative = demoted.
+          const movement =
+            outcome === 'ok' && liveRank !== null ? path.rank - liveRank : null
+          const showMovement =
+            movement !== null && (movement !== 0 || okCount > 1)
+          const cardClass = `rg-ranked-item${
+            isFirst ? ' rg-rank-1 rg-best' : ''
+          }${outcome === 'ok' ? '' : ' rg-route-dim'}`
+          return (
+            <li key={path.path_id} className={cardClass}>
+              <div className="rg-ranked-head">
+                <span className="rg-ranked-rank">
+                  {liveRank !== null ? `#${liveRank}` : '—'}
+                </span>
+                <VenueSequence transitions={path.transitions} />
+                {isWinner ? (
+                  <span className="rg-badge rg-badge-winner">winner</span>
+                ) : isFirst ? (
+                  <span className="rg-badge rg-badge-best">best</span>
+                ) : null}
+              </div>
+
+              <div className="rg-cmp">
+                {/* Cached cost estimate — what the ranker scored, pre-quote. */}
+                <div className="rg-cmp-row">
+                  <span className="rg-cmp-tag rg-cmp-tag-cached">cached</span>
+                  <div className="rg-cmp-body">
+                    <div className="rg-cmp-summary">
+                      <span className="rg-cmp-rankref">#{path.rank} by cost</span>
+                      <span
+                        className={`rg-sum-bps${summary.allKnown ? '' : ' rg-sum-partial'}`}
+                        title={
+                          summary.allKnown
+                            ? 'Total path cost (fee + gas) the ranker minimized, summed across every leg'
+                            : 'Sum of priced legs only; some legs had no fresh or live cost, so the true total is higher'
+                        }
+                      >
+                        {formatPathBpsTotal(summary)}
+                      </span>
+                      <span className="rg-sum-hops">{path.hop_count} hops</span>
+                      {path.missing_edges > 0 ? (
+                        <span className="rg-missing">
+                          {path.missing_edges} uncached
+                        </span>
+                      ) : null}
+                      {path.total_latency_ms > 0 ? (
+                        <span>{path.total_latency_ms}ms</span>
+                      ) : null}
+                      {explain.tier_sample_usd_micros ? (
+                        <span
+                          className="rg-tier-ctx"
+                          title="Cost snapshots are sampled at fixed tier sizes; the request notional rounds UP to the nearest tier. A fixed-dollar leg therefore reads as more bps for a request smaller than its tier sample."
+                        >
+                          request {formatUsdMicros(explain.request_usd_micros)} →{' '}
+                          {formatUsdMicros(explain.tier_sample_usd_micros)} tier
+                        </span>
+                      ) : null}
+                    </div>
+                    <PathChain
+                      path={path}
+                      nodes={nodes}
+                      tierSampleUsdMicros={explain.tier_sample_usd_micros}
+                    />
+                  </div>
+                </div>
+
+                {/* Live result — what the end-to-end quote actually returned. */}
+                <div className="rg-cmp-row">
+                  <span className="rg-cmp-tag rg-cmp-tag-live">live</span>
+                  <div className="rg-cmp-body">
+                    <div className="rg-cmp-summary">
+                      {outcome === 'ok' ? (
+                        <>
+                          <span className="rg-out">
+                            out {path.estimated_amount_out}
+                          </span>
+                          <span className="rg-live-delta">
+                            {isFirst
+                              ? 'best output'
+                              : `−${formatBps(deltaBps)} bps vs best`}
+                          </span>
+                          {liveCostBps !== null ? (
+                            <span
+                              className={`rg-live-cost${
+                                liveCostIsNoise ? ' rg-cost-uncertain' : ''
+                              }`}
+                            >
+                              <span
+                                className="rg-cost-live"
+                                title="Realized total cost from the live end-to-end quote: the output valued in USD vs the input notional (fee + gas + slippage). Approximate — uses mid-market pricing."
+                              >
+                                live ≈{formatBps(liveCostBps)} bps
+                                {liveCostUsdMicros !== null
+                                  ? ` (${liveCostUsdMicros < 0 ? '−' : ''}${formatUsdMicros(
+                                      Math.abs(liveCostUsdMicros)
+                                    )})`
+                                  : ''}
+                              </span>
+                              <span className="rg-cost-vs">
+                                vs cached {formatBps(path.total_bps)} bps
+                              </span>
+                              {liveCostIsNoise ? (
+                                <span
+                                  className="rg-cost-delta rg-cost-noise"
+                                  title="The realized figure values the output at mid-market prices. At this order size the dollar cost is within pricing noise, so the bps comparison against the cached estimate is not meaningful."
+                                >
+                                  within pricing noise
+                                </span>
+                              ) : costDelta !== null ? (
+                                <span
+                                  className={`rg-cost-delta ${
+                                    costDelta > 0.05
+                                      ? 'rg-cost-up'
+                                      : costDelta < -0.05
+                                        ? 'rg-cost-down'
+                                        : 'rg-cost-flat'
+                                  }`}
+                                  title="Live realized cost minus the cached estimate (positive = the route cost more than predicted)"
+                                >
+                                  {costDelta >= 0 ? '+' : '−'}
+                                  {formatBps(Math.abs(costDelta))} bps
+                                  {costPct !== null
+                                    ? ` (${costDelta >= 0 ? '+' : '−'}${Math.abs(
+                                        costPct
+                                      ).toFixed(0)}%)`
+                                    : ''}
+                                </span>
+                              ) : null}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : outcome === 'failed' ? (
+                        <span className="rg-live-pill rg-live-fail">
+                          no executable quote
+                        </span>
+                      ) : (
+                        <span className="rg-live-pill rg-not-quoted">
+                          not live-quoted (outside top cost cut)
+                        </span>
+                      )}
+                      {showMovement ? (
+                        <span
+                          className="rg-cmp-move"
+                          title="This route's live output rank vs its cached cost rank"
+                        >
+                          {movement === 0
+                            ? 'same as cost rank'
+                            : (movement ?? 0) > 0
+                              ? `▲ up ${movement} vs cost rank`
+                              : `▼ down ${-(movement ?? 0)} vs cost rank`}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </li>
+          )
+        })}
+      </ol>
+    </section>
   )
 }
 

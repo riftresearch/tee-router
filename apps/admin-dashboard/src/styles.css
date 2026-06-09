@@ -3588,17 +3588,6 @@ code,
   letter-spacing: 0.01em;
 }
 
-.rg-ranked-summary {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-  margin-left: auto;
-  font-size: 12px;
-  color: #9aa6a0;
-  font-variant-numeric: tabular-nums;
-}
-
 /* Total bps for the whole path (sum of cached legs). */
 .rg-sum-bps {
   font-weight: 700;
@@ -3614,83 +3603,98 @@ code,
   color: #d6c478;
 }
 
-.rg-ranked-summary .rg-missing {
-  color: var(--accent-bright);
-}
-
-.rg-ranked-summary .rg-out {
-  color: #6ee79a;
-}
-
-/* Detailed hop chain: asset → venue · bps → asset → … */
+/* Detailed hop chain: [asset node] → (venue + bps leg pill) → [asset node] → … */
 .rg-path-chain {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 8px;
+  gap: 6px 4px;
   margin: 0;
   padding-top: 11px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
-  font-size: 12px;
-  line-height: 1.7;
 }
 
-.rg-chain-asset {
+/* Asset node chip (the token at each boundary between legs). */
+.rg-chain-node {
   font-family:
     "SFMono-Regular", Consolas, "Liberation Mono", Menlo, ui-monospace, monospace;
   font-size: 11.5px;
+  font-weight: 600;
   color: #e6ebe8;
-  background: rgba(255, 255, 255, 0.04);
-  border-radius: 5px;
-  padding: 2px 7px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 3px 8px;
   white-space: nowrap;
 }
 
 .rg-chain-step {
   display: inline-flex;
   align-items: center;
-  gap: 6px 8px;
+  gap: 4px;
 }
 
-.rg-chain-step::before {
-  content: "→";
-  color: #6b7670;
-  font-size: 11px;
+.rg-chain-arrow {
+  color: #5f6a64;
+  font-size: 12px;
 }
 
-.rg-chain-hop {
+/* Each leg is a discrete bordered pill: venue name + its bps cost. */
+.rg-leg {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  font-weight: 600;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 4px 3px 10px;
+  background: rgba(255, 255, 255, 0.03);
   white-space: nowrap;
 }
 
-.rg-hop-name {
-  white-space: nowrap;
+.rg-leg-name {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
-/* Per-step bps chip rendered next to each venue hop. */
-.rg-hop-bps {
-  font-size: 10.5px;
-  font-weight: 600;
-  color: #c7cfca;
-  background: rgba(255, 255, 255, 0.06);
-  border-radius: 4px;
-  padding: 0 5px;
+/* Per-leg bps cost — the prominent number, in a solid inner chip. */
+.rg-leg-bps {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #0f1512;
+  background: #cbd5cf;
+  border-radius: 999px;
+  padding: 1px 8px;
   font-variant-numeric: tabular-nums;
 }
 
-.rg-hop-bps.rg-hop-missing {
-  color: #6b7670;
-  background: transparent;
-  padding: 0 2px;
+.rg-leg-bps.rg-leg-bps-live {
+  color: #1a1030;
+  background: #c4b5fd;
 }
 
-.rg-hop-bps.rg-hop-live {
-  color: #c4b5fd;
-  background: rgba(168, 85, 247, 0.14);
+.rg-leg-bps.rg-leg-bps-missing {
+  color: #c2922f;
+  background: rgba(214, 196, 120, 0.18);
+}
+
+/* Absolute dollar cost of the leg, next to its bps chip. */
+.rg-leg-usd {
+  font-size: 11px;
+  font-weight: 700;
+  color: #d6dcd8;
+  font-variant-numeric: tabular-nums;
+  padding-right: 2px;
+}
+
+/* Muted reconciler: the cache table's per-tier bps for this leg, so the
+   per-request bps and the table's number visibly describe the same dollars. */
+.rg-leg-cache {
+  font-size: 10px;
+  color: #7d847f;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  padding-right: 6px;
 }
 
 .rg-badge {
@@ -3763,10 +3767,245 @@ code,
   color: #d9dedb;
 }
 
+.rg-winner-bps {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 700;
+  color: #f4f0d8;
+  background: rgba(250, 204, 21, 0.14);
+  border: 1px solid rgba(250, 204, 21, 0.45);
+  border-radius: 6px;
+  padding: 1px 9px;
+  font-variant-numeric: tabular-nums;
+}
+
 .rg-winner-out {
   margin-left: auto;
   color: #fde68a;
   font-variant-numeric: tabular-nums;
+}
+
+/* Stacked ranking sections (cached cost vs live output). */
+.rg-section {
+  margin-top: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rg-section:first-of-type {
+  margin-top: 4px;
+}
+
+.rg-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.rg-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #c5ccc8;
+}
+
+.rg-section-sub {
+  font-size: 11px;
+  color: #7d847f;
+}
+
+/* Live-result pills used in each route card's live row. */
+.rg-live-pill {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.rg-live-fail {
+  background: rgba(248, 113, 113, 0.14);
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.rg-not-quoted {
+  background: rgba(255, 255, 255, 0.04);
+  color: #7d847f;
+  border-color: var(--border);
+}
+
+/* Routes that weren't live-quoted or whose live quote failed are de-emphasized
+   relative to the executable ones. */
+.rg-route-dim {
+  opacity: 0.62;
+}
+
+/* Per-card cached-vs-live comparison: two tagged rows under the identity head. */
+.rg-cmp {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding-top: 11px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.rg-cmp-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.rg-cmp-tag {
+  flex: none;
+  margin-top: 1px;
+  min-width: 48px;
+  text-align: center;
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 3px 7px;
+  border-radius: 999px;
+}
+
+.rg-cmp-tag-cached {
+  color: #9aa6a0;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+}
+
+.rg-cmp-tag-live {
+  color: #8ce8bc;
+  background: rgba(52, 211, 153, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.4);
+}
+
+.rg-cmp-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.rg-cmp-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  font-size: 12px;
+  color: #9aa6a0;
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-cmp-rankref {
+  color: #c5ccc8;
+  font-weight: 600;
+}
+
+.rg-cmp-summary .rg-out {
+  font-size: 13px;
+  font-weight: 700;
+  color: #6ee79a;
+}
+
+.rg-cmp-summary .rg-missing {
+  color: var(--accent-bright);
+}
+
+.rg-cmp-move {
+  color: #7d847f;
+}
+
+.rg-live-delta {
+  color: #c5ccc8;
+}
+
+/* Live realized total cost vs the cached estimate, shown on the live row. */
+.rg-live-cost {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.rg-cost-live {
+  font-weight: 700;
+  color: #e6ebe8;
+}
+
+.rg-cost-vs {
+  color: #7d847f;
+}
+
+.rg-cost-delta {
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Realized cost above the cached estimate (worse than predicted). */
+.rg-cost-up {
+  color: #fca5a5;
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+/* Realized cost below the cached estimate (better than predicted). */
+.rg-cost-down {
+  color: #8ce8bc;
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.45);
+}
+
+.rg-cost-flat {
+  color: #9aa6a0;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Request -> tier context on the cached row: explains why per-request bps can
+   read higher than the cache table (the request rounds up to the tier). */
+.rg-tier-ctx {
+  color: #7d847f;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* Low-confidence realized cost: order too small for mid-price valuation to be
+   meaningful, so the whole live-vs-cached comparison is muted. */
+.rg-live-cost.rg-cost-uncertain .rg-cost-live {
+  color: #9aa6a0;
+  font-weight: 600;
+}
+
+.rg-cost-delta.rg-cost-noise {
+  color: #9aa6a0;
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border);
+  font-weight: 600;
+  font-style: italic;
+}
+
+/* Inside the cached row the chain is grouped under the summary, so drop its
+   own top divider. */
+.rg-cmp-body .rg-path-chain {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* The winning card paints its key numbers green. */
+.rg-ranked-item.rg-best .rg-cmp-summary .rg-out {
+  color: #6ee7b7;
 }
 
 /* Single-hop venue checks (cross-family alternative to the ranked routes). */
@@ -3891,7 +4130,7 @@ code,
 }
 
 @media (max-width: 720px) {
-  .rg-ranked-summary {
-    margin-left: 0;
+  .rg-cmp-tag {
+    min-width: 40px;
   }
 }

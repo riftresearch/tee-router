@@ -665,6 +665,8 @@ function isRouteExplain(value: unknown): value is RouteExplain {
     typeof value.amount_in === 'string' &&
     typeof value.request_usd_micros === 'number' &&
     typeof value.tier_label === 'string' &&
+    (value.tier_sample_usd_micros === undefined ||
+      typeof value.tier_sample_usd_micros === 'number') &&
     isRecord(counts) &&
     typeof counts.paths_enumerated === 'number' &&
     typeof counts.paths_after_executable === 'number' &&
@@ -771,7 +773,10 @@ function isRankedPathView(value: unknown): value is RankedPathView {
     Array.isArray(value.transitions) &&
     value.transitions.every(isRouteTransitionView) &&
     (value.estimated_amount_out === null ||
-      typeof value.estimated_amount_out === 'string')
+      typeof value.estimated_amount_out === 'string') &&
+    (value.live_total_bps === undefined ||
+      value.live_total_bps === null ||
+      typeof value.live_total_bps === 'number')
   )
 }
 
@@ -788,7 +793,13 @@ function isRouteTransitionView(value: unknown): value is RouteTransitionView {
     typeof value.to_asset === 'string' &&
     (value.cost_bps === undefined ||
       value.cost_bps === null ||
-      typeof value.cost_bps === 'number')
+      typeof value.cost_bps === 'number') &&
+    (value.cost_usd_micros === undefined ||
+      value.cost_usd_micros === null ||
+      typeof value.cost_usd_micros === 'number') &&
+    (value.tier_fee_bps === undefined ||
+      value.tier_fee_bps === null ||
+      typeof value.tier_fee_bps === 'number')
   )
 }
 

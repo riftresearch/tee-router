@@ -452,6 +452,12 @@ export type RouteTransitionView = {
    * exactly as the ranker scored it. `null`/absent when the leg had no fresh
    * cost and was not live-sampled. */
   cost_bps?: number | null
+  /** Same effective leg cost in absolute USD micros — makes fixed-cost legs
+   * legible regardless of the bps denominator. */
+  cost_usd_micros?: number | null
+  /** The cached snapshot's fee as bps of the *tier sample* amount — the exact
+   * number the route-cost cache table shows for this leg. */
+  tier_fee_bps?: number | null
 }
 
 export type RankedPathView = {
@@ -468,6 +474,10 @@ export type RankedPathView = {
   total_latency_ms: number
   transitions: RouteTransitionView[]
   estimated_amount_out: string | null
+  /** Realized total cost in bps from the live end-to-end quote (output valued
+   * in USD vs the request notional). The live counterpart to `total_bps`.
+   * `null`/absent when the path was not live-quoted or could not be priced. */
+  live_total_bps?: number | null
 }
 
 export type RouteExplainCounts = {
@@ -546,6 +556,9 @@ export type RouteExplain = {
   amount_in: string
   request_usd_micros: number
   tier_label: string
+  /** Sample size (USD micros) of the route-cost tier this request ranked
+   * against; the tier ladder rounds the request notional up. */
+  tier_sample_usd_micros?: number
   counts: RouteExplainCounts
   timings: RouteExplainTimings
   ranked: RankedPathView[]

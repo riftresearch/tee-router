@@ -297,6 +297,13 @@ pub struct RouteExplain {
     pub amount_in: String,
     pub request_usd_micros: u64,
     pub tier_label: String,
+    /// Sample size (USD micros) of the route-cost tier this request ranked
+    /// against (`select_route_cost_tier` rounds the request notional *up*).
+    /// Lets the dashboard show that e.g. a $482 request priced off the $1,000
+    /// tier, which is why per-request bps read higher than the cache table's
+    /// per-tier bps for the same absolute cost.
+    #[serde(default)]
+    pub tier_sample_usd_micros: u64,
     pub counts: RouteExplainCounts,
     pub timings: RouteExplainTimings,
     pub ranked: Vec<RankedPathView>,
@@ -441,6 +448,15 @@ pub struct RankedPathView {
     pub transitions: Vec<RouteTransitionView>,
     /// Present only when `live_quote` was requested and this path was quoted.
     pub estimated_amount_out: Option<String>,
+    /// The route's *realized* total cost in basis points, derived from the live
+    /// end-to-end quote: `(1 - output_usd / request_usd) * 10_000`, with the
+    /// output valued in USD via the live pricing snapshot. This is the live
+    /// counterpart to the cached `total_bps` (which is the pre-quote estimate),
+    /// so the dashboard can show cached-vs-live cost and their delta. `None`
+    /// when the path was not live-quoted or its output could not be priced.
+    /// Approximate: uses mid-market pricing, so it can be slightly negative.
+    #[serde(default)]
+    pub live_total_bps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -459,6 +475,17 @@ pub struct RouteTransitionView {
     /// dashboard renders this per step and sums it into the card total.
     #[serde(default)]
     pub cost_bps: Option<f64>,
+    /// The same effective leg cost as `cost_bps` but in absolute USD micros.
+    /// Surfacing the dollar figure makes fixed-cost legs legible: a ~$1.25 Unit
+    /// deposit reads as 13 bps at the $1k tier but 25.8 bps for a $482 request,
+    /// while the dollars are identical.
+    #[serde(default)]
+    pub cost_usd_micros: Option<u64>,
+    /// The cached snapshot's `estimated_fee_bps` — fee as bps of the *tier
+    /// sample* amount, i.e. the exact number the route-cost cache table shows.
+    /// `None` for uncached legs.
+    #[serde(default)]
+    pub tier_fee_bps: Option<u64>,
 }
 
 /// Response body for the admin manual-refund endpoint

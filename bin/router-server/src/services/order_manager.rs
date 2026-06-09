@@ -1376,10 +1376,9 @@ impl OrderManager {
         let outcome = outcome?;
 
         let request_usd_micros = outcome.request_usd_micros;
-        let tier_label =
-            router_core::services::route_costs::select_route_cost_tier(request_usd_micros)
-                .label
-                .to_string();
+        let tier = router_core::services::route_costs::select_route_cost_tier(request_usd_micros);
+        let tier_label = tier.label.to_string();
+        let tier_sample_usd_micros = tier.sample_usd_micros;
 
         let mut ranked = outcome.ranked;
         if ranked.len() > TOP_K_PATHS {
@@ -1431,6 +1430,33 @@ impl OrderManager {
             }
         };
 
+        // Live realized total cost in bps: value each path's live end-to-end
+        // output in USD (same pricing snapshot the pipeline uses) and compare it
+        // to the request notional. This is the live counterpart to the cached
+        // `total_bps`, so the dashboard can show cached-estimate vs live-realized
+        // cost and their delta. Output valuation needs the destination asset's
+        // canonical price + decimals; absent route-costs/pricing we skip it.
+        let live_pricing = if let Some(route_costs) = self.route_costs.as_ref() {
+            Some(route_costs.current_or_refresh_pricing_snapshot().await)
+        } else {
+            None
+        };
+        let destination_chain_asset = self.asset_registry.chain_asset(&destination_asset);
+        let live_total_bps_of = |amount_out: &str| -> Option<f64> {
+            let pricing = live_pricing.as_ref()?;
+            let chain_asset = destination_chain_asset?;
+            if request_usd_micros == 0 {
+                return None;
+            }
+            let raw = U256::from_str(amount_out).ok()?;
+            let output_usd_micros = router_core::services::route_costs::raw_amount_to_usd_micros(
+                raw,
+                chain_asset,
+                pricing,
+            )?;
+            Some((1.0 - output_usd_micros as f64 / request_usd_micros as f64) * 10_000.0)
+        };
+
         let ranked_views = ranked
             .iter()
             .enumerate()
@@ -1440,14 +1466,14 @@ impl OrderManager {
                     .transitions
                     .iter()
                     .map(|transition| {
-                        let cost_bps = cost_snapshots.get(&transition.id).map(|snapshot| {
-                            cost_bps_of(
-                                router_core::services::route_costs::effective_leg_cost_usd_micros(
-                                    snapshot,
-                                    request_usd_micros,
-                                ),
+                        let snapshot = cost_snapshots.get(&transition.id);
+                        let cost_usd_micros = snapshot.map(|snapshot| {
+                            router_core::services::route_costs::effective_leg_cost_usd_micros(
+                                snapshot,
+                                request_usd_micros,
                             )
                         });
+                        let cost_bps = cost_usd_micros.map(&cost_bps_of);
                         RouteTransitionView {
                             id: transition.id.clone(),
                             provider: transition.provider.as_str().to_string(),
@@ -1458,6 +1484,8 @@ impl OrderManager {
                             to_chain: transition.output.asset.chain.as_str().to_string(),
                             to_asset: transition.output.asset.asset.as_str().to_string(),
                             cost_bps,
+                            cost_usd_micros,
+                            tier_fee_bps: snapshot.map(|snapshot| snapshot.estimated_fee_bps),
                         }
                     })
                     .collect();
@@ -1475,6 +1503,9 @@ impl OrderManager {
                     total_latency_ms: ranked_path.score.total_latency_ms,
                     transitions,
                     estimated_amount_out: estimated_out_by_path.get(&path.id).cloned(),
+                    live_total_bps: estimated_out_by_path
+                        .get(&path.id)
+                        .and_then(|amount_out| live_total_bps_of(amount_out)),
                 }
             })
             .collect();
@@ -1531,6 +1562,7 @@ impl OrderManager {
             amount_in: request.amount_in,
             request_usd_micros,
             tier_label,
+            tier_sample_usd_micros,
             counts: RouteExplainCounts {
                 paths_enumerated: outcome.counts.paths_enumerated,
                 paths_after_executable: outcome.counts.paths_after_executable,
