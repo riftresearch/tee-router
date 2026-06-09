@@ -873,11 +873,12 @@ async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
         return Err(eyre!("--sizes-usd-csv must contain at least one size"));
     }
 
-    let (price_usd_micros, decimals) = probe_asset_price(&command.from)
-        .ok_or_else(|| eyre!(
+    let (price_usd_micros, decimals) = probe_asset_price(&command.from).ok_or_else(|| {
+        eyre!(
             "unknown asset {} in --from; supported: *.USDC, *.USDT, *.ETH, *.BTC, *.CBBTC",
             command.from
-        ))?;
+        )
+    })?;
 
     let runtime = runtime_config(&QuoteInput {
         gateway_url: command.gateway_url.clone(),
@@ -908,7 +909,12 @@ async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
     let mut rows = Vec::with_capacity(sizes.len());
     for &size_usd in &sizes {
         let raw_amount = usd_to_raw_amount_string(size_usd, price_usd_micros, decimals)
-            .ok_or_else(|| eyre!("could not convert ${size_usd} to raw amount for {}", command.from))?;
+            .ok_or_else(|| {
+                eyre!(
+                    "could not convert ${size_usd} to raw amount for {}",
+                    command.from
+                )
+            })?;
         let resolved = ResolvedQuoteInput {
             order_type: OrderType::Market,
             from: command.from.clone(),
@@ -940,15 +946,20 @@ async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
 
     eprintln!("\n-- routing info lines (matched by quote_id) --");
     let router_log_lines = if command.show_router_server_logs {
-        fetch_compose_logs(&command, probe_start).await.unwrap_or_else(|err| {
-            eprintln!("  (could not read router logs: {err:#})");
-            String::new()
-        })
+        fetch_compose_logs(&command, probe_start)
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("  (could not read router logs: {err:#})");
+                String::new()
+            })
     } else {
         String::new()
     };
     if router_log_lines.is_empty() && command.show_router_server_logs {
-        eprintln!("  (no log lines captured; check `just dc logs {} --tail 50` manually)", command.compose_log_service);
+        eprintln!(
+            "  (no log lines captured; check `just dc logs {} --tail 50` manually)",
+            command.compose_log_service
+        );
     }
     for row in &rows {
         eprintln!(
@@ -958,9 +969,7 @@ async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
         );
         let mut found = false;
         for line in router_log_lines.lines() {
-            if line.contains(&row.quote_id)
-                && line.contains("best_provider_quote selected")
-            {
+            if line.contains(&row.quote_id) && line.contains("best_provider_quote selected") {
                 eprintln!("    {}", line.trim());
                 found = true;
             }
@@ -981,8 +990,14 @@ async fn run_probe_routing(command: ProbeRoutingCommand) -> Result<()> {
             .find(|line| line.contains(&row.quote_id))
             .map(parse_routing_log_fields)
             .unwrap_or_default();
-        let band = parsed.band_size.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
-        let delta = parsed.delta_bps.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let band = parsed
+            .band_size
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        let delta = parsed
+            .delta_bps
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
         let leader = parsed.leader_path_id.as_deref().unwrap_or("?");
         let chosen = parsed.chosen_path_id.as_deref().unwrap_or("?");
         let arrow = if leader == chosen {
@@ -1072,9 +1087,7 @@ async fn fetch_compose_logs(
     command: &ProbeRoutingCommand,
     since: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
-    let since_arg = since
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
+    let since_arg = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     // We deliberately do NOT pass `-f` here: the docker daemon tracks the
     // running project by name, and the local stack splits across several
     // compose files (compose.local-infra.yml + compose.local-devnet.yml

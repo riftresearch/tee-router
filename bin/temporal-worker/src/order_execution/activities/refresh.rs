@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use super::super::types::{LegBoundaryRequoteAttemptOutcome, LegBoundaryRequoteAttemptShape};
 use super::*;
 use router_core::services::action_providers::UnitProvider;
 use router_core::services::asset_registry::{AssetRegistry, RequiredCustodyRole};
@@ -8,7 +9,6 @@ use router_core::services::gas_reimbursement::{
     try_transition_retention_amount, GasReimbursementError, GasReimbursementPlan,
 };
 use router_core::services::market_order_planner::MarketOrderInitialHyperliquidCustody;
-use super::super::types::{LegBoundaryRequoteAttemptOutcome, LegBoundaryRequoteAttemptShape};
 
 pub(super) fn refreshed_market_order_quote_exact_in(
     order: &RouterOrder,

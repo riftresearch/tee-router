@@ -66,9 +66,7 @@ fn is_executable_transition_path(registry: &AssetRegistry, path: &TransitionPath
         )
         || (matches!(
             last_kind,
-            Some(
-                MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge
-            )
+            Some(MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge)
         ) && path_contains_runtime_asset(registry, path))
 }
 
@@ -360,12 +358,10 @@ fn pipeline_terminates_with_executable_kind_and_same_chain_preference() {
 
     prefer_same_chain_evm_paths(&source, &destination, &mut executable);
     assert!(
-        executable
-            .iter()
-            .all(|p| p.transitions.iter().all(|t| {
-                t.input.asset.chain.as_str() == "evm:8453"
-                    && t.output.asset.chain.as_str() == "evm:8453"
-            })),
+        executable.iter().all(|p| p.transitions.iter().all(|t| {
+            t.input.asset.chain.as_str() == "evm:8453"
+                && t.output.asset.chain.as_str() == "evm:8453"
+        })),
         "same-chain preference should restrict all hops to evm:8453"
     );
 
@@ -477,14 +473,16 @@ fn bfs_does_not_expand_past_goal() {
         let n = path.transitions.len();
         for (i, transition) in path.transitions.iter().enumerate() {
             assert_ne!(
-                transition.input.asset, destination,
+                transition.input.asset,
+                destination,
                 "path {} has destination as input on hop {i} (kinds={:?})",
                 path.id,
                 path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>(),
             );
             if i + 1 != n {
                 assert_ne!(
-                    transition.output.asset, destination,
+                    transition.output.asset,
+                    destination,
                     "path {} has destination as intermediate output on hop {i} (kinds={:?})",
                     path.id,
                     path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>(),
@@ -516,8 +514,16 @@ fn confidence_band_round_trip_via_public_api() {
     paths.sort_by(|a, b| {
         let sa = amount_aware_path_score(a, &empty_cache, &pricing, request_usd_micros);
         let sb = amount_aware_path_score(b, &empty_cache, &pricing, request_usd_micros);
-        (sa.total_effective_cost_usd_micros, a.transitions.len(), a.id.clone())
-            .cmp(&(sb.total_effective_cost_usd_micros, b.transitions.len(), b.id.clone()))
+        (
+            sa.total_effective_cost_usd_micros,
+            a.transitions.len(),
+            a.id.clone(),
+        )
+            .cmp(&(
+                sb.total_effective_cost_usd_micros,
+                b.transitions.len(),
+                b.id.clone(),
+            ))
     });
     let ranked: Vec<RankedTransitionPath> = paths
         .iter()
