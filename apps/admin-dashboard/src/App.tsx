@@ -58,6 +58,7 @@ import type {
   SwapTimeAveragesResponse,
   RouteCostSnapshot,
   RouteCostSampleEvent,
+  RouteCostFailureCategory,
   RouteGraphEdge,
   UsdAmountValuation,
   UsdValuation,
@@ -1514,6 +1515,28 @@ const ROUTE_COST_POLL_MS = 30_000
 const ROUTE_COST_EVENTS_POLL_MS = 4_000
 const ROUTE_COST_DEFAULT_WINDOW_SECONDS = 1800
 const ROUTE_COST_ACTIVITY_LOG_LIMIT = 150
+const ROUTE_COST_FAILURE_LOG_LIMIT = 80
+
+const ROUTE_COST_FAILURE_CATEGORY_ORDER: RouteCostFailureCategory[] = [
+  'rate_limited',
+  'timeout',
+  'upstream_server',
+  'upstream_client',
+  'no_route',
+  'other'
+]
+
+const ROUTE_COST_FAILURE_CATEGORY_LABELS: Record<
+  RouteCostFailureCategory,
+  string
+> = {
+  rate_limited: 'rate limited',
+  timeout: 'timeout',
+  upstream_server: 'upstream 5xx',
+  upstream_client: 'upstream 4xx',
+  no_route: 'no route',
+  other: 'other'
+}
 
 const ROUTE_COST_PROVIDER_ORDER = [
   'across',
@@ -1771,6 +1794,8 @@ function RouteCostsView() {
         <RouteCostActivityLog events={events} nowMs={serverNowMs} />
       </div>
 
+      <RouteCostFailuresPanel events={events} nowMs={serverNowMs} />
+
       {loading && snapshots.length === 0 ? (
         <div className="route-costs-empty">Loading route costs…</div>
       ) : providers.length === 0 ? (
@@ -1898,7 +1923,24 @@ type RouteCostProviderLane = {
   total: number
   succeeded: number
   failed: number
+  skipped: number
   events: RouteCostSampleEvent[]
+}
+
+function routeCostOutcomeClass(outcome: RouteCostSampleEvent['outcome']): string {
+  if (outcome === 'failed') return 'rc-bad'
+  if (outcome === 'skipped') return 'rc-skip'
+  return 'rc-good'
+}
+
+function routeCostOutcomeText(event: RouteCostSampleEvent): string {
+  if (event.outcome === 'failed') {
+    return `failed${event.reason ? `: ${event.reason}` : ''}`
+  }
+  if (event.outcome === 'skipped') {
+    return `too large${event.reason ? `: ${event.reason}` : ''}`
+  }
+  return `${formatRouteCostBps(event.estimatedFeeBps ?? 0)} bps`
 }
 
 function RouteCostScheduleTimeline({
@@ -1934,6 +1976,12 @@ function RouteCostScheduleTimeline({
                   {lane.failed > 0 ? (
                     <span className="route-costs-lane-failed"> · {lane.failed} failed</span>
                   ) : null}
+                  {lane.skipped > 0 ? (
+                    <span className="route-costs-lane-skipped">
+                      {' '}
+                      · {lane.skipped} too large
+                    </span>
+                  ) : null}
                 </span>
               </div>
               <div className="route-costs-lane-track">
@@ -1943,9 +1991,9 @@ function RouteCostScheduleTimeline({
                   return (
                     <span
                       key={event.id}
-                      className={`route-costs-tick ${
-                        event.outcome === 'failed' ? 'rc-bad' : 'rc-good'
-                      }`}
+                      className={`route-costs-tick ${routeCostOutcomeClass(
+                        event.outcome
+                      )}`}
                       style={{ left: `${(ratio * 100).toFixed(3)}%` }}
                       title={routeCostEventTooltip(event, nowMs)}
                     />
@@ -1985,9 +2033,9 @@ function RouteCostActivityLog({
           {recent.map((event) => (
             <li
               key={event.id}
-              className={`route-costs-activity-row ${
-                event.outcome === 'failed' ? 'rc-bad' : 'rc-good'
-              }`}
+              className={`route-costs-activity-row ${routeCostOutcomeClass(
+                event.outcome
+              )}`}
             >
               <span className="route-costs-activity-time">
                 {formatRouteCostAgo(nowMs - Date.parse(event.sampledAt))}
@@ -2004,13 +2052,110 @@ function RouteCostActivityLog({
                 {formatRouteCostTier(event.sampleAmountUsdMicros)}
               </span>
               <span className="route-costs-activity-outcome">
-                {event.outcome === 'failed'
-                  ? `failed${event.reason ? `: ${event.reason}` : ''}`
-                  : `${formatRouteCostBps(event.estimatedFeeBps ?? 0)} bps`}
+                {routeCostOutcomeText(event)}
               </span>
             </li>
           ))}
         </ol>
+      )}
+    </section>
+  )
+}
+
+function routeCostFailureCategory(
+  event: RouteCostSampleEvent
+): RouteCostFailureCategory {
+  const category = event.failureCategory
+  if (category && category in ROUTE_COST_FAILURE_CATEGORY_LABELS) {
+    return category
+  }
+  return 'other'
+}
+
+function RouteCostFailuresPanel({
+  events,
+  nowMs
+}: {
+  events: RouteCostSampleEvent[]
+  nowMs: number
+}) {
+  const failures = useMemo(
+    () => events.filter((event) => event.outcome === 'failed'),
+    [events]
+  )
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<RouteCostFailureCategory, number>()
+    for (const event of failures) {
+      const category = routeCostFailureCategory(event)
+      counts.set(category, (counts.get(category) ?? 0) + 1)
+    }
+    return ROUTE_COST_FAILURE_CATEGORY_ORDER.filter(
+      (category) => counts.has(category)
+    ).map((category) => ({ category, count: counts.get(category) ?? 0 }))
+  }, [failures])
+  const recent = failures.slice(0, ROUTE_COST_FAILURE_LOG_LIMIT)
+
+  return (
+    <section className="route-costs-failures" aria-label="Sampling failures">
+      <header className="route-costs-widget-header">
+        <h2>Sampling failures</h2>
+        <span className="route-costs-widget-sub">
+          {failures.length === 0
+            ? 'none in window'
+            : `${failures.length} in window`}
+        </span>
+      </header>
+      {failures.length === 0 ? (
+        <div className="route-costs-widget-empty">
+          No sampling failures in this window. Failed samples are retried with
+          backoff and logged here with their cause.
+        </div>
+      ) : (
+        <>
+          <div className="route-costs-failure-categories">
+            {categoryCounts.map(({ category, count }) => (
+              <span
+                key={category}
+                className={`rc-failure-badge rc-failure-${category}`}
+              >
+                {ROUTE_COST_FAILURE_CATEGORY_LABELS[category]}
+                <span className="rc-failure-badge-count">{count}</span>
+              </span>
+            ))}
+          </div>
+          <ol className="route-costs-failure-list">
+            {recent.map((event) => {
+              const category = routeCostFailureCategory(event)
+              return (
+                <li className="route-costs-failure-row" key={event.id}>
+                  <span className="route-costs-activity-time">
+                    {formatRouteCostAgo(nowMs - Date.parse(event.sampledAt))}
+                  </span>
+                  <span className="route-costs-activity-provider">
+                    {routeCostProviderLabel(event.provider)}
+                  </span>
+                  <span className="route-costs-activity-pair">
+                    {routeCostAssetLabel(event.source)}
+                    <ArrowRight size={11} />
+                    {routeCostAssetLabel(event.destination)}
+                  </span>
+                  <span className="route-costs-activity-tier">
+                    {formatRouteCostTier(event.sampleAmountUsdMicros)}
+                  </span>
+                  <span className={`rc-failure-badge rc-failure-${category}`}>
+                    {ROUTE_COST_FAILURE_CATEGORY_LABELS[category]}
+                  </span>
+                  <span
+                    className="route-costs-failure-reason"
+                    title={event.reason ?? undefined}
+                  >
+                    {event.reason ?? 'failed'}
+                  </span>
+                </li>
+              )
+            })}
+          </ol>
+        </>
       )}
     </section>
   )
@@ -2028,12 +2173,14 @@ function groupEventsByProvider(
         total: 0,
         succeeded: 0,
         failed: 0,
+        skipped: 0,
         events: []
       }
       byProvider.set(event.provider, lane)
     }
     lane.total += 1
     if (event.outcome === 'failed') lane.failed += 1
+    else if (event.outcome === 'skipped') lane.skipped += 1
     else lane.succeeded += 1
     lane.events.push(event)
   }
@@ -2051,9 +2198,7 @@ function routeCostEventTooltip(event: RouteCostSampleEvent, nowMs: number): stri
       event.source
     )} → ${routeCostAssetLabel(event.destination)}`,
     formatRouteCostTier(event.sampleAmountUsdMicros),
-    event.outcome === 'failed'
-      ? `failed${event.reason ? `: ${event.reason}` : ''}`
-      : `${formatRouteCostBps(event.estimatedFeeBps ?? 0)} bps`,
+    routeCostOutcomeText(event),
     `${formatRouteCostAgo(nowMs - Date.parse(event.sampledAt))} ago`
   ]
   if (event.estimatedLatencyMs !== null && event.outcome === 'succeeded') {

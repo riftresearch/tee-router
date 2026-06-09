@@ -10,10 +10,11 @@ export type RouteCostSampleEventRow = {
   source: { chainId: string; assetId: string }
   destination: { chainId: string; assetId: string }
   sampleAmountUsdMicros: number
-  outcome: 'succeeded' | 'failed'
+  outcome: 'succeeded' | 'failed' | 'skipped'
   estimatedFeeBps: number | null
   estimatedLatencyMs: number | null
   reason: string | null
+  failureCategory: string | null
 }
 
 type RouteCostEventDbRow = {
@@ -32,6 +33,7 @@ type RouteCostEventDbRow = {
   estimated_fee_bps: string | number | null
   estimated_latency_ms: string | number | null
   reason: string | null
+  failure_category: string | null
 }
 
 const ROUTE_COST_EVENTS_SQL = `
@@ -50,7 +52,8 @@ const ROUTE_COST_EVENTS_SQL = `
     outcome,
     estimated_fee_bps,
     estimated_latency_ms,
-    reason
+    reason,
+    failure_category
   FROM public.router_route_cost_sample_events
   WHERE sampled_at >= $1
   ORDER BY sampled_at DESC, id DESC
@@ -95,10 +98,16 @@ function mapRouteCostEventRow(row: RouteCostEventDbRow): RouteCostSampleEventRow
       row.sample_amount_usd_micros,
       'sample_amount_usd_micros'
     ),
-    outcome: row.outcome === 'failed' ? 'failed' : 'succeeded',
+    outcome:
+      row.outcome === 'failed'
+        ? 'failed'
+        : row.outcome === 'skipped'
+          ? 'skipped'
+          : 'succeeded',
     estimatedFeeBps: toNullableNumber(row.estimated_fee_bps),
     estimatedLatencyMs: toNullableNumber(row.estimated_latency_ms),
-    reason: row.reason
+    reason: row.reason,
+    failureCategory: row.failure_category
   }
 }
 

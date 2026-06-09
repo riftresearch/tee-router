@@ -53,6 +53,22 @@ const DUMMY_EVM_RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 /// limits.
 const REFRESH_FANOUT_PERMITS: usize = 16;
 
+/// Maximum number of times the retry queue will re-attempt a failed cell before
+/// giving up and letting the normal paced sweep cover it on the next window.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+/// Upper bound on how many due retries are folded into a single refresh tick,
+/// so retries cannot burst past the one-by-one pacing or the fanout cap.
+const MAX_RETRIES_PER_TICK: usize = 8;
+/// Backoff base/cap for ordinary failures: `base * 2^(attempts-1)`, clamped.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(20);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(300);
+/// Rate-limited failures back off harder so retries do not amplify throttling.
+const RETRY_RATE_LIMITED_BASE_DELAY: Duration = Duration::from_secs(60);
+const RETRY_RATE_LIMITED_MAX_DELAY: Duration = Duration::from_secs(600);
+
+/// Identifies a single cacheable cell: `(transition_id, tier_label)`.
+type RetryKey = (String, String);
+
 /// Cost cache tier. Each tier is one row of `router_route_cost_snapshots`
 /// per transition. Quote-time ranking picks the smallest tier whose
 /// `sample_usd_micros` is at least the request size (round up to be
@@ -181,6 +197,11 @@ impl RouteCostSnapshot {
 pub enum RouteCostSampleOutcome {
     Succeeded,
     Failed,
+    /// The provider was reached but reported a benign, expected condition that
+    /// is not a failure - e.g. the orderbook is too shallow to absorb the
+    /// sampled tier notional. Recorded for visibility, shown neutrally in the
+    /// feed, excluded from the failures panel, and not retried.
+    Skipped,
 }
 
 impl RouteCostSampleOutcome {
@@ -189,8 +210,85 @@ impl RouteCostSampleOutcome {
         match self {
             RouteCostSampleOutcome::Succeeded => "succeeded",
             RouteCostSampleOutcome::Failed => "failed",
+            RouteCostSampleOutcome::Skipped => "skipped",
         }
     }
+}
+
+/// Coarse classification of a failed provider sample, derived heuristically
+/// from the provider error string. Drives both the dashboard failures log and
+/// the retry backoff (rate-limited failures back off harder so we do not
+/// amplify provider throttling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    /// HTTP 429 / "rate limit" / "too many requests".
+    RateLimited,
+    /// Our own provider timeout, or an upstream "timed out".
+    Timeout,
+    /// Provider answered but has no route for this pair/size.
+    NoRoute,
+    /// Upstream 5xx (server-side failure).
+    UpstreamServer,
+    /// Other upstream 4xx (client-side rejection that is not a rate limit).
+    UpstreamClient,
+    /// Anything we could not classify.
+    Other,
+}
+
+impl FailureCategory {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FailureCategory::RateLimited => "rate_limited",
+            FailureCategory::Timeout => "timeout",
+            FailureCategory::NoRoute => "no_route",
+            FailureCategory::UpstreamServer => "upstream_server",
+            FailureCategory::UpstreamClient => "upstream_client",
+            FailureCategory::Other => "other",
+        }
+    }
+}
+
+/// Best-effort classification of a provider sampling failure from its error
+/// string. Heuristic by necessity: provider errors are surfaced as free-text
+/// `String`s, so we match on substrings. Order matters - rate limiting is
+/// checked before the generic 4xx bucket.
+#[must_use]
+pub fn classify_failure(reason: &str) -> FailureCategory {
+    let lower = reason.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+
+    if has("429") || has("rate limit") || has("rate-limit") || has("too many requests") {
+        FailureCategory::RateLimited
+    } else if has("timed out") || has("timeout") {
+        FailureCategory::Timeout
+    } else if has("no route") || has("no available route") || has("returned no route") {
+        FailureCategory::NoRoute
+    } else if has("500") || has("502") || has("503") || has("504") || has("server error") {
+        FailureCategory::UpstreamServer
+    } else if has("400") || has("401") || has("403") || has("404") || has("422") {
+        FailureCategory::UpstreamClient
+    } else {
+        FailureCategory::Other
+    }
+}
+
+/// Detect benign "the sampled amount is simply too large for this venue at this
+/// tier" conditions, as opposed to genuine provider failures. Covers:
+/// - Hyperliquid spot orderbook-depth exhaustion (`could not absorb` /
+///   `could not produce` / `empty book side`).
+/// - Across `AMOUNT_TOO_HIGH` (HTTP 400; the notional exceeds the route cap).
+/// These are recorded as a neutral `skipped` sample rather than a failure, and
+/// are not retried (retrying the same oversized tier cannot succeed).
+#[must_use]
+pub fn is_benign_unsatisfiable_amount(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("could not absorb")
+        || lower.contains("could not produce")
+        || lower.contains("empty book side")
+        || lower.contains("amount_too_high")
+        || lower.contains("amount too high")
 }
 
 /// One provider sample attempt made by the paced refresher. Written to the
@@ -211,8 +309,10 @@ pub struct RouteCostSampleEvent {
     pub estimated_fee_bps: Option<u64>,
     /// Present only when `outcome == Succeeded`.
     pub estimated_latency_ms: Option<u64>,
-    /// Present only when `outcome == Failed`.
+    /// Present when `outcome == Failed` or `outcome == Skipped`.
     pub reason: Option<String>,
+    /// Coarse failure classification. Present only when `outcome == Failed`.
+    pub failure_category: Option<FailureCategory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +356,17 @@ struct ProviderCursor {
     next_unit: usize,
 }
 
+/// A failed cell awaiting re-sampling. Held in [`RouteCostService::retry_queue`]
+/// keyed by [`RetryKey`]. In-memory only: a worker restart simply falls back to
+/// the normal paced sweep, which is the backstop for any dropped retry.
+#[derive(Debug, Clone)]
+struct RetryEntry {
+    transition: TransitionDecl,
+    tier: &'static RouteCostTier,
+    attempts: u32,
+    due_at: DateTime<Utc>,
+}
+
 /// Aggregate counters returned by sampling a set of curated work units.
 #[derive(Debug, Default)]
 struct UnitSampleTotals {
@@ -277,6 +388,10 @@ pub struct RouteCostService {
     /// One paced cursor per provider, keyed by provider id. Each provider
     /// advances independently so venues never bunch against each other.
     refresh_cursors: Arc<Mutex<BTreeMap<String, ProviderCursor>>>,
+    /// Failed cells awaiting an out-of-band retry, keyed by `(transition, tier)`.
+    /// Folded into each refresh tick alongside the paced chunk (see
+    /// [`Self::refresh_due_costs`]) so a failure is re-attempted within seconds.
+    retry_queue: Arc<Mutex<HashMap<RetryKey, RetryEntry>>>,
 }
 
 impl RouteCostService {
@@ -292,6 +407,7 @@ impl RouteCostService {
             pricing_refresh: Arc::new(Mutex::new(())),
             pricing_oracle: None,
             refresh_cursors: Arc::new(Mutex::new(BTreeMap::new())),
+            retry_queue: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -412,11 +528,15 @@ impl RouteCostService {
         let candidate_edges = transitions.len();
         let plan = interleaved_refresh_plan(&transitions);
         let chunk = self.claim_due_units(&plan, now, window).await;
+        // Fold in any failed cells whose backoff has elapsed so they are
+        // re-sampled within seconds instead of waiting the next window sweep.
+        let retries = self.claim_due_retries(now, MAX_RETRIES_PER_TICK).await;
+        let units = merge_paced_and_retries(chunk, retries);
 
-        let totals = if chunk.is_empty() {
+        let totals = if units.is_empty() {
             UnitSampleTotals::default()
         } else {
-            self.sample_and_store_units(chunk, now, expires_at, &pricing)
+            self.sample_and_store_units(units, now, expires_at, &pricing)
                 .await?
         };
 
@@ -491,9 +611,18 @@ impl RouteCostService {
         let mut snapshots = Vec::new();
         let mut events = Vec::new();
         let mut totals = UnitSampleTotals::default();
+        // Cells that no longer need retrying (succeeded, or could not be
+        // attempted at all) and cells that failed and should be (re)scheduled.
+        let mut resolved_keys: Vec<RetryKey> = Vec::new();
+        let mut failed_units: Vec<(TransitionDecl, &'static RouteCostTier, FailureCategory)> =
+            Vec::new();
         while let Some((transition, tier, outcome, elapsed_ms)) = tasks.next().await {
             match outcome {
-                LiveCostSnapshotOutcome::NotAttempted => {}
+                LiveCostSnapshotOutcome::NotAttempted => {
+                    // Nothing reached a provider; stop retrying this cell so we
+                    // do not spin on something we cannot sample.
+                    resolved_keys.push(retry_key(&transition, tier));
+                }
                 LiveCostSnapshotOutcome::Succeeded { snapshot } => {
                     totals.provider_quotes_attempted += 1;
                     totals.provider_quotes_succeeded += 1;
@@ -504,16 +633,38 @@ impl RouteCostService {
                         Some(snapshot.estimated_fee_bps),
                         Some(elapsed_ms),
                         None,
+                        None,
                     ));
+                    // A fresh success clears any pending retry for this cell.
+                    resolved_keys.push(retry_key(&transition, tier));
                     snapshots.push(*snapshot);
+                }
+                LiveCostSnapshotOutcome::Skipped(reason) => {
+                    // Provider reached, but reported a benign expected
+                    // condition (e.g. orderbook too shallow for this tier).
+                    // Record it neutrally and do not retry - the next paced
+                    // sweep re-samples it anyway, and retrying will not help.
+                    totals.provider_quotes_attempted += 1;
+                    events.push(sample_event(
+                        &transition,
+                        tier,
+                        RouteCostSampleOutcome::Skipped,
+                        None,
+                        Some(elapsed_ms),
+                        Some(reason),
+                        None,
+                    ));
+                    resolved_keys.push(retry_key(&transition, tier));
                 }
                 LiveCostSnapshotOutcome::Failed(reason) => {
                     totals.provider_quotes_attempted += 1;
                     totals.provider_quotes_failed += 1;
+                    let category = classify_failure(&reason);
                     debug!(
                         transition_id = %transition.id,
                         provider = transition.provider.as_str(),
                         tier = tier.label,
+                        category = category.as_str(),
                         reason = %reason,
                         "route-cost provider sampling failed; leaving cell uncached"
                     );
@@ -524,12 +675,17 @@ impl RouteCostService {
                         None,
                         Some(elapsed_ms),
                         Some(reason),
+                        Some(category),
                     ));
+                    failed_units.push((transition, tier, category));
                 }
             }
         }
         self.db.route_costs().upsert_many(&snapshots).await?;
         totals.snapshots_upserted = snapshots.len();
+        // Update the in-memory retry queue: clear resolved cells and
+        // (re)schedule the failures with category-aware backoff.
+        self.reschedule_failures(resolved_keys, failed_units).await;
         // The activity feed is best-effort: a write failure here must never
         // fail the refresh cycle (the worker treats refresh errors as fatal to
         // the tick). Log and continue.
@@ -537,6 +693,67 @@ impl RouteCostService {
             warn!(error = %err, "route-cost sample-event feed write failed; continuing");
         }
         Ok(totals)
+    }
+
+    /// Apply the outcome of a sampling pass to the retry queue. Resolved cells
+    /// (succeeded or not-attempted) are dropped; failed cells have their
+    /// attempt count incremented and a fresh `due_at` computed from
+    /// [`retry_delay`], or are abandoned once they exceed
+    /// [`RETRY_MAX_ATTEMPTS`] (the next paced sweep is the backstop).
+    async fn reschedule_failures(
+        &self,
+        resolved: Vec<RetryKey>,
+        failed: Vec<(TransitionDecl, &'static RouteCostTier, FailureCategory)>,
+    ) {
+        if resolved.is_empty() && failed.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let mut queue = self.retry_queue.lock().await;
+        for key in resolved {
+            queue.remove(&key);
+        }
+        for (transition, tier, category) in failed {
+            let key = retry_key(&transition, tier);
+            let attempts = queue.get(&key).map_or(0, |entry| entry.attempts) + 1;
+            if attempts > RETRY_MAX_ATTEMPTS {
+                queue.remove(&key);
+                continue;
+            }
+            let due_at = now
+                + chrono::Duration::from_std(retry_delay(attempts, category))
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            queue.insert(
+                key,
+                RetryEntry {
+                    transition,
+                    tier,
+                    attempts,
+                    due_at,
+                },
+            );
+        }
+    }
+
+    /// Return up to `limit` retry cells whose `due_at` has passed, oldest-due
+    /// first. Entries are left in the queue; [`Self::reschedule_failures`]
+    /// removes or reschedules them after sampling completes.
+    async fn claim_due_retries(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Vec<(TransitionDecl, &'static RouteCostTier)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let queue = self.retry_queue.lock().await;
+        let mut due: Vec<&RetryEntry> =
+            queue.values().filter(|entry| entry.due_at <= now).collect();
+        due.sort_by_key(|entry| entry.due_at);
+        due.into_iter()
+            .take(limit)
+            .map(|entry| (entry.transition.clone(), entry.tier))
+            .collect()
     }
 
     /// Rank `paths` against the request size in USD micros. The returned
@@ -617,11 +834,11 @@ impl RouteCostService {
                 self.live_unit_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
             }
-            MarketOrderTransitionKind::UniversalRouterSwap => {
-                self.live_velora_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
+            MarketOrderTransitionKind::UniversalRouterSwap
+            | MarketOrderTransitionKind::HyperliquidTrade => {
+                self.live_exchange_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
             }
-            MarketOrderTransitionKind::HyperliquidTrade => LiveCostSnapshotOutcome::NotAttempted,
         }
     }
 
@@ -663,7 +880,17 @@ impl RouteCostService {
             Ok(Ok(None)) => {
                 return LiveCostSnapshotOutcome::Failed("provider returned no route".to_string())
             }
-            Ok(Err(err)) => return LiveCostSnapshotOutcome::Failed(err),
+            Ok(Err(err)) => {
+                // "Amount too large for this route" (e.g. Across
+                // `AMOUNT_TOO_HIGH`) is a benign, expected condition at large
+                // notionals - record it as a neutral skip, not a failure, and
+                // do not retry the same oversized tier.
+                return if is_benign_unsatisfiable_amount(&err) {
+                    LiveCostSnapshotOutcome::Skipped(err)
+                } else {
+                    LiveCostSnapshotOutcome::Failed(err)
+                };
+            }
             Err(_) => return LiveCostSnapshotOutcome::Failed("provider timed out".to_string()),
         };
         let amount_out = match U256::from_str(&quote.amount_out) {
@@ -688,10 +915,13 @@ impl RouteCostService {
         )
     }
 
-    /// Live-sample a curated same-chain Velora swap (`USDC <-> USDT`). The
-    /// measured cost is the value loss between the input and the Velora
-    /// `destAmount`, captured as bps + USD micros exactly like a bridge.
-    async fn live_velora_cost_snapshot(
+    /// Live-sample an exchange-quoted leg: a curated same-chain Velora swap
+    /// (`USDC <-> USDT`) or a Hyperliquid spot trade (`USDC <-> UBTC/UETH`).
+    /// The measured cost is the value loss between the input amount and the
+    /// exchange `amount_out`, captured as bps + USD micros exactly like a
+    /// bridge. The exchange provider is resolved by the transition's provider
+    /// id (`velora` / `hyperliquid_spot`).
+    async fn live_exchange_cost_snapshot(
         &self,
         transition: &TransitionDecl,
         refreshed_at: DateTime<Utc>,
@@ -728,9 +958,23 @@ impl RouteCostService {
         let quote = match timeout(ROUTE_COST_PROVIDER_TIMEOUT, exchange.quote_trade(request)).await {
             Ok(Ok(Some(quote))) => quote,
             Ok(Ok(None)) => {
-                return LiveCostSnapshotOutcome::Failed("provider returned no route".to_string())
+                // A swap venue with no route at this size means it cannot fill
+                // the sampled notional (insufficient liquidity) - benign, not a
+                // failure, and not retryable at the same tier.
+                return LiveCostSnapshotOutcome::Skipped(
+                    "no route at this size (insufficient liquidity)".to_string(),
+                );
             }
-            Ok(Err(err)) => return LiveCostSnapshotOutcome::Failed(err),
+            Ok(Err(err)) => {
+                // "Amount too large for this venue/tier" (orderbook too shallow,
+                // amount-too-high) is a benign, expected condition at large
+                // notionals - record it as a neutral skip rather than a failure.
+                return if is_benign_unsatisfiable_amount(&err) {
+                    LiveCostSnapshotOutcome::Skipped(err)
+                } else {
+                    LiveCostSnapshotOutcome::Failed(err)
+                };
+            }
             Err(_) => return LiveCostSnapshotOutcome::Failed("provider timed out".to_string()),
         };
         let amount_out = match U256::from_str(&quote.amount_out) {
@@ -901,6 +1145,7 @@ fn sample_event(
     estimated_fee_bps: Option<u64>,
     estimated_latency_ms: Option<u64>,
     reason: Option<String>,
+    failure_category: Option<FailureCategory>,
 ) -> RouteCostSampleEvent {
     RouteCostSampleEvent {
         sampled_at: Utc::now(),
@@ -915,7 +1160,46 @@ fn sample_event(
         estimated_fee_bps,
         estimated_latency_ms,
         reason,
+        failure_category,
     }
+}
+
+/// Stable key for a single cacheable cell, used by the retry queue and to
+/// dedupe paced work against due retries within a tick.
+fn retry_key(transition: &TransitionDecl, tier: &RouteCostTier) -> RetryKey {
+    (transition.id.clone(), tier.label.to_string())
+}
+
+/// Category-aware exponential backoff: `base * 2^(attempts-1)`, clamped to the
+/// per-category cap. Rate-limited failures use a longer base/cap so retries do
+/// not amplify provider throttling. `attempts` is 1-based (first retry == 1).
+fn retry_delay(attempts: u32, category: FailureCategory) -> Duration {
+    let (base, cap) = match category {
+        FailureCategory::RateLimited => {
+            (RETRY_RATE_LIMITED_BASE_DELAY, RETRY_RATE_LIMITED_MAX_DELAY)
+        }
+        _ => (RETRY_BASE_DELAY, RETRY_MAX_DELAY),
+    };
+    // Clamp the shift so the multiplier cannot overflow; the cap bounds it anyway.
+    let shift = attempts.saturating_sub(1).min(16);
+    base.saturating_mul(1u32 << shift).min(cap)
+}
+
+/// Merge the paced work chunk with due retries, deduping by [`RetryKey`] so a
+/// cell already in the paced slice is not sampled twice in one tick.
+fn merge_paced_and_retries(
+    paced: Vec<(TransitionDecl, &'static RouteCostTier)>,
+    retries: Vec<(TransitionDecl, &'static RouteCostTier)>,
+) -> Vec<(TransitionDecl, &'static RouteCostTier)> {
+    let mut seen: std::collections::HashSet<RetryKey> =
+        paced.iter().map(|(t, tier)| retry_key(t, tier)).collect();
+    let mut units = paced;
+    for (transition, tier) in retries {
+        if seen.insert(retry_key(&transition, tier)) {
+            units.push((transition, tier));
+        }
+    }
+    units
 }
 
 #[async_trait]
@@ -929,6 +1213,10 @@ enum LiveCostSnapshotOutcome {
     NotAttempted,
     Succeeded { snapshot: Box<RouteCostSnapshot> },
     Failed(String),
+    /// Provider reached but reported a benign expected condition (e.g. the
+    /// orderbook is too shallow for this tier). Recorded as a neutral
+    /// `skipped` sample, not a failure, and not retried.
+    Skipped(String),
 }
 
 fn pricing_snapshot_is_fresh(
@@ -1524,6 +1812,132 @@ mod tests {
             id: id.to_string(),
             transitions,
         }
+    }
+
+    #[test]
+    fn classify_failure_buckets_common_provider_errors() {
+        assert_eq!(
+            classify_failure("HTTP 429 Too Many Requests"),
+            FailureCategory::RateLimited
+        );
+        assert_eq!(
+            classify_failure("upstream rate limit exceeded"),
+            FailureCategory::RateLimited
+        );
+        assert_eq!(
+            classify_failure("provider timed out"),
+            FailureCategory::Timeout
+        );
+        assert_eq!(
+            classify_failure("request timeout after 10s"),
+            FailureCategory::Timeout
+        );
+        assert_eq!(
+            classify_failure("provider returned no route"),
+            FailureCategory::NoRoute
+        );
+        assert_eq!(
+            classify_failure("502 Bad Gateway"),
+            FailureCategory::UpstreamServer
+        );
+        assert_eq!(
+            classify_failure("400 Bad Request: invalid token"),
+            FailureCategory::UpstreamClient
+        );
+        assert_eq!(
+            classify_failure("provider amount_out was not numeric: x"),
+            FailureCategory::Other
+        );
+    }
+
+    #[test]
+    fn benign_unsatisfiable_amount_is_detected() {
+        assert!(is_benign_unsatisfiable_amount(
+            "hyperliquid quote: book side could not absorb remaining input 904951000"
+        ));
+        assert!(is_benign_unsatisfiable_amount(
+            "hyperliquid quote: book side could not produce remaining output 12"
+        ));
+        assert!(is_benign_unsatisfiable_amount(
+            "hyperliquid quote: empty book side"
+        ));
+        assert!(is_benign_unsatisfiable_amount(
+            "Across returned HTTP 400: {\"type\":\"AcrossApiError\",\"code\":\"AMOUNT_TOO_HIGH\",\"status\":400}"
+        ));
+        assert!(!is_benign_unsatisfiable_amount("429 Too Many Requests"));
+        assert!(!is_benign_unsatisfiable_amount("provider timed out"));
+        assert!(!is_benign_unsatisfiable_amount("400 Bad Request: invalid token"));
+    }
+
+    #[test]
+    fn retry_delay_grows_exponentially_and_clamps() {
+        assert_eq!(
+            retry_delay(1, FailureCategory::Other),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            retry_delay(2, FailureCategory::Other),
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            retry_delay(3, FailureCategory::Other),
+            Duration::from_secs(80)
+        );
+        // Eventually clamps to the per-category cap.
+        assert_eq!(retry_delay(10, FailureCategory::Other), RETRY_MAX_DELAY);
+        // Monotonic non-decreasing across attempts.
+        let mut prev = Duration::ZERO;
+        for attempts in 1..=8 {
+            let delay = retry_delay(attempts, FailureCategory::Other);
+            assert!(delay >= prev, "delay should not shrink at attempt {attempts}");
+            prev = delay;
+        }
+    }
+
+    #[test]
+    fn retry_delay_rate_limited_backs_off_harder() {
+        assert_eq!(
+            retry_delay(1, FailureCategory::RateLimited),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            retry_delay(20, FailureCategory::RateLimited),
+            RETRY_RATE_LIMITED_MAX_DELAY
+        );
+        for attempts in 1..=6 {
+            assert!(
+                retry_delay(attempts, FailureCategory::RateLimited)
+                    >= retry_delay(attempts, FailureCategory::Other),
+                "rate-limited backoff must be >= ordinary backoff at attempt {attempts}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_paced_and_retries_dedupes_by_cell() {
+        let tier = &ROUTE_COST_TIERS[0];
+        let t1 = transition("across:eth->base", MarketOrderTransitionKind::AcrossBridge);
+        let t2 = transition("cctp:eth->base", MarketOrderTransitionKind::CctpBridge);
+        let paced = vec![(t1.clone(), tier)];
+        // t1 duplicates the paced cell; t2 is new.
+        let retries = vec![(t1.clone(), tier), (t2.clone(), tier)];
+        let merged = merge_paced_and_retries(paced, retries);
+        assert_eq!(merged.len(), 2);
+        let keys: Vec<RetryKey> = merged.iter().map(|(t, ti)| retry_key(t, ti)).collect();
+        assert!(keys.contains(&retry_key(&t1, tier)));
+        assert!(keys.contains(&retry_key(&t2, tier)));
+    }
+
+    #[test]
+    fn merge_paced_and_retries_distinguishes_tiers() {
+        let t1 = transition("across:eth->base", MarketOrderTransitionKind::AcrossBridge);
+        let tier_a = &ROUTE_COST_TIERS[0];
+        let tier_b = &ROUTE_COST_TIERS[1];
+        let paced = vec![(t1.clone(), tier_a)];
+        // Same transition at a different tier is a distinct cell.
+        let retries = vec![(t1.clone(), tier_b)];
+        let merged = merge_paced_and_retries(paced, retries);
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]

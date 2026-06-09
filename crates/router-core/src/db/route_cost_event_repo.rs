@@ -47,9 +47,10 @@ impl RouteCostEventRepository {
                     outcome,
                     estimated_fee_bps,
                     estimated_latency_ms,
-                    reason
+                    reason,
+                    failure_category
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 "#,
             )
             .bind(event.sampled_at)
@@ -66,6 +67,7 @@ impl RouteCostEventRepository {
             .bind(event.estimated_fee_bps.and_then(u64_to_i64))
             .bind(event.estimated_latency_ms.and_then(u64_to_i64))
             .bind(event.reason.as_deref())
+            .bind(event.failure_category.map(|category| category.as_str()))
             .execute(&mut *tx)
             .await;
             if let Err(err) = result {
@@ -117,5 +119,6 @@ mod tests {
     fn outcome_round_trips_to_db_text() {
         assert_eq!(RouteCostSampleOutcome::Succeeded.as_str(), "succeeded");
         assert_eq!(RouteCostSampleOutcome::Failed.as_str(), "failed");
+        assert_eq!(RouteCostSampleOutcome::Skipped.as_str(), "skipped");
     }
 }
