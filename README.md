@@ -57,6 +57,6 @@ cargo run -p temporal-worker -- worker
 
 ## Action Providers
 
-Market-order quoting and execution are composed from provider-specific adapters inside the router. Configure multihop execution provider base URLs with `ACROSS_API_URL`, `CCTP_API_URL`, `HYPERUNIT_API_URL`, `HYPERLIQUID_API_URL`, and `VELORA_API_URL`. Quote-only single-hop venues are enabled independently with `RELAY_API_URL`, `NEAR_INTENTS_API_URL`, `MAYAN_API_URL`, `CHAINFLIP_API_URL`, and `GARDEN_API_URL`/`GARDEN_API_KEY`; they compete with the multihop engine for `/quote` responses but are rejected for order execution until venue execution support is added.
+Market-order quoting and execution are composed from provider-specific adapters inside the router. Configure multihop execution provider base URLs with `ACROSS_API_URL`, `CCTP_API_URL`, `HYPERUNIT_API_URL`, `HYPERLIQUID_API_URL`, and `VELORA_API_URL`. Quote-only single-hop venues are enabled independently with `RELAY_API_URL`, `NEAR_INTENTS_API_URL`, `MAYAN_API_URL`, `CHAINFLIP_API_URL`, `GARDEN_API_URL`/`GARDEN_API_KEY`, and `CHANGENOW_API_URL`/`CHANGENOW_API_KEY`; they compete with the multihop engine for `/quote` responses but are rejected for order execution until venue execution support is added.
 
 The current HTTP adapters and mock integrators exercise the router provider contract. They are not yet sufficient to point directly at real money provider APIs. Track the live-money readiness checklist in `docs/live-real-money-readiness.md` before running a funded route.

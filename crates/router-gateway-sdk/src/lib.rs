@@ -55,6 +55,7 @@ pub enum ProviderId {
     Mayan,
     Chainflip,
     Garden,
+    Changenow,
 }
 
 impl ProviderId {
@@ -72,6 +73,7 @@ impl ProviderId {
             "mayan" => Some(Self::Mayan),
             "chainflip" => Some(Self::Chainflip),
             "garden" => Some(Self::Garden),
+            "changenow" => Some(Self::Changenow),
             _ => None,
         }
     }

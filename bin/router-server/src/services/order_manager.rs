@@ -13,6 +13,7 @@ use crate::{
 use alloy::primitives::U256;
 use chains::ChainRegistry;
 use chrono::{Duration as ChronoDuration, Utc};
+use futures_util::future::join_all;
 use router_core::{
     config::Settings,
     db::Database,
@@ -55,13 +56,12 @@ use router_core::{
 use router_primitives::ChainType;
 use serde_json::{json, Value};
 use snafu::Snafu;
+use std::str::FromStr;
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
-use futures_util::future::join_all;
-use std::str::FromStr;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -471,7 +471,6 @@ impl OrderManager {
             Err(err) => return Err(err),
         };
         let provider_quote = provider_selection.quote;
-
 
         let now = Utc::now();
         let expected_swap_time_ms = self
@@ -1076,12 +1075,12 @@ impl OrderManager {
         let chosen = match outcome.chosen {
             Some(chosen) => chosen,
             None => {
-                return Err(outcome.last_error.unwrap_or_else(|| {
-                    MarketOrderError::NoRoute {
+                return Err(outcome
+                    .last_error
+                    .unwrap_or_else(|| MarketOrderError::NoRoute {
                         reason: "no executable transition path satisfied the requested constraints"
                             .to_string(),
-                    }
-                }));
+                    }));
             }
         };
         // Multi-hop contributes exactly ONE quote-candidate: the winning path.
@@ -1209,12 +1208,22 @@ impl OrderManager {
         counts.top_paths = ranked.len().min(LIVE_QUOTE_TOP_N);
 
         let provider_policy_snapshot = if let Some(service) = self.provider_policies.as_ref() {
-            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
         } else {
             None
         };
         let provider_health_snapshot = if let Some(service) = self.provider_health.as_ref() {
-            Some(service.snapshot().await.map_err(MarketOrderError::database)?)
+            Some(
+                service
+                    .snapshot()
+                    .await
+                    .map_err(MarketOrderError::database)?,
+            )
         } else {
             None
         };
@@ -1370,8 +1379,16 @@ impl OrderManager {
         // the dashboard shows the full cross-family comparison a real `/quote`
         // makes (production runs both branches in parallel too).
         let (outcome, single_hop) = tokio::join!(
-            self.run_market_quote_pipeline(&normalized_request, quote_id, &source_depositor_address),
-            self.explain_single_hop_venues(&normalized_request, quote_id, &source_depositor_address),
+            self.run_market_quote_pipeline(
+                &normalized_request,
+                quote_id,
+                &source_depositor_address
+            ),
+            self.explain_single_hop_venues(
+                &normalized_request,
+                quote_id,
+                &source_depositor_address
+            ),
         );
         let outcome = outcome?;
 
@@ -1488,12 +1505,15 @@ impl OrderManager {
                 .get(id)
                 .map(|out| (id.to_string(), out.clone()))
         });
-        let single_hop_best = single_hop.iter().find(|venue| venue.best).and_then(|venue| {
-            venue
-                .estimated_amount_out
-                .clone()
-                .map(|out| (venue.provider.clone(), out))
-        });
+        let single_hop_best = single_hop
+            .iter()
+            .find(|venue| venue.best)
+            .and_then(|venue| {
+                venue
+                    .estimated_amount_out
+                    .clone()
+                    .map(|out| (venue.provider.clone(), out))
+            });
         let overall_winner = match (multi_hop_best, single_hop_best) {
             (Some((mh_label, mh_out)), Some((sh_label, sh_out))) => {
                 let mh_value = U256::from_str(&mh_out).unwrap_or_default();
@@ -1590,6 +1610,21 @@ impl OrderManager {
             return Vec::new();
         };
 
+        let Some(source_decimals) = self
+            .asset_registry
+            .chain_asset(&request.source_asset)
+            .map(|asset| asset.decimals)
+        else {
+            return Vec::new();
+        };
+        let Some(destination_decimals) = self
+            .asset_registry
+            .chain_asset(&request.destination_asset)
+            .map(|asset| asset.decimals)
+        else {
+            return Vec::new();
+        };
+
         let mut views: Vec<SingleHopVenueView> = Vec::new();
         let mut tasks = tokio::task::JoinSet::new();
         for provider in providers {
@@ -1611,7 +1646,9 @@ impl OrderManager {
             }
             let provider_request = SingleHopQuoteRequest {
                 source_asset: request.source_asset.clone(),
+                source_decimals,
                 destination_asset: request.destination_asset.clone(),
+                destination_decimals,
                 amount_in: request.amount_in.clone(),
                 source_depositor_address: source_depositor_address.to_string(),
                 destination_recipient_address: destination_recipient_address.clone(),
@@ -1764,26 +1801,23 @@ impl OrderManager {
         if unique.is_empty() {
             return std::collections::HashMap::new();
         }
-        let tier_label = router_core::services::route_costs::select_route_cost_tier(
-            request_usd_micros,
-        )
-        .label
-        .to_string();
+        let tier_label =
+            router_core::services::route_costs::select_route_cost_tier(request_usd_micros)
+                .label
+                .to_string();
         let sample_futures = unique.into_values().map(|decl| {
             let tier_label = tier_label.clone();
             async move {
-                self.sample_one_velora_leg(
-                    request,
-                    &decl,
-                    request_usd_micros,
-                    pricing,
-                    &tier_label,
-                )
-                .await
-                .map(|snapshot| (decl.id.clone(), snapshot))
+                self.sample_one_velora_leg(request, &decl, request_usd_micros, pricing, &tier_label)
+                    .await
+                    .map(|snapshot| (decl.id.clone(), snapshot))
             }
         });
-        join_all(sample_futures).await.into_iter().flatten().collect()
+        join_all(sample_futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Shared candidate-selection pipeline used by both the real `/quote` path
@@ -1865,7 +1899,9 @@ impl OrderManager {
     ) -> Option<RouteCostSnapshot> {
         const VELORA_PROBE_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 
-        let exchange = self.action_providers.exchange(transition.provider.as_str())?;
+        let exchange = self
+            .action_providers
+            .exchange(transition.provider.as_str())?;
 
         // Determine the input amount to quote.
         let amount_in = if transition.input.asset.chain == request.source_asset.chain
@@ -1962,7 +1998,11 @@ impl OrderManager {
         use crate::api::{RouteExplainGraph, RouteExplainGraphEdge, RouteExplainGraphNode};
         use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
-        let source_key = format!("external:{}:{}", source.chain.as_str(), source.asset.as_str());
+        let source_key = format!(
+            "external:{}:{}",
+            source.chain.as_str(),
+            source.asset.as_str()
+        );
         let dest_key = format!(
             "external:{}:{}",
             destination.chain.as_str(),
@@ -1982,8 +2022,14 @@ impl OrderManager {
         for decl in &declarations {
             let (from_key, from_node) = self.explain_graph_node(&decl.from);
             let (to_key, to_node) = self.explain_graph_node(&decl.to);
-            forward.entry(from_key.clone()).or_default().push(to_key.clone());
-            backward.entry(to_key.clone()).or_default().push(from_key.clone());
+            forward
+                .entry(from_key.clone())
+                .or_default()
+                .push(to_key.clone());
+            backward
+                .entry(to_key.clone())
+                .or_default()
+                .push(from_key.clone());
             node_meta.entry(from_key).or_insert(from_node);
             node_meta.entry(to_key).or_insert(to_node);
         }
@@ -2124,11 +2170,9 @@ impl OrderManager {
     /// amount-aware ranking. Falls back to `DEFAULT_SAMPLE_AMOUNT_USD_MICROS`
     /// when the source asset has no pricing row, so ranking degrades to
     /// today's behaviour rather than failing the request.
-    async fn market_request_usd_micros(
-        &self,
-        request: &NormalizedMarketOrderQuoteRequest,
-    ) -> u64 {
-        self.request_usd_micros(&request.source_asset, &request.amount_in).await
+    async fn market_request_usd_micros(&self, request: &NormalizedMarketOrderQuoteRequest) -> u64 {
+        self.request_usd_micros(&request.source_asset, &request.amount_in)
+            .await
     }
 
     async fn request_usd_micros(&self, source_asset: &DepositAsset, amount_in: &str) -> u64 {
@@ -2243,6 +2287,29 @@ impl OrderManager {
         let destination_recipient_address =
             self.quote_address_for_chain(quote_id, &request.destination_asset.chain)?;
         let refund_address = self.quote_address_for_chain(quote_id, &request.source_asset.chain)?;
+        let source_decimals = self
+            .asset_registry
+            .chain_asset(&request.source_asset)
+            .map(|asset| asset.decimals)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: format!(
+                    "single-hop source asset {} on {} has no registered decimals",
+                    request.source_asset.asset.as_str(),
+                    request.source_asset.chain.as_str()
+                ),
+            })?;
+        let destination_decimals = self
+            .asset_registry
+            .chain_asset(&request.destination_asset)
+            .map(|asset| asset.decimals)
+            .ok_or_else(|| MarketOrderError::NoRoute {
+                reason: format!(
+                    "single-hop destination asset {} on {} has no registered decimals",
+                    request.destination_asset.asset.as_str(),
+                    request.destination_asset.chain.as_str()
+                ),
+            })?;
+
         let mut candidates = include_candidates.then(Vec::new);
         let mut tasks = tokio::task::JoinSet::new();
         for provider in providers {
@@ -2266,7 +2333,9 @@ impl OrderManager {
             }
             let provider_request = SingleHopQuoteRequest {
                 source_asset: request.source_asset.clone(),
+                source_decimals,
                 destination_asset: request.destination_asset.clone(),
+                destination_decimals,
                 amount_in: request.amount_in.clone(),
                 source_depositor_address: source_depositor_address.to_string(),
                 destination_recipient_address: destination_recipient_address.clone(),
@@ -5349,7 +5418,6 @@ mod tests {
         };
         assert!(reason.contains("cannot mix transition providers with single-hop"));
     }
-
 
     #[test]
     fn amount_parser_rejects_oversized_decimal_strings_before_u256_parse() {

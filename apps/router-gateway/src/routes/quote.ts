@@ -29,7 +29,8 @@ const ProviderIdSchema = z.enum([
   'near_intents',
   'mayan',
   'chainflip',
-  'garden'
+  'garden',
+  'changenow'
 ])
 
 const QuoteRoutingSchema = z

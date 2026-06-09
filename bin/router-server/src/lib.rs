@@ -292,6 +292,18 @@ pub struct RouterServerArgs {
     #[arg(long, env = "GARDEN_PROXY_URL")]
     pub garden_proxy_url: Option<String>,
 
+    /// ChangeNOW quote API base URL
+    #[arg(long, env = "CHANGENOW_API_URL")]
+    pub changenow_api_url: Option<String>,
+
+    /// ChangeNOW API key sent as x-changenow-api-key
+    #[arg(long, env = "CHANGENOW_API_KEY")]
+    pub changenow_api_key: Option<String>,
+
+    /// Optional ChangeNOW SOCKS5 proxy URL
+    #[arg(long, env = "CHANGENOW_PROXY_URL")]
+    pub changenow_proxy_url: Option<String>,
+
     /// Hyperliquid paymaster private key used as the recovery/sweep destination
     /// for released internal Hyperliquid custody
     #[arg(long, env = "HYPERLIQUID_PAYMASTER_PRIVATE_KEY")]
