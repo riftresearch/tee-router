@@ -132,6 +132,22 @@ const RANDOM_ROUTES: &[RandomRoute] = &[
         LimitAsset::Eth,
     ),
     RandomRoute::new(
+        "Bitcoin.BTC",
+        "Base.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
+    ),
+    RandomRoute::new(
+        "Bitcoin.BTC",
+        "Arbitrum.USDC",
+        RandomAddressKind::Bitcoin,
+        RandomAddressKind::Evm,
+        LimitAsset::Btc,
+        LimitAsset::Usdc,
+    ),
+    RandomRoute::new(
         "Base.ETH",
         "Base.USDC",
         RandomAddressKind::Evm,
@@ -1581,9 +1597,18 @@ fn quote_input_for_task(
         return Err(eyre!("limit orders are disabled"));
     }
 
-    let route = RANDOM_ROUTES
+    let available_routes: Vec<&RandomRoute> = RANDOM_ROUTES
+        .iter()
+        .filter(|r| {
+            let needs_btc = r.source_kind == RandomAddressKind::Bitcoin
+                || r.destination_kind == RandomAddressKind::Bitcoin;
+            !needs_btc || random_context.bitcoin_address.is_some()
+        })
+        .collect();
+    let route = available_routes
         .choose(rng)
         .ok_or_else(|| eyre!("random route list is empty"))?
+        .to_owned()
         .to_owned();
     let notional_usdc_raw =
         rng.gen_range(command.random_min_raw_amount..=command.random_max_raw_amount);
