@@ -38,3 +38,5 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `start_paused` runtimes for deterministic TTL/single-flight cache tests.
+tokio = { workspace = true, features = ["test-util"] }

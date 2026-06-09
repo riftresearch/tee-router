@@ -13,6 +13,7 @@ use crate::{
             HyperliquidCallNetwork, HyperliquidCallPayload,
         },
         http_body::{read_limited_response_text, response_body_error_preview},
+        hyperliquid_books::{HlBookCache, HttpL2BookSource, TieredBook, HL_BOOK_CACHE_TTL},
         pricing::checked_pow10,
         upstream_proxy::ProxyUrl,
     },
@@ -31,10 +32,8 @@ use hyperliquid_client::{
     actions::{Actions as HyperliquidActions, BulkOrder, Limit, Order, OrderRequest, Tif},
     bridge::{bridge_address as hyperliquid_bridge_address, minimum_bridge_deposit},
     client::Network as HyperliquidApiNetwork,
-    info::{
-        ClearinghouseState, L2BookSnapshot, L2Level, OrderStatusResponse, SpotClearinghouseState,
-        UserFill,
-    },
+    info::{ClearinghouseState, L2Level, OrderStatusResponse, SpotClearinghouseState, UserFill},
+    l2book::{next_label, prev_label},
     meta::{spot_wire_asset_index, SpotMeta, TokenInfo},
     HttpClient as HyperliquidHttpClient,
 };
@@ -4068,6 +4067,9 @@ pub struct HyperliquidProvider {
     target_base_url: String,
     order_timeout_ms: u64,
     spot_meta: Arc<OnceCell<SpotMeta>>,
+    /// Per-pair multi-resolution `l2Book` cache. The waterfall-stitch quote
+    /// path reads through this instead of fetching per quote.
+    books: HlBookCache,
 }
 
 /// HL spot pairs always quote against USDC. Hardcoding the symbol avoids
@@ -4102,6 +4104,10 @@ impl HyperliquidProvider {
         let target_base_url = normalize_base_url(base_url)?;
         let http =
             HyperliquidHttpClient::new(rustls_http_client(proxy_url)?, target_base_url.clone());
+        let books = HlBookCache::new(
+            Arc::new(HttpL2BookSource::new(http.clone())),
+            HL_BOOK_CACHE_TTL,
+        );
         Ok(Self {
             network,
             asset_registry,
@@ -4109,6 +4115,7 @@ impl HyperliquidProvider {
             target_base_url,
             order_timeout_ms,
             spot_meta: Arc::new(OnceCell::new()),
+            books,
         })
     }
 
@@ -4184,17 +4191,6 @@ impl HyperliquidProvider {
         Ok((wire_asset, pair.name.clone(), base.clone(), quote.clone()))
     }
 
-    /// Fetch `/info l2Book` for a spot pair (e.g. `"UBTC/USDC"`). HL returns a
-    /// snapshot with bids at `levels[0]` (descending px) and asks at
-    /// `levels[1]` (ascending px).
-    async fn fetch_l2_book(&self, pair_coin: &str) -> ProviderResult<L2BookSnapshot> {
-        let req = json!({ "type": "l2Book", "coin": pair_coin });
-        self.http
-            .post_json::<_, L2BookSnapshot>("/info", &req)
-            .await
-            .map_err(|err| format!("fetch hyperliquid l2Book {pair_coin}: {err}"))
-    }
-
     /// Single-leg cross-token quote (one side is USDC). Walks the
     /// `{base}/USDC` book to compute the other side of the trade.
     async fn quote_single_leg(
@@ -4210,7 +4206,7 @@ impl HyperliquidProvider {
         let (_, pair_name, base_meta, _) = self
             .resolve_spot_pair(&base_symbol, HL_QUOTE_SYMBOL)
             .await?;
-        let book = self.fetch_l2_book(&pair_name).await?;
+        let books = self.books.pair_books(&pair_name).await?;
 
         let (amount_in_wire, amount_out_wire) = simulate_leg(
             is_buy,
@@ -4218,7 +4214,7 @@ impl HyperliquidProvider {
             output_decimals,
             base_meta.sz_decimals,
             &request.order_kind,
-            &book,
+            &books.tiers,
         )?;
 
         let leg = hl_leg_descriptor(
@@ -4261,8 +4257,8 @@ impl HyperliquidProvider {
         let (_, output_pair_name, output_base_meta, _) = self
             .resolve_spot_pair(output_token, HL_QUOTE_SYMBOL)
             .await?;
-        let sell_book = self.fetch_l2_book(&input_pair_name).await?;
-        let buy_book = self.fetch_l2_book(&output_pair_name).await?;
+        let sell_books = self.books.pair_books(&input_pair_name).await?;
+        let buy_books = self.books.pair_books(&output_pair_name).await?;
 
         let usdc_asset = DepositAsset {
             chain: ChainId::parse("hyperliquid")
@@ -4294,7 +4290,7 @@ impl HyperliquidProvider {
                         // outer user bound on the final output.
                         min_amount_out: Some("1".to_string()),
                     },
-                    &sell_book,
+                    &sell_books.tiers,
                 )?;
                 // Leg 2: BUY output with all the USDC from leg 1 (exact_in).
                 let (_, output_from_leg2) = simulate_leg(
@@ -4306,7 +4302,7 @@ impl HyperliquidProvider {
                         amount_in: usdc_from_leg1.clone(),
                         min_amount_out: min_amount_out.clone(),
                     },
-                    &buy_book,
+                    &buy_books.tiers,
                 )?;
                 (
                     amount_in.clone(),
@@ -4329,7 +4325,7 @@ impl HyperliquidProvider {
                         amount_out: amount_out.clone(),
                         max_amount_in: Some(PRACTICAL_USDC_MAX_WIRE_STR.to_string()),
                     },
-                    &buy_book,
+                    &buy_books.tiers,
                 )?;
                 // Leg 1: SELL input to cover `usdc_for_leg2` — how much input?
                 let (input_for_leg1, _) = simulate_leg(
@@ -4341,7 +4337,7 @@ impl HyperliquidProvider {
                         amount_out: usdc_for_leg2.clone(),
                         max_amount_in: max_amount_in.clone(),
                     },
-                    &sell_book,
+                    &sell_books.tiers,
                 )?;
                 (
                     input_for_leg1,
@@ -6164,8 +6160,9 @@ const PRACTICAL_USDC_MAX_WIRE_STR: &str = "1000000000000000";
 const HL_PRICE_DECIMALS: u8 = 8;
 
 /// Simulate filling a marketable slippage-bounded limit order against the
-/// current L2 book. Returns the pair of wire amounts `(amount_in, amount_out)`
-/// the leg would realise at quote time:
+/// current multi-resolution L2 book set (`tiers`, fine → coarse). Returns the
+/// pair of wire amounts `(amount_in, amount_out)` the leg would realise at
+/// quote time:
 ///
 /// - `is_buy = true`  walks asks (ascending px) spending USDC for base.
 /// - `is_buy = false` walks bids (descending px) selling base for USDC.
@@ -6174,18 +6171,40 @@ const HL_PRICE_DECIMALS: u8 = 8;
 /// `exact_out` walks forward until the target output is reached. Both modes
 /// enforce the user-supplied slippage bound (`min_amount_out` / `max_amount_in`)
 /// against the final totals so a book that isn't deep enough fails quoting.
+///
+/// The walked level sequence is the waterfall stitch of the tiers (design doc
+/// §4.3): orders that fill inside the finest tier price identically to a
+/// single-book walk, and larger orders continue into coarser tiers strictly
+/// beyond the finer tiers' coverage. Coarse bucket labels round away from the
+/// spread, so the stitched tail is priced taker-pessimistically.
 fn simulate_leg(
     is_buy: bool,
     input_decimals: u8,
     output_decimals: u8,
     base_sz_decimals: u8,
     order_kind: &ProviderOrderKind,
-    book: &L2BookSnapshot,
+    tiers: &[TieredBook],
 ) -> ProviderResult<(String, String)> {
-    let side: &[L2Level] = if is_buy { book.asks() } else { book.bids() };
-    if side.is_empty() {
+    let fine_side_is_empty = tiers.first().is_none_or(|tier| {
+        let side = if is_buy {
+            tier.book.asks()
+        } else {
+            tier.book.bids()
+        };
+        side.is_empty()
+    });
+    if fine_side_is_empty {
         return Err("hyperliquid quote: empty book side".to_string());
     }
+    // The base token is the non-USDC side of the pair: the output of a buy,
+    // the input of a sell. Book px/sz parsing is denominated in base.
+    let base_decimals = if is_buy {
+        output_decimals
+    } else {
+        input_decimals
+    };
+    let stitched = stitch_book_levels(is_buy, base_decimals, tiers)?;
+    let side = stitched.as_slice();
 
     match order_kind {
         ProviderOrderKind::ExactIn {
@@ -6237,6 +6256,76 @@ fn simulate_leg(
     }
 }
 
+/// Assemble the walkable level sequence across `tiers` (fine → coarse) for
+/// one book side — the waterfall stitch of design doc §4.3.
+///
+/// The tiers are overlapping re-aggregations of the same resting orders, so a
+/// coarser tier may only contribute buckets that lie entirely beyond the
+/// finer tiers' coverage frontier. A tier's 20 levels cover *all* orders
+/// priced at-or-better than its last label (§4.2), so after each tier the
+/// frontier advances to that label — computed from the unfiltered side,
+/// because covered-by-finer buckets still attest coverage even though they
+/// are not walked. An ask bucket labeled `L` with step `S` contains orders
+/// priced in `(L−S, L]` (bids mirror as `[L, L+S)`), so a coarse bucket is
+/// included only when its full extent clears the frontier; the one bucket
+/// straddling the boundary is discarded by construction — its size is
+/// part-already-counted and cannot be split (§4.3, conservative in the safe
+/// direction).
+///
+/// Asks ascend and bids descend in price across each seam by construction of
+/// the filter, so the stitched sequence walks exactly like a single book side.
+fn stitch_book_levels(
+    is_buy: bool,
+    base_decimals: u8,
+    tiers: &[TieredBook],
+) -> ProviderResult<Vec<ParsedBookLevel>> {
+    let mut stitched = Vec::new();
+    let mut frontier: Option<u128> = None;
+    for tier in tiers {
+        let side = if is_buy {
+            tier.book.asks()
+        } else {
+            tier.book.bids()
+        };
+        let mut tier_last_label = None;
+        for level in side {
+            let Some(parsed) = parse_hl_book_level(level, base_decimals)? else {
+                continue;
+            };
+            let label = book_px_label(parsed.price_raw)?;
+            tier_last_label = Some(label);
+            let beyond_frontier = frontier.is_none_or(|frontier| {
+                if is_buy {
+                    prev_label(label, tier.resolution) >= frontier
+                } else {
+                    next_label(label, tier.resolution) <= frontier
+                }
+            });
+            if beyond_frontier {
+                stitched.push(parsed);
+            }
+        }
+        // Asks ascend / bids descend, so the side's last level is its
+        // worst-priced label: the new coverage frontier for this tier.
+        if let Some(last_label) = tier_last_label {
+            frontier = Some(match frontier {
+                None => last_label,
+                Some(frontier) if is_buy => frontier.max(last_label),
+                Some(frontier) => frontier.min(last_label),
+            });
+        }
+    }
+    Ok(stitched)
+}
+
+/// A parsed book px as the `u128` raw value the label math in
+/// `hyperliquid_client::l2book` operates on. Unreachable for real HL prices
+/// (≤5 sig figs at 8 decimals), kept checked for the error idiom.
+fn book_px_label(price_raw: U256) -> ProviderResult<u128> {
+    u128::try_from(price_raw)
+        .map_err(|_| format!("hyperliquid quote: book px {price_raw} exceeded u128 label range"))
+}
+
 /// Walk a book side spending exactly `input_raw` - USDC when `is_buy`, base
 /// otherwise - and return the output amount in router wire units. Base-side
 /// executable amounts are quantized to `base_sz_decimals`.
@@ -6245,7 +6334,7 @@ fn walk_book_exact_in(
     input_raw: U256,
     input_decimals: u8,
     output_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     if is_buy {
@@ -6274,7 +6363,7 @@ fn walk_book_exact_out(
     output_raw: U256,
     input_decimals: u8,
     output_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     if is_buy {
@@ -6300,7 +6389,7 @@ fn walk_buy_exact_in(
     usdc_input_raw: U256,
     usdc_decimals: u8,
     base_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
@@ -6313,9 +6402,6 @@ fn walk_buy_exact_in(
             exhausted_book = false;
             break;
         }
-        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
-            continue;
-        };
         let affordable = max_base_for_usdc_budget(usdc_remaining, level.price_raw, scales)?;
         if affordable.is_zero() {
             exhausted_book = false;
@@ -6351,7 +6437,7 @@ fn walk_sell_exact_in(
     base_input_raw: U256,
     base_decimals: u8,
     usdc_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
@@ -6362,9 +6448,6 @@ fn walk_sell_exact_in(
         if base_remaining.is_zero() {
             break;
         }
-        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
-            continue;
-        };
         let base_taken = base_remaining.min(level.base_size_raw);
         let usdc_gained = base_to_usdc_raw_floor(base_taken, level.price_raw, scales)?;
         usdc_total = checked_add_u256(
@@ -6387,7 +6470,7 @@ fn walk_buy_exact_out(
     base_output_raw: U256,
     usdc_decimals: u8,
     base_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
@@ -6398,9 +6481,6 @@ fn walk_buy_exact_out(
         if base_remaining.is_zero() {
             break;
         }
-        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
-            continue;
-        };
         let base_taken = base_remaining.min(level.base_size_raw);
         let usdc_spent = base_to_usdc_raw_ceil(base_taken, level.price_raw, scales)?;
         usdc_total = checked_add_u256(
@@ -6423,7 +6503,7 @@ fn walk_sell_exact_out(
     usdc_output_raw: U256,
     base_decimals: u8,
     usdc_decimals: u8,
-    side: &[L2Level],
+    side: &[ParsedBookLevel],
     base_sz_decimals: u8,
 ) -> ProviderResult<U256> {
     let scales = BookWalkScales::new(base_decimals, usdc_decimals, base_sz_decimals)?;
@@ -6434,9 +6514,6 @@ fn walk_sell_exact_out(
         if usdc_remaining.is_zero() {
             break;
         }
-        let Some(level) = parse_hl_book_level(level, base_decimals)? else {
-            continue;
-        };
         let full_level_output =
             base_to_usdc_raw_floor(level.base_size_raw, level.price_raw, scales)?;
         if full_level_output.is_zero() {
@@ -7473,11 +7550,13 @@ mod hyperliquid_math_tests {
             custody_action_executor::{
                 ChainCall, CustodyAction, CustodyActionReceipt, HyperliquidCallPayload,
             },
+            hyperliquid_books::TieredBook,
             AssetRegistry, CanonicalAsset, ProviderAsset, ProviderAssetCapability, ProviderId,
         },
     };
     use alloy::primitives::U256;
     use hyperliquid_client::info::{ClearinghouseState, L2BookSnapshot, L2Level};
+    use hyperliquid_client::L2BookResolution;
     use hyperunit_client::{UnitChain, UnitGenerateAddressResponse};
     use serde_json::json;
     use std::sync::Arc;
@@ -8491,6 +8570,51 @@ mod hyperliquid_math_tests {
         }
     }
 
+    /// Wrap one full-precision book as a single-tier set — the shape under
+    /// which `simulate_leg` must price bit-identically to the pre-stitch
+    /// single-book walk.
+    fn single_tier(book: L2BookSnapshot) -> Vec<TieredBook> {
+        vec![TieredBook {
+            resolution: L2BookResolution::SigFigs5,
+            book,
+        }]
+    }
+
+    fn book_levels(levels: &[(&str, &str)]) -> Vec<L2Level> {
+        levels
+            .iter()
+            .map(|(px, sz)| L2Level {
+                n: 1,
+                px: px.to_string(),
+                sz: sz.to_string(),
+            })
+            .collect()
+    }
+
+    /// A tier whose book has only asks (bids empty) — buy-walk fixtures.
+    fn ask_tier(resolution: L2BookResolution, asks: &[(&str, &str)]) -> TieredBook {
+        TieredBook {
+            resolution,
+            book: L2BookSnapshot {
+                coin: "UBTC/USDC".to_string(),
+                levels: vec![Vec::new(), book_levels(asks)],
+                time: 0,
+            },
+        }
+    }
+
+    /// A tier whose book has only bids (asks empty) — sell-walk fixtures.
+    fn bid_tier(resolution: L2BookResolution, bids: &[(&str, &str)]) -> TieredBook {
+        TieredBook {
+            resolution,
+            book: L2BookSnapshot {
+                coin: "UBTC/USDC".to_string(),
+                levels: vec![book_levels(bids), Vec::new()],
+                time: 0,
+            },
+        }
+    }
+
     #[test]
     fn simulate_hl_exact_in_sell_counts_only_executable_base_size() {
         let book = single_level_book("60000", "100");
@@ -8503,7 +8627,7 @@ mod hyperliquid_math_tests {
                 amount_in: "120930796".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
-            &book,
+            &single_tier(book),
         )
         .unwrap();
 
@@ -8640,7 +8764,7 @@ mod hyperliquid_math_tests {
                 amount_in: "98577278".to_string(),
                 min_amount_out: Some("1".to_string()),
             },
-            &book,
+            &single_tier(book),
         )
         .unwrap();
 
@@ -8659,7 +8783,7 @@ mod hyperliquid_math_tests {
                 amount_out: "1".to_string(),
                 max_amount_in: Some("1".to_string()),
             },
-            &book,
+            &single_tier(book),
         )
         .unwrap();
 
@@ -8678,11 +8802,251 @@ mod hyperliquid_math_tests {
                 amount_out: "1000000".to_string(),
                 max_amount_in: Some("2000".to_string()),
             },
-            &book,
+            &single_tier(book),
         )
         .unwrap();
 
         assert_eq!(amount_in, "2000");
+    }
+
+    #[test]
+    fn stitch_consumes_coarse_tier_beyond_fine_ceiling() {
+        // Fine tier: 0.5 @ 61,671 + 0.5 @ 61,707 = 61,689 USDC of visible
+        // asks (coverage frontier 61,707). Coarse SigFigs2 tier: the 62,000
+        // bucket covers (61,000, 62,000], which straddles the frontier — its
+        // size is part-already-counted, so it must be discarded; the 63,000
+        // bucket covers (62,000, 63,000], entirely beyond -> kept.
+        let tiers = vec![
+            ask_tier(
+                L2BookResolution::SigFigs5,
+                &[("61671", "0.5"), ("61707", "0.5")],
+            ),
+            ask_tier(
+                L2BookResolution::SigFigs2,
+                &[("62000", "5"), ("63000", "10")],
+            ),
+        ];
+
+        // Buy exact-in 64,000 USDC (6 decimals) of UBTC (8 decimals, sz 5 ->
+        // quantum 10^3 raw):
+        //   0.5 UBTC @ 61,671 costs 30,835,500,000; remaining 33,164,500,000
+        //   0.5 UBTC @ 61,707 costs 30,853,500,000; remaining  2,311,000,000
+        //   @ 63,000 (630 raw-USDC per raw-base): floor(2,311,000,000 / 630)
+        //     = 3,668,253 raw base, costing ceil(3,668,253 * 630)
+        //     = 2,310,999,390 (dust 610 unspent ends the walk)
+        //   base_total = 50e6 + 50e6 + 3,668,253 = 103,668,253
+        //   floored once to the 10^3 quantum -> 103,668,000.
+        // Walking the straddling 62,000 bucket instead would price the tail
+        // at 620 raw-USDC per raw-base and yield a larger total.
+        let (amount_in, amount_out) = simulate_leg(
+            true,
+            6,
+            8,
+            5,
+            &ProviderOrderKind::ExactIn {
+                amount_in: "64000000000".to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            &tiers,
+        )
+        .unwrap();
+
+        assert_eq!(amount_in, "64000000000");
+        assert_eq!(amount_out, "103668000");
+    }
+
+    #[test]
+    fn stitch_excludes_already_covered_coarse_bucket() {
+        // The fine ceiling lands exactly on the coarse 62,000 label: that
+        // bucket covers (61,000, 62,000], all of it at-or-better than the
+        // frontier, i.e. already fully represented by the fine tier
+        // (prev_label(62,000) = 61,000 < frontier). It contributes nothing.
+        let tiers = vec![
+            ask_tier(
+                L2BookResolution::SigFigs5,
+                &[("61671", "0.5"), ("62000", "0.5")],
+            ),
+            ask_tier(
+                L2BookResolution::SigFigs2,
+                &[("62000", "5"), ("63000", "10")],
+            ),
+        ];
+
+        // Buy exact-in 62,000 USDC:
+        //   0.5 UBTC @ 61,671 costs 30,835,500,000; remaining 31,164,500,000
+        //   0.5 UBTC @ 62,000 costs 31,000,000,000; remaining    164,500,000
+        //   @ 63,000: floor(164,500,000 / 630) = 261,111 raw base
+        //     (cost 164,499,930; dust 70 ends the walk)
+        //   base_total = 100,261,111 -> quantum floor -> 100,261,000.
+        // Double-counting the covered 62,000 bucket would let the tail fill
+        // at 620 raw-USDC per raw-base (265,322 raw base) instead.
+        let (_, amount_out) = simulate_leg(
+            true,
+            6,
+            8,
+            5,
+            &ProviderOrderKind::ExactIn {
+                amount_in: "62000000000".to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            &tiers,
+        )
+        .unwrap();
+
+        assert_eq!(amount_out, "100261000");
+    }
+
+    #[test]
+    fn degenerate_identical_tiers_match_single_tier() {
+        // Today's devnet mock shape: the same single-level book at every
+        // resolution. 60,000 is a label at all six resolutions, and every
+        // coarser duplicate has prev_label(60,000) < the 60,000 frontier, so
+        // all five duplicates are filtered — no double-counted depth.
+        let all_tiers: Vec<TieredBook> = L2BookResolution::LADDER_FINE_TO_COARSE
+            .into_iter()
+            .map(|resolution| TieredBook {
+                resolution,
+                book: single_level_book("60000", "1"),
+            })
+            .collect();
+
+        // Buy exact-in 30,000 USDC against 1 UBTC @ 60,000: affordable base
+        // = floor(30,000,000,000 / 600) = 50,000,000 raw (0.5 UBTC), costing
+        // exactly the full budget.
+        let order = ProviderOrderKind::ExactIn {
+            amount_in: "30000000000".to_string(),
+            min_amount_out: Some("1".to_string()),
+        };
+        let stitched = simulate_leg(true, 6, 8, 5, &order, &all_tiers).unwrap();
+        let single = simulate_leg(
+            true,
+            6,
+            8,
+            5,
+            &order,
+            &single_tier(single_level_book("60000", "1")),
+        )
+        .unwrap();
+        assert_eq!(stitched, single);
+        assert_eq!(stitched.1, "50000000");
+
+        // 120,000 USDC exceeds the single level's 60,000 USDC of real depth.
+        // Double-counting the duplicates would see 6 UBTC and succeed; the
+        // stitch must fail exactly like the single-tier walk.
+        let over_depth = ProviderOrderKind::ExactIn {
+            amount_in: "120000000000".to_string(),
+            min_amount_out: Some("1".to_string()),
+        };
+        let err = simulate_leg(true, 6, 8, 5, &over_depth, &all_tiers).unwrap_err();
+        assert!(err.contains("could not absorb"), "{err}");
+    }
+
+    #[test]
+    fn stitch_exact_out_crosses_seam() {
+        // Fine frontier 61,707. Coarse SigFigs5Mantissa5 tier (step 5):
+        // the 61,710 bucket covers (61,705, 61,710] -> straddles, discarded;
+        // the 61,725 bucket covers (61,720, 61,725] -> kept.
+        let tiers = vec![
+            ask_tier(
+                L2BookResolution::SigFigs5,
+                &[("61671", "0.5"), ("61707", "0.5")],
+            ),
+            ask_tier(
+                L2BookResolution::SigFigs5Mantissa5,
+                &[("61710", "1"), ("61725", "5")],
+            ),
+        ];
+
+        // Buy exact-out 1.20000001 UBTC (120,000,001 raw; sz 8 -> quantum 1,
+        // no ceil-to-quantum adjustment):
+        //   0.5 UBTC @ 61,671 costs ceil(50,000,000 * 616.71) = 30,835,500,000
+        //   0.5 UBTC @ 61,707 costs ceil(50,000,000 * 617.07) = 30,853,500,000
+        //   20,000,001 raw @ 61,725 costs ceil(20,000,001 * 617.25)
+        //     = ceil(12,345,000,617.25) = 12,345,000,618 (ceil binds)
+        //   amount_in = 74,034,000,618.
+        let (amount_in, amount_out) = simulate_leg(
+            true,
+            6,
+            8,
+            8,
+            &ProviderOrderKind::ExactOut {
+                amount_out: "120000001".to_string(),
+                max_amount_in: Some("100000000000".to_string()),
+            },
+            &tiers,
+        )
+        .unwrap();
+
+        assert_eq!(amount_in, "74034000618");
+        assert_eq!(amount_out, "120000001");
+    }
+
+    #[test]
+    fn stitch_insufficient_across_all_tiers_errors() {
+        // Total stitched depth: 0.5 UBTC @ 61,671 + 1 UBTC @ 63,000 =
+        // 93,835.50 USDC. A 1,000,000 USDC buy exhausts every tier and must
+        // surface the existing insufficient-depth error.
+        let tiers = vec![
+            ask_tier(L2BookResolution::SigFigs5, &[("61671", "0.5")]),
+            ask_tier(L2BookResolution::SigFigs2, &[("63000", "1")]),
+        ];
+
+        let err = simulate_leg(
+            true,
+            6,
+            8,
+            5,
+            &ProviderOrderKind::ExactIn {
+                amount_in: "1000000000000".to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            &tiers,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("could not absorb"), "{err}");
+    }
+
+    #[test]
+    fn stitch_sell_side_mirrors_buy() {
+        // Bids mirror with floors: fine frontier is the *lowest* fine bid
+        // label (61,650), and a coarse bid bucket labeled L covers
+        // [L, L + step). SigFigs2's 61,000 bucket covers [61,000, 62,000) ->
+        // straddles the frontier (next_label 62,000 > 61,650), discarded;
+        // the 60,000 bucket covers [60,000, 61,000) -> kept.
+        let tiers = vec![
+            bid_tier(
+                L2BookResolution::SigFigs5,
+                &[("61667", "0.5"), ("61650", "0.5")],
+            ),
+            bid_tier(
+                L2BookResolution::SigFigs2,
+                &[("61000", "5"), ("60000", "10")],
+            ),
+        ];
+
+        // Sell exact-in 1.5 UBTC (150,000,000 raw, already quantum-aligned):
+        //   0.5 UBTC @ 61,667 yields floor(50,000,000 * 616.67) = 30,833,500,000
+        //   0.5 UBTC @ 61,650 yields 30,825,000,000
+        //   0.5 UBTC @ 60,000 yields 30,000,000,000
+        //   amount_out = 91,658,500,000 (91,658.50 USDC).
+        // Walking the straddling 61,000 bucket would price the tail at 610
+        // raw-USDC per raw-base (30,500,000,000) — over-promising proceeds.
+        let (amount_in, amount_out) = simulate_leg(
+            false,
+            8,
+            6,
+            5,
+            &ProviderOrderKind::ExactIn {
+                amount_in: "150000000".to_string(),
+                min_amount_out: Some("1".to_string()),
+            },
+            &tiers,
+        )
+        .unwrap();
+
+        assert_eq!(amount_in, "150000000");
+        assert_eq!(amount_out, "91658500000");
     }
 
     #[test]

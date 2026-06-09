@@ -12,6 +12,7 @@ pub mod eip712;
 pub mod error;
 pub mod http;
 pub mod info;
+pub mod l2book;
 pub mod meta;
 pub mod signature;
 pub mod wire;
@@ -36,6 +37,9 @@ pub use info::{
     OrderInfoEnvelope, OrderStatusResponse, PerpAssetMeta, PerpMeta, SpotBalance,
     SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
     UserNonFundingLedgerUpdate, UserRateLimit,
+};
+pub use l2book::{
+    next_label, prev_label, round_down_to_resolution, round_up_to_resolution, L2BookResolution,
 };
 pub use meta::{
     spot_wire_asset_index, SpotAssetMeta, SpotMeta, TokenInfo, SPOT_ASSET_INDEX_OFFSET,

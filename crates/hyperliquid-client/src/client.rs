@@ -29,6 +29,7 @@ use crate::{
         ClearinghouseState, L2BookSnapshot, OpenOrder, OrderStatusResponse, PerpMeta,
         SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerUpdate, UserRateLimit,
     },
+    l2book::L2BookResolution,
     meta::SpotMeta,
     signature::{sign_l1_action, sign_typed_data},
 };
@@ -157,6 +158,21 @@ impl HyperliquidInfoClient {
     pub async fn l2_book(&self, coin: &str) -> Result<L2BookSnapshot, Error> {
         let req = serde_json::json!({ "type": "l2Book", "coin": coin });
         self.http.post_json("/info", &req).await
+    }
+
+    /// L2 orderbook snapshot at an explicit aggregation resolution. The
+    /// closed [`L2BookResolution`] enum is the only way to set
+    /// `nSigFigs`/`mantissa`: HL answers every other combination with an
+    /// opaque HTTP 500 (body `null`) that masquerades as an outage, so
+    /// invalid params are unrepresentable client-side.
+    pub async fn l2_book_at(
+        &self,
+        coin: &str,
+        resolution: L2BookResolution,
+    ) -> Result<L2BookSnapshot, Error> {
+        self.http
+            .post_json("/info", &resolution.request_body(coin))
+            .await
     }
 
     /// Poll the status of a single resting / historical order by `oid`.
@@ -714,6 +730,14 @@ impl HyperliquidClient {
 
     pub async fn l2_book(&self, coin: &str) -> Result<L2BookSnapshot, Error> {
         self.info.l2_book(coin).await
+    }
+
+    pub async fn l2_book_at(
+        &self,
+        coin: &str,
+        resolution: L2BookResolution,
+    ) -> Result<L2BookSnapshot, Error> {
+        self.info.l2_book_at(coin, resolution).await
     }
 
     pub async fn order_status(

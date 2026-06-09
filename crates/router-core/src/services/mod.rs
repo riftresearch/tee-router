@@ -5,6 +5,7 @@ pub mod bitcoin_funding;
 pub mod custody_action_executor;
 pub mod gas_reimbursement;
 pub mod http_body;
+pub(crate) mod hyperliquid_books;
 pub mod market_order_planner;
 pub mod pricing;
 pub mod quote_legs;
