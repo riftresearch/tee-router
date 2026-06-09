@@ -1697,20 +1697,18 @@ impl OrderManager {
             return Vec::new();
         };
 
-        let Some(source_decimals) = self
+        // Registry decimals are optional: address-form/venue-only tokens
+        // (e.g. WBTC) have none, and only human-decimal venue APIs
+        // (ChangeNow) need them — those providers decline individually
+        // rather than the whole single-hop family going dark.
+        let source_decimals = self
             .asset_registry
             .chain_asset(&request.source_asset)
-            .map(|asset| asset.decimals)
-        else {
-            return Vec::new();
-        };
-        let Some(destination_decimals) = self
+            .map(|asset| asset.decimals);
+        let destination_decimals = self
             .asset_registry
             .chain_asset(&request.destination_asset)
-            .map(|asset| asset.decimals)
-        else {
-            return Vec::new();
-        };
+            .map(|asset| asset.decimals);
 
         let mut views: Vec<SingleHopVenueView> = Vec::new();
         let mut tasks = tokio::task::JoinSet::new();
@@ -2374,28 +2372,16 @@ impl OrderManager {
         let destination_recipient_address =
             self.quote_address_for_chain(quote_id, &request.destination_asset.chain)?;
         let refund_address = self.quote_address_for_chain(quote_id, &request.source_asset.chain)?;
+        // Registry decimals are optional (see the single-hop view builder):
+        // only ChangeNow consumes them, declining individually on `None`.
         let source_decimals = self
             .asset_registry
             .chain_asset(&request.source_asset)
-            .map(|asset| asset.decimals)
-            .ok_or_else(|| MarketOrderError::NoRoute {
-                reason: format!(
-                    "single-hop source asset {} on {} has no registered decimals",
-                    request.source_asset.asset.as_str(),
-                    request.source_asset.chain.as_str()
-                ),
-            })?;
+            .map(|asset| asset.decimals);
         let destination_decimals = self
             .asset_registry
             .chain_asset(&request.destination_asset)
-            .map(|asset| asset.decimals)
-            .ok_or_else(|| MarketOrderError::NoRoute {
-                reason: format!(
-                    "single-hop destination asset {} on {} has no registered decimals",
-                    request.destination_asset.asset.as_str(),
-                    request.destination_asset.chain.as_str()
-                ),
-            })?;
+            .map(|asset| asset.decimals);
 
         let mut candidates = include_candidates.then(Vec::new);
         let mut tasks = tokio::task::JoinSet::new();

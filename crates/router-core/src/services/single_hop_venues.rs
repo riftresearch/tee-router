@@ -32,9 +32,14 @@ pub type SingleHopQuoteFuture<'a, T> =
 #[derive(Debug, Clone)]
 pub struct SingleHopQuoteRequest {
     pub source_asset: DepositAsset,
-    pub source_decimals: u8,
+    /// Registry decimals for the source asset, when it is a registered chain
+    /// asset. `None` for address-form/venue-only tokens (e.g. WBTC). Only
+    /// providers whose APIs speak human-decimal amounts (ChangeNow) consume
+    /// these; they return no route on `None` while raw-base-unit venues
+    /// quote regardless.
+    pub source_decimals: Option<u8>,
     pub destination_asset: DepositAsset,
-    pub destination_decimals: u8,
+    pub destination_decimals: Option<u8>,
     pub amount_in: String,
     pub source_depositor_address: String,
     pub destination_recipient_address: String,
@@ -673,9 +678,16 @@ impl SingleHopQuoteProvider for ChangenowQuoteProvider {
             else {
                 return Ok(None);
             };
+            // ChangeNow's API speaks human-decimal amounts; without registry
+            // decimals on both ends the conversion is impossible, so this
+            // venue (alone) sits the pair out.
+            let (Some(source_decimals), Some(destination_decimals)) =
+                (request.source_decimals, request.destination_decimals)
+            else {
+                return Ok(None);
+            };
 
-            let from_amount =
-                format_raw_units_as_decimal(&request.amount_in, request.source_decimals)?;
+            let from_amount = format_raw_units_as_decimal(&request.amount_in, source_decimals)?;
             let query = vec![
                 ("fromCurrency", from.asset.to_lowercase()),
                 ("toCurrency", to.asset.to_lowercase()),
@@ -700,7 +712,7 @@ impl SingleHopQuoteProvider for ChangenowQuoteProvider {
             let to_amount_decimal = json_decimal_field_from_body(&raw_body, "toAmount")
                 .ok_or_else(|| "changenow response missing toAmount".to_string())?;
             let to_amount =
-                parse_decimal_to_raw_units_floor(&to_amount_decimal, request.destination_decimals)?;
+                parse_decimal_to_raw_units_floor(&to_amount_decimal, destination_decimals)?;
 
             Ok(Some(SingleHopQuote {
                 provider_id: ProviderId::Changenow,
@@ -1245,6 +1257,40 @@ mod tests {
             parse_decimal_to_raw_units_floor("1.234567891", 8).expect("floors extra precision"),
             "123456789"
         );
+    }
+
+    /// Regression: missing registry decimals must make ChangeNow alone
+    /// decline the pair, not error — the original guard nuked the whole
+    /// single-hop family for venue-only tokens like WBTC, which raw-base-
+    /// unit venues (relay, garden, chainflip) quote without any decimals.
+    #[tokio::test]
+    async fn changenow_declines_pairs_without_registry_decimals() {
+        // Dead-end base URL: reaching HTTP at all would fail the test,
+        // proving the decimals gate short-circuits before any request.
+        let provider = ChangenowQuoteProvider::new("http://127.0.0.1:1", "test-key", None)
+            .expect("provider");
+        let request = SingleHopQuoteRequest {
+            // WBTC -> BTC is in the ChangeNow asset map, so only the
+            // decimals gate stands between this request and HTTP.
+            source_asset: asset(
+                "evm:1",
+                AssetId::reference("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
+            ),
+            source_decimals: None,
+            destination_asset: asset("bitcoin", AssetId::Native),
+            destination_decimals: None,
+            amount_in: "500000000".to_string(),
+            source_depositor_address: "0x1111111111111111111111111111111111111111".to_string(),
+            destination_recipient_address: "bc1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqmql8k8"
+                .to_string(),
+            refund_address: "0x1111111111111111111111111111111111111111".to_string(),
+        };
+
+        let quote = provider
+            .quote_market_order(request)
+            .await
+            .expect("no-route, not an error");
+        assert!(quote.is_none());
     }
 
     #[test]
