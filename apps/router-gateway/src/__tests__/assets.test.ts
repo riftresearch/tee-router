@@ -53,6 +53,23 @@ describe('asset and amount helpers', () => {
       decimals: 8
     })
 
+    expect(resolveAssetIdentifier('Ethereum.WBTC')).toEqual({
+      id: 'Ethereum.WBTC',
+      internal: {
+        chain: 'evm:1',
+        asset: '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599'
+      },
+      decimals: 8
+    })
+
+    expect(resolveAssetIdentifier('Arbitrum.WBTC')).toEqual({
+      id: 'Arbitrum.WBTC',
+      internal: {
+        chain: 'evm:42161',
+        asset: '0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f'
+      },
+      decimals: 8
+    })
 
     expect(
       resolveAssetIdentifier('Ethereum.0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48')
