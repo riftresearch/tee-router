@@ -4,11 +4,9 @@
 //! pipeline used by the production order manager:
 //!
 //!   1. BFS enumerate candidate transition paths (`select_transition_paths`)
-//!   2. Filter to executable terminal kinds (mirror of
+//!   2. Drop empty paths (mirror of
 //!      `bin/router-server/src/services/order_manager.rs::is_executable_transition_path`)
-//!   3. Prefer same-chain EVM paths when source/destination share an EVM chain
-//!      (mirror of `prefer_same_chain_evm_paths`)
-//!   4. Rank by structural cost (`rank_transition_paths_structurally`)
+//!   3. Rank by structural cost (`rank_transition_paths_structurally`)
 //!
 //! Provider-configured / health / unit-compatibility filters live in
 //! `router-server` and are out of scope here -- they need a live
@@ -27,12 +25,11 @@ use router_core::{
         },
         pricing::PricingSnapshot,
         route_costs::{
-            amount_aware_path_score, confidence_band, rank_transition_paths_structurally,
-            structural_path_score, RankedTransitionPath, DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
+            rank_transition_paths_structurally, structural_path_score,
+            DEFAULT_SAMPLE_AMOUNT_USD_MICROS,
         },
     },
 };
-use std::collections::HashMap;
 
 const USDC_BASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const USDC_ARBITRUM: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
@@ -53,54 +50,12 @@ fn evm_token(chain: &str, address: &str) -> DepositAsset {
 }
 
 /// Local copy of `is_executable_transition_path` from
-/// `bin/router-server/src/services/order_manager.rs`. Kept in sync manually.
-fn is_executable_transition_path(registry: &AssetRegistry, path: &TransitionPath) -> bool {
-    if path.transitions.is_empty() {
-        return false;
-    }
-    let last_kind = path.transitions.last().map(|t| t.kind);
-    matches!(last_kind, Some(MarketOrderTransitionKind::UnitWithdrawal))
-        || matches!(
-            last_kind,
-            Some(MarketOrderTransitionKind::UniversalRouterSwap)
-        )
-        || (matches!(
-            last_kind,
-            Some(
-                MarketOrderTransitionKind::AcrossBridge | MarketOrderTransitionKind::CctpBridge
-            )
-        ) && path_contains_runtime_asset(registry, path))
-}
-
-fn path_contains_runtime_asset(registry: &AssetRegistry, path: &TransitionPath) -> bool {
-    path.transitions.iter().any(|t| {
-        registry.chain_asset(&t.input.asset).is_none()
-            || registry.chain_asset(&t.output.asset).is_none()
-    })
-}
-
-/// Local copy of `prefer_same_chain_evm_paths` from the order manager.
-fn prefer_same_chain_evm_paths(
-    source: &DepositAsset,
-    destination: &DepositAsset,
-    paths: &mut Vec<TransitionPath>,
-) {
-    if source.chain != destination.chain || !source.chain.as_str().starts_with("evm:") {
-        return;
-    }
-    let chain = &source.chain;
-    let same_chain: Vec<_> = paths
-        .iter()
-        .filter(|p| {
-            p.transitions
-                .iter()
-                .all(|t| t.input.asset.chain == *chain && t.output.asset.chain == *chain)
-        })
-        .cloned()
-        .collect();
-    if !same_chain.is_empty() {
-        *paths = same_chain;
-    }
+/// `bin/router-server/src/services/order_manager.rs`. Kept in sync manually:
+/// production only drops empty paths here (a bridge exit to a registered
+/// destination asset is just as executable as a Velora or Unit exit); the
+/// real filtering happens in the provider/quote stages downstream.
+fn is_executable_transition_path(path: &TransitionPath) -> bool {
+    !path.transitions.is_empty()
 }
 
 // -- Tests -----------------------------------------------------------------
@@ -171,7 +126,7 @@ fn bfs_wraps_arbitrary_erc20_into_anchor_for_pepe_to_btc() {
 
     let executable: Vec<_> = paths
         .into_iter()
-        .filter(|p| is_executable_transition_path(&registry, p))
+        .filter(is_executable_transition_path)
         .collect();
     assert!(
         !executable.is_empty(),
@@ -226,7 +181,7 @@ fn bfs_wraps_arbitrary_erc20_at_tail_for_btc_to_pepe() {
     let paths = registry.select_transition_paths(&source, &destination, 5);
     let executable: Vec<_> = paths
         .into_iter()
-        .filter(|p| is_executable_transition_path(&registry, p))
+        .filter(is_executable_transition_path)
         .collect();
     assert!(
         !executable.is_empty(),
@@ -335,7 +290,7 @@ fn bfs_returns_empty_for_unknown_endpoints() {
 }
 
 #[test]
-fn pipeline_terminates_with_executable_kind_and_same_chain_preference() {
+fn pipeline_ranks_same_chain_candidates_for_arbitrary_erc20_pair() {
     let registry = AssetRegistry::default();
 
     // Two arbitrary, unknown ERC20 addresses on Base. These are not in the
@@ -351,22 +306,22 @@ fn pipeline_terminates_with_executable_kind_and_same_chain_preference() {
 
     let mut executable: Vec<_> = bfs
         .into_iter()
-        .filter(|p| is_executable_transition_path(&registry, p))
+        .filter(is_executable_transition_path)
         .collect();
     assert!(
         !executable.is_empty(),
-        "expected at least one executable path after terminal-kind filter"
+        "expected at least one executable path after the empty-path filter"
     );
 
-    prefer_same_chain_evm_paths(&source, &destination, &mut executable);
+    // No same-chain preference filter: cross-chain candidates stay in the set
+    // and must win on ranked cost. The direct same-chain Velora route must
+    // still be among the candidates.
     assert!(
-        executable
-            .iter()
-            .all(|p| p.transitions.iter().all(|t| {
-                t.input.asset.chain.as_str() == "evm:8453"
-                    && t.output.asset.chain.as_str() == "evm:8453"
-            })),
-        "same-chain preference should restrict all hops to evm:8453"
+        executable.iter().any(|p| p.transitions.iter().all(|t| {
+            t.input.asset.chain.as_str() == "evm:8453"
+                && t.output.asset.chain.as_str() == "evm:8453"
+        })),
+        "expected at least one all-same-chain candidate for a same-chain pair"
     );
 
     rank_transition_paths_structurally(&mut executable, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
@@ -494,39 +449,3 @@ fn bfs_does_not_expand_past_goal() {
     }
 }
 
-// -- S1.2 integration tests: amount-aware ranking and confidence band ------
-
-const USD_MICRO_HERE: u64 = 1_000_000;
-
-/// Audit S1.2 - confidence-band round trip via the public API: scoring +
-/// `confidence_band` together must return a non-zero band whose first
-/// element is the structural leader, and must always include at least one
-/// path when there is anything to score.
-#[test]
-fn confidence_band_round_trip_via_public_api() {
-    let source = asset("evm:1", AssetId::Native);
-    let destination = asset("bitcoin", AssetId::Native);
-    let registry = AssetRegistry::default();
-    let pricing = PricingSnapshot::static_bootstrap(chrono::Utc::now());
-    let mut paths = registry.select_transition_paths(&source, &destination, 5);
-    assert!(!paths.is_empty(), "expected at least one candidate path");
-    let empty_cache: HashMap<String, _> = HashMap::new();
-    // Sort by amount-aware score in place, then build the ranked list.
-    let request_usd_micros = 50_000 * USD_MICRO_HERE;
-    paths.sort_by(|a, b| {
-        let sa = amount_aware_path_score(a, &empty_cache, &pricing, request_usd_micros);
-        let sb = amount_aware_path_score(b, &empty_cache, &pricing, request_usd_micros);
-        (sa.total_effective_cost_usd_micros, a.transitions.len(), a.id.clone())
-            .cmp(&(sb.total_effective_cost_usd_micros, b.transitions.len(), b.id.clone()))
-    });
-    let ranked: Vec<RankedTransitionPath> = paths
-        .iter()
-        .map(|path| RankedTransitionPath {
-            path: path.clone(),
-            score: amount_aware_path_score(path, &empty_cache, &pricing, request_usd_micros),
-        })
-        .collect();
-    let band = confidence_band(&ranked, request_usd_micros, 8);
-    assert!(band >= 1, "band must always contain at least the leader");
-    assert!(band <= ranked.len().min(8), "band must respect top_k");
-}

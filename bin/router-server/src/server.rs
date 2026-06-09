@@ -1232,9 +1232,10 @@ async fn get_route_graph(
     Ok(Json(build_route_graph(state.order_manager.asset_registry())))
 }
 
-/// Admin-only dry-run route explainer powering the interactive demo. Runs the
-/// real BFS/ranking/confidence-band pipeline without persisting anything; with
-/// `live_quote` it additionally reports real per-path outputs and the winner.
+/// Admin-only route explainer powering the dashboard route-graph visualizer.
+/// Runs the real shared quote pipeline (BFS -> ranking -> top-3 end-to-end
+/// live quote, plus the parallel single-hop venue checks) without persisting
+/// anything, and returns the full trace: ranking, live outputs, and winner.
 async fn explain_route(
     State(state): State<AppState>,
     headers: HeaderMap,

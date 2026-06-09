@@ -3,7 +3,7 @@
 > Canonical end-to-end description of the route-cost caching, refreshing,
 > quoting, and visual-debugging stack. Keep it updated as the system changes.
 >
-> Last updated: 2026-06-08.
+> Last updated: 2026-06-09.
 
 ---
 
@@ -45,8 +45,9 @@ the allowlist only narrows what gets a cost row.
 - **CCTP**: `USDC` between `ETH` / `BASE` / `ARB`.
 - **Unit**: `HL.uETH <-> ETH.ETH`, `HL.uBTC <-> BTC.BTC`.
 - **Hyperliquid bridge**: `ARB.USDC <-> HL.USDC` (native USDC bridge).
-- **Hyperliquid spot**: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`. `HYPE`
-  spot legs are not curated (no live USD reference price for value-loss bps).
+- **Hyperliquid spot**: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`,
+  `HL.USDC <-> HL.USDT`. `HYPE` spot legs are not curated (no live USD
+  reference price for value-loss bps).
 - **Velora** (same-chain): `USDC <-> USDT` on `ETH` / `BASE` / `ARB`.
 
 The anchor assets used for the arbitrary-ERC20 wrap (Section 6) are `USDC`,
@@ -57,11 +58,14 @@ The anchor assets used for the arbitrary-ERC20 wrap (Section 6) are `USDC`,
 ## 3. The tier ladder
 
 Every curated hop is sampled at a ladder of trade sizes, so a `$100` quote and a
-`$5m` quote do not score a path identically. Twelve tiers, `$100`–`$10m`
+`$5m` quote do not score a path identically. Thirteen tiers, `$100`–`$10m`
 (`ROUTE_COST_TIERS` in
 [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs)):
 
-`100 / 1k / 10k / 25k / 50k / 75k / 100k / 200k / 500k / 1m / 5m / 10m` (USD).
+`100 / 500 / 1k / 10k / 25k / 50k / 75k / 100k / 200k / 500k / 1m / 5m / 10m`
+(USD). The `$500` rung exists because round-up tier selection would otherwise
+price every `$101-999` request off the `$1k` sample, overstating fixed-cost
+legs (e.g. Unit's ~$1.25 deposit fee) by up to 10x in bps terms.
 
 At quote time `select_route_cost_tier` rounds **up** to the smallest tier that
 covers the request (slippage-conservative); above `$10m` it clamps to the top
@@ -83,7 +87,7 @@ tier.
 | `estimated_latency_ms` | `0` for curated rows. |
 | `sample_amount_usd_micros` | The tier sample size this row was measured at. |
 | `quote_source` | `provider_quote:<id>` for every row. |
-| `refreshed_at` / `expires_at` | When the row was written / its TTL expiry (~10 min). |
+| `refreshed_at` / `expires_at` | When the row was written / its TTL expiry (`DEFAULT_ROUTE_COST_SNAPSHOT_TTL` = `2400s`, i.e. the ~30 min refresh window plus margin, so the last sample stays valid until its next sweep). |
 
 The upsert overwrites a row only when the incoming `refreshed_at` is newer, so a
 late-arriving stale sample cannot clobber fresher data.
@@ -99,7 +103,7 @@ the worker loop in
 
 ### The window
 
-The full work set is `curated_edges x 12 tiers`. Rather than burst-refreshing,
+The full work set is `curated_edges x 13 tiers`. Rather than burst-refreshing,
 all sample calls are spread evenly across a configurable window
 (`worker_route_cost_refresh_seconds`, default `1800` = 30 min): every provider is
 trickled fresh quotes, one full sweep finishes per window, then re-anchors.
@@ -133,7 +137,7 @@ flowchart LR
   15s)`, sized to total work so each provider advances at most one unit per tick.
 - **Distinct-route ordering** (`interleaved_refresh_plan`): within a provider,
   units are ordered tier-outer/route-inner, so consecutive samples step through
-  different routes instead of all 12 tiers of one route back-to-back.
+  different routes instead of all 13 tiers of one route back-to-back.
 - **Concurrency**: each tick's slice is sampled behind a semaphore capped at
   `REFRESH_FANOUT_PERMITS = 16` outbound calls.
 
@@ -236,11 +240,10 @@ flowchart TB
   Tier --> Read["read snapshots for that tier (1 query)"]
   Read --> Score["amount_aware_path_score per path"]
   Score --> Sort["sort: missing_edges, cost, latency, hops, path_id"]
-  Sort --> TopK["truncate top-K = 8"]
-  TopK --> Band["confidence_band"]
-  Band --> Fan["live-quote band in parallel"]
+  Sort --> Fan["live-quote top-3 in parallel"]
   Fan --> Best["pick largest amount_out"]
-  Best --> Resp["return quote"]
+  Best --> Sh["compare vs best single-hop venue"]
+  Sh --> Resp["return quote"]
 ```
 
 0. Validate/normalize the request. Quotes whose normalized source and
@@ -257,17 +260,20 @@ flowchart TB
    ceil(request_usd_micros * cached_bps / 10_000))`; an uncached leg adds zero
    cost but bumps `missing_edges`.
 5. Sort deterministically `(missing_edges, cost, latency, hops, path_id)`.
-6. Truncate to `TOP_K_PATHS = 8`.
-7. Build the **confidence band** (leader + peers within `CONFIDENCE_BAND_BPS` =
-   10% cost, or with `missing_edges > 0`, or with non-live-refreshed legs at
-   `>= CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS` = `$10k`).
-8. Live-quote the band in parallel and validate each.
-9. Return the path with the largest `estimated_amount_out` (tie-break hops,
-   path_id).
+   There is **no same-chain preference filter**: cross-chain candidates stay in
+   the set even for same-chain EVM pairs and must win on cost.
+6. Live-quote the top `LIVE_QUOTE_TOP_N = 3` ranked paths end-to-end in
+   parallel and validate each. (The fanout width is a fixed top-3; the old
+   variable-width confidence band was removed.)
+7. Pick the multi-hop path with the largest `estimated_amount_out` (tie-break
+   fewer hops, then path_id), then compare it against the best single-hop venue
+   quote (`best_single_hop_provider_quote`) - higher output wins, fewer hops on
+   an exact tie - and gate the final winner on the destination dust floor
+   (`route_output_floor`, rejecting with `OutputBelowFloor`).
 
-The dashboard's explain endpoint (Section 8) reuses the same BFS → score → rank
-pipeline but, instead of the variable-width confidence band, live-quotes a
-hardcoded top-3 (`LIVE_QUOTE_TOP_N`) and persists nothing.
+The dashboard's explain endpoint (Section 8) runs this exact shared pipeline
+(`run_market_quote_pipeline` plus the single-hop venue probe) and persists
+nothing; there is no separate dashboard code path.
 
 ---
 
@@ -312,21 +318,17 @@ view and the worker's retry backoff (see §5).
 declared corridor topology (every node and edge from `/api/route-graph`) and lets
 you run rankings:
 
-- Pick **source/destination** assets, a **tier**, and an **amount**. Changing any
-  input auto-runs a **cache-only dry run** (`POST /api/route-explain` with
-  `live_quote: false`): BFS + filters + ranking against cached bps only, no
-  provider calls.
-- The **Live quote** toggle additionally live-quotes the top-3 ranked paths to
-  report real per-path `estimated_amount_out` and pick the true output-maximizing
-  winner. It runs only on explicit rank (manual) to avoid hammering providers on
-  every keystroke; a `live …ms` timing is shown when used.
-- Ranked results render as cards: a header with the venue sequence and a summary
-  (`Σ` total path bps, hop count, uncached count, latency, est. out), and a hop
-  chain showing each leg's **per-step bps** (cached value, `live` for Velora, or
-  `—` for legs with no cached cost such as `HyperliquidTrade`/HL bridge). The
-  total `Σ bps` sums cached legs only and is shown as `Σ ≥… bps` when some legs
-  are live/uncached. The `#1` rank and the live-quote winner are highlighted
-  green; lower ranks are neutral.
+- Pick **source/destination** assets, a **tier**, and an **amount**, then rank.
+  Every explain runs the real shared quote pipeline (`POST /api/route-explain`,
+  no dry-run toggle): BFS + filters + cached ranking, then a live end-to-end
+  quote of the top-3 ranked paths and the parallel single-hop venue checks -
+  exactly what a user's `/quote` does.
+- Ranked results render as cards stacking the **cached** estimate (cost rank,
+  per-leg bps chain, request/tier context) and the **live** outcome (real
+  `estimated_amount_out`, realized total bps, delta vs cached) for each route,
+  plus a single-hop venue panel and an overall cross-family winner banner. A
+  dust-floor rejection banner appears when production would return
+  `OutputBelowFloor` for the request.
 
 ### Starting it
 
@@ -366,14 +368,13 @@ Implemented in `crates/devnet/src/mock_integrators.rs`
 | `worker_route_cost_refresh_seconds` (`ROUTER_WORKER_ROUTE_COST_REFRESH_SECONDS`) | [`lib.rs`](../bin/router-server/src/lib.rs) (default `1800`) | Refresh window; all curated samples are spread evenly across it. |
 | `route_cost_pacing_tick` | [`worker.rs`](../bin/router-server/src/worker.rs) | `(window/total_units).clamp(1s,15s)`; sizes the tick so each provider advances <=1 unit per tick. |
 | `REFRESH_FANOUT_PERMITS` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`16`) | Max concurrent provider calls per tick. |
-| `DEFAULT_REFRESH_TTL` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`600s`) | Row expiry. |
+| `DEFAULT_REFRESH_TTL` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`600s`) | Pricing-oracle freshness gate (not row expiry). |
+| `DEFAULT_ROUTE_COST_SNAPSHOT_TTL` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`2400s`) | Snapshot row expiry: refresh window plus margin so the last sample stays valid until the next sweep. |
 | `RETRY_MAX_ATTEMPTS` / `MAX_RETRIES_PER_TICK` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`5` / `8`) | Retry-queue give-up bound / max due retries folded into one tick. |
 | `RETRY_BASE_DELAY` / `RETRY_MAX_DELAY` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`20s` / `5m`) | Exponential backoff base/cap for ordinary failures. |
 | `RETRY_RATE_LIMITED_BASE_DELAY` / `RETRY_RATE_LIMITED_MAX_DELAY` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`60s` / `10m`) | Harder backoff base/cap for rate-limited failures. |
-| `CONFIDENCE_BAND_BPS` | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) (`1_000` = 10%) | Cost band width around the leader for fanout. |
-| `CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS` | same file (`$10k`) | Above this, band widens for non-live-refreshed legs. |
-| `TOP_K_PATHS` / `MAX_PATH_DEPTH` | [`order_manager.rs`](../bin/router-server/src/services/order_manager.rs) (`8` / `5`) | Ranked-candidate cap / BFS depth. |
-| `LIVE_QUOTE_TOP_N` | [`order_manager.rs`](../bin/router-server/src/services/order_manager.rs) (`3`) | Paths live-quoted by the dashboard explain endpoint. |
+| `TOP_K_PATHS` / `MAX_PATH_DEPTH` | [`order_manager.rs`](../bin/router-server/src/services/order_manager.rs) (`8` / `5`) | Dashboard ranked-list display cap / BFS depth. |
+| `LIVE_QUOTE_TOP_N` | [`order_manager.rs`](../bin/router-server/src/services/order_manager.rs) (`3`) | Ranked paths live-quoted end-to-end by the shared quote pipeline (production `/quote` and the dashboard explainer alike). |
 
 ---
 
@@ -381,7 +382,7 @@ Implemented in `crates/devnet/src/mock_integrators.rs`
 
 | Concern | File |
 | --- | --- |
-| Tier table, scoring, paced refresher, live samplers, confidence band | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) |
+| Tier table, scoring, paced refresher, live samplers | [`route_costs.rs`](../crates/router-core/src/services/route_costs.rs) |
 | Canonical assets, curated allowlist, runtime Velora edges, graph | [`asset_registry.rs`](../crates/router-core/src/services/asset_registry.rs) |
 | Provider traits (bridge/exchange/unit fee) | [`action_providers.rs`](../crates/router-core/src/services/action_providers.rs) |
 | Cache persistence | [`route_cost_repo.rs`](../crates/router-core/src/db/route_cost_repo.rs) |
@@ -399,8 +400,11 @@ Implemented in `crates/devnet/src/mock_integrators.rs`
 
 - `HYPE` Hyperliquid spot legs are not curated (no live USD reference price for
   value-loss bps), so they show as uncached (`—`) and are priced only by the
-  request-time fanout. Other HL spot pairs (`USDC <-> uBTC/uETH`) and the native
-  USDC bridge are now sampled and cached.
+  request-time fanout. Other HL spot pairs (`USDC <-> uBTC/uETH/USDT`) and the
+  native USDC bridge are sampled and cached.
+- Across `USDT` legs touching Arbitrum are deliberately uncached (no usable
+  venue liquidity); paths through them carry a missing-edge penalty or are
+  strict-dropped, which is intentional since the venue cannot fill them.
 - Limit orders and the temporal boundary requote pin to a fixed `$1k` anchor and
   skip the fanout.
 - The retry queue is in-memory; a worker restart drops pending retries and falls

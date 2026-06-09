@@ -906,31 +906,6 @@ fn boundary_unit_path_compatible(unit: &dyn UnitProvider, path: &TransitionPath)
         })
 }
 
-fn boundary_prefer_same_chain_evm_paths(
-    source_asset: &DepositAsset,
-    destination_asset: &DepositAsset,
-    paths: &mut Vec<TransitionPath>,
-) {
-    if source_asset.chain != destination_asset.chain
-        || !source_asset.chain.as_str().starts_with("evm:")
-    {
-        return;
-    }
-    let chain = &source_asset.chain;
-    let same_chain_paths = paths
-        .iter()
-        .filter(|path| {
-            path.transitions.iter().all(|transition| {
-                transition.input.asset.chain == *chain && transition.output.asset.chain == *chain
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !same_chain_paths.is_empty() {
-        *paths = same_chain_paths;
-    }
-}
-
 fn boundary_is_better_quote(
     candidate: &BoundaryComposedMarketOrderQuote,
     current: &Option<BoundaryComposedMarketOrderQuote>,
@@ -1452,11 +1427,6 @@ async fn boundary_best_provider_quote(
     paths.retain(|path| {
         boundary_path_has_configured_provider_set(deps.action_providers.as_ref(), path)
     });
-    boundary_prefer_same_chain_evm_paths(
-        &context.source_asset,
-        &order.destination_asset,
-        &mut paths,
-    );
     if paths.is_empty() {
         return Ok(None);
     }

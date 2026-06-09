@@ -30,6 +30,7 @@ import type {
 // and a representative `amount_in` filled into the editable amount field.
 const ROUTE_TIERS: Array<{ label: string; usd: number }> = [
   { label: 'usd_100', usd: 100 },
+  { label: 'usd_500', usd: 500 },
   { label: 'usd_1000', usd: 1_000 },
   { label: 'usd_10000', usd: 10_000 },
   { label: 'usd_25000', usd: 25_000 },
@@ -441,7 +442,7 @@ export function RouteGraphView() {
           maxZoom={1.8}
         >
           <Background color="#222824" gap={24} />
-          <Controls showInteractive={false} />
+          <Controls showInteractive={false} position="bottom-right" />
         </ReactFlow>
         <ColumnLegend />
       </div>
@@ -507,7 +508,6 @@ function ExplainPanel({
         <Stat label="Executable" value={counts.paths_after_executable} />
         <Stat label="Providers" value={counts.paths_after_provider} />
         <Stat label="HyperEVM" value={counts.paths_after_hyperevm} />
-        <Stat label="Same-chain" value={counts.paths_after_same_chain} />
         <Stat label="Ranked" value={counts.ranked_count} />
       </div>
 
@@ -540,6 +540,29 @@ function ExplainPanel({
           <span className="rg-winner-out">
             out {overallWinner.estimated_amount_out}
           </span>
+        </div>
+      ) : null}
+
+      {explain.floor_rejection ? (
+        <div className="rg-floor-rejected">
+          <span className="rg-floor-tag">Rejected</span>
+          <span>
+            output {explain.floor_rejection.estimated_amount_out} is below the
+            destination dust floor of {explain.floor_rejection.output_floor}{' '}
+            base units — a real /quote returns OutputBelowFloor for this
+            request instead of the winner above
+          </span>
+        </div>
+      ) : null}
+
+      {(explain.warnings ?? []).length > 0 ? (
+        <div className="rg-warnings">
+          {(explain.warnings ?? []).map((warning) => (
+            <div key={warning} className="rg-warning-row">
+              <span className="rg-warning-tag">Warning</span>
+              <span>{warning}</span>
+            </div>
+          ))}
         </div>
       ) : null}
 

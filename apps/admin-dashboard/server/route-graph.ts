@@ -1,7 +1,9 @@
 import type { AdminDashboardConfig } from './config'
 
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-const REQUEST_TIMEOUT_MS = 15_000
+// Slightly above router-api's 60s end-to-end quote timeout so the proxy never
+// gives up on an explain that production would still complete.
+const REQUEST_TIMEOUT_MS = 65_000
 
 export type RouteGraphProxyConfig = Pick<
   AdminDashboardConfig,
