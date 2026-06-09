@@ -24,7 +24,7 @@ use devnet::{HyperliquidNode, HyperliquidNodeConfig, RiftDevnet};
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use hyperliquid_client::{
     client::Network, CancelRequest, ClearinghouseState, HyperliquidClient,
-    HyperliquidExchangeClient, HyperliquidInfoClient, Limit, Order, OrderRequest,
+    HyperliquidExchangeClient, HyperliquidInfoClient, L2BookResolution, Limit, Order, OrderRequest,
     SpotClearinghouseState, UserFill, UserFunding, UserNonFundingLedgerDelta,
     UserNonFundingLedgerUpdate, MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
@@ -320,6 +320,45 @@ async fn l2_book_reflects_configured_rate() {
     assert_eq!(best_ask.px, "30000");
     assert_eq!(book.bids().len(), 1);
     assert_eq!(book.asks().len(), 1);
+}
+
+#[tokio::test]
+async fn l2_book_at_aggregates_configured_levels() {
+    let (node, client, _addr) = fixture(&[]).await;
+    node.set_rate("UBTC", "USDC", 61_670.0).await;
+    node.set_book_levels(
+        "UBTC",
+        "USDC",
+        vec![(61_667.0, 0.6), (61_640.0, 1.2), (59_800.0, 5.0)],
+        vec![
+            (61_671.0, 0.5),
+            (61_673.0, 0.4),
+            (61_707.0, 1.0),
+            (62_450.0, 3.0),
+        ],
+    )
+    .await;
+
+    let book = client
+        .l2_book_at(UBTC_USDC, L2BookResolution::SigFigs2)
+        .await
+        .expect("fetch aggregated l2 book");
+
+    // `nSigFigs: 2` → $1,000 buckets labeled away from the spread: asks ceil
+    // (61,671 / 61,673 / 61,707 → 62,000; 62,450 → 63,000), bids floor
+    // (61,667 / 61,640 → 61,000; 59,800 → 59,000).
+    let asks: Vec<(&str, &str, u64)> = book
+        .asks()
+        .iter()
+        .map(|level| (level.px.as_str(), level.sz.as_str(), level.n))
+        .collect();
+    assert_eq!(asks, vec![("62000", "1.9", 3), ("63000", "3", 1)]);
+    let bids: Vec<(&str, &str, u64)> = book
+        .bids()
+        .iter()
+        .map(|level| (level.px.as_str(), level.sz.as_str(), level.n))
+        .collect();
+    assert_eq!(bids, vec![("61000", "1.8", 2), ("59000", "5", 1)]);
 }
 
 #[tokio::test]

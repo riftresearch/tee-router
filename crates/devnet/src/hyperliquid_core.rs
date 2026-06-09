@@ -19,8 +19,9 @@
 use alloy::primitives::Address;
 use chrono::Utc;
 use hyperliquid_client::{
-    spot_wire_asset_index, PerpAssetMeta, PerpMeta, SpotAssetMeta, SpotMeta, TokenInfo, UserFill,
-    UserFunding, UserNonFundingLedgerUpdate, UserRateLimit, SPOT_ASSET_INDEX_OFFSET,
+    round_down_to_resolution, round_up_to_resolution, spot_wire_asset_index, L2BookResolution,
+    PerpAssetMeta, PerpMeta, SpotAssetMeta, SpotMeta, TokenInfo, UserFill, UserFunding,
+    UserNonFundingLedgerUpdate, UserRateLimit, SPOT_ASSET_INDEX_OFFSET,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -80,6 +81,10 @@ pub(crate) struct HyperliquidCoreState {
     /// bid/ask levels. Immediate marketable orders can only consume this much
     /// liquidity before either resting (Gtc) or dropping the remainder (Ioc).
     book_depths: BTreeMap<(String, String), HyperliquidBookDepth>,
+    /// `(base, quote) -> explicit multi-level book` served by `l2Book` when
+    /// configured, overriding the single synthesized rate level. Installed by
+    /// [`Self::set_book_levels`]; affects `l2Book` responses only.
+    book_levels: BTreeMap<(String, String), HlBookLevels>,
     /// Orders that have left the open-order set and reached a terminal state.
     /// Queryable via `/info { type: "orderStatus" }`.
     terminal_orders: BTreeMap<u64, TerminalOrder>,
@@ -109,6 +114,16 @@ pub(crate) struct HyperliquidCoreState {
 struct HyperliquidBookDepth {
     bid: f64,
     ask: f64,
+}
+
+/// An explicit multi-level L2 book for one spot pair: `(px, sz)` ladders kept
+/// best-first (bids descending, asks ascending by price). Installed by
+/// [`HyperliquidCoreState::set_book_levels`] and consumed only by
+/// [`HyperliquidCoreState::l2_book_snapshot`].
+#[derive(Debug, Clone)]
+struct HlBookLevels {
+    bids: Vec<(f64, f64)>,
+    asks: Vec<(f64, f64)>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,6 +274,86 @@ fn trim_decimal_string(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// The `l2Book` 20-levels-per-side response cap, which the real API applies
+/// at every resolution (verified live 2026-06-09).
+const HYPERLIQUID_L2_BOOK_LEVEL_CAP: usize = 20;
+
+/// Fixed-point scale the aggregation label math runs at: HL prices parse at
+/// 8 decimals, so `px × 10^8` is exact for every wire-representable price.
+const HYPERLIQUID_L2_BOOK_PX_SCALE: f64 = 1e8;
+
+/// Render one side of an `l2Book` response from raw `(px, sz)` levels sorted
+/// best-first (bids descending, asks ascending by price).
+///
+/// With a `resolution`, consecutive levels are grouped into buckets labeled
+/// by the S1 rounding helpers — asks ceil up to their label and bids floor
+/// down, away from the spread, exactly as the real API does — summing `sz`
+/// and counting `n` per bucket. At full precision (`None`) the levels pass
+/// through verbatim. In both cases the side is capped at 20 levels; since
+/// the input is sorted best-first, truncation keeps the 20 lowest asks /
+/// highest bids, matching the real API's cap.
+/// Merge adjacent same-price entries of a sorted side into one level summing
+/// `sz` — the real API's per-price aggregation invariant.
+fn merge_duplicate_px_levels(levels: &mut Vec<(f64, f64)>) {
+    levels.dedup_by(|next, kept| {
+        if next.0 == kept.0 {
+            kept.1 += next.1;
+            true
+        } else {
+            false
+        }
+    });
+}
+
+fn render_l2_book_side(
+    levels: &[(f64, f64)],
+    resolution: Option<L2BookResolution>,
+    is_ask: bool,
+) -> Vec<Value> {
+    let mut rendered: Vec<Value> = match resolution {
+        None => levels
+            .iter()
+            .map(|&(px, sz)| {
+                json!({
+                    "n": 1,
+                    "px": format_hl_amount(px),
+                    "sz": format_hl_amount(sz),
+                })
+            })
+            .collect(),
+        Some(resolution) => {
+            let mut buckets: Vec<(u128, f64, u64)> = Vec::new();
+            for &(px, sz) in levels {
+                let raw = (px * HYPERLIQUID_L2_BOOK_PX_SCALE).round() as u128;
+                let label = if is_ask {
+                    round_up_to_resolution(raw, resolution)
+                } else {
+                    round_down_to_resolution(raw, resolution)
+                };
+                match buckets.last_mut() {
+                    Some((last_label, total_sz, n)) if *last_label == label => {
+                        *total_sz += sz;
+                        *n += 1;
+                    }
+                    _ => buckets.push((label, sz, 1)),
+                }
+            }
+            buckets
+                .into_iter()
+                .map(|(label, sz, n)| {
+                    json!({
+                        "n": n,
+                        "px": format_hl_amount(label as f64 / HYPERLIQUID_L2_BOOK_PX_SCALE),
+                        "sz": format_hl_amount(sz),
+                    })
+                })
+                .collect()
+        }
+    };
+    rendered.truncate(HYPERLIQUID_L2_BOOK_LEVEL_CAP);
+    rendered
 }
 
 /// Default spot meta served by the mock's `/info { type: "spotMeta" }`. Same
@@ -508,6 +603,36 @@ impl HyperliquidCoreState {
         );
     }
 
+    /// Install an explicit multi-level L2 book for a spot pair, replacing the
+    /// single synthesized rate level in `l2Book` responses. Each side is a
+    /// `(px, sz)` ladder; sides are defensively re-sorted best-first (bids
+    /// descending, asks ascending by price) and non-positive px/sz entries
+    /// are dropped.
+    ///
+    /// This configures ONLY the `l2Book` response. Matching-engine fill caps
+    /// remain governed by [`Self::set_book_depth`] (top-of-book), unchanged.
+    pub(crate) fn set_book_levels(
+        &mut self,
+        base: &str,
+        quote: &str,
+        mut bids: Vec<(f64, f64)>,
+        mut asks: Vec<(f64, f64)>,
+    ) {
+        bids.retain(|&(px, sz)| px > 0.0 && sz > 0.0);
+        asks.retain(|&(px, sz)| px > 0.0 && sz > 0.0);
+        bids.sort_by(|left, right| right.0.total_cmp(&left.0));
+        asks.sort_by(|left, right| left.0.total_cmp(&right.0));
+        // The real API never emits two levels at one price — even at full
+        // precision a level is the per-price aggregate — so merge duplicate
+        // px entries here to keep the rendered shape parity-true.
+        merge_duplicate_px_levels(&mut bids);
+        merge_duplicate_px_levels(&mut asks);
+        self.book_levels.insert(
+            (base.to_string(), quote.to_string()),
+            HlBookLevels { bids, asks },
+        );
+    }
+
     fn book_depth_for(&self, base: &str, quote: &str) -> HyperliquidBookDepth {
         self.book_depths
             .get(&(base.to_string(), quote.to_string()))
@@ -594,43 +719,36 @@ impl HyperliquidCoreState {
         Some((base.name.clone(), quote.name.clone()))
     }
 
-    /// Synthesize a one-level L2 book from the configured rate: bid == ask ==
-    /// rate. Depth is configurable per pair so tests can exercise partial-fill
-    /// behavior without a full matching engine.
-    pub(crate) fn l2_book_snapshot(&self, coin: &str) -> Value {
-        let levels = self
-            .pair_tokens(coin)
-            .and_then(|(base, quote)| {
-                self.rate_for(&base, &quote).map(|rate| {
-                    let depth = self.book_depth_for(&base, &quote);
-                    let bid = json!({
-                        "n": 1,
-                        "px": format_hl_amount(rate),
-                        "sz": format_hl_amount(depth.bid),
-                    });
-                    let ask = json!({
-                        "n": 1,
-                        "px": format_hl_amount(rate),
-                        "sz": format_hl_amount(depth.ask),
-                    });
-                    (bid, ask)
-                })
+    /// Synthesize an L2 book snapshot for `coin`, honoring the requested
+    /// aggregation `resolution` exactly like the real API (verified live, see
+    /// `docs/hyperliquid-l2-book-cache-design.md` §3): bucket labels round
+    /// away from the spread (asks ceil, bids floor) and at most 20 levels per
+    /// side are returned at every resolution.
+    ///
+    /// Raw levels come from [`Self::set_book_levels`] when the pair has an
+    /// explicit book configured; otherwise the book is the single synthesized
+    /// level at the configured rate (bid == ask == rate) with
+    /// [`Self::set_book_depth`]'s per-side size, so tests can exercise
+    /// partial-fill behavior without a full matching engine.
+    pub(crate) fn l2_book_snapshot(
+        &self,
+        coin: &str,
+        resolution: Option<L2BookResolution>,
+    ) -> Value {
+        let raw_sides = self.pair_tokens(coin).and_then(|(base, quote)| {
+            if let Some(levels) = self.book_levels.get(&(base.clone(), quote.clone())) {
+                return Some((levels.bids.clone(), levels.asks.clone()));
+            }
+            self.rate_for(&base, &quote).map(|rate| {
+                let depth = self.book_depth_for(&base, &quote);
+                (vec![(rate, depth.bid)], vec![(rate, depth.ask)])
             })
-            .map(|(bid, ask)| {
-                let level = json!({
-                    "n": 1,
-                    "px": bid["px"],
-                    "sz": bid["sz"],
-                });
-                let ask_level = json!({
-                    "n": 1,
-                    "px": ask["px"],
-                    "sz": ask["sz"],
-                });
-                (level, ask_level)
-            });
-        let (bids, asks) = match levels {
-            Some((bid, ask)) => (vec![bid], vec![ask]),
+        });
+        let (bids, asks) = match raw_sides {
+            Some((bids, asks)) => (
+                render_l2_book_side(&bids, resolution, false),
+                render_l2_book_side(&asks, resolution, true),
+            ),
             None => (vec![], vec![]),
         };
         json!({

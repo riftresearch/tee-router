@@ -38,9 +38,9 @@ use alloy::{
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use chrono::Utc;
 use hyperliquid_client::{
-    recover_l1_signer, recover_typed_signer, Actions, SendAsset, SpotSend, UsdClassTransfer,
-    UserFill, UserFunding, UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate, Withdraw3,
-    MINIMUM_BRIDGE_DEPOSIT_USDC,
+    recover_l1_signer, recover_typed_signer, Actions, L2BookResolution, SendAsset, SpotSend,
+    UsdClassTransfer, UserFill, UserFunding, UserNonFundingLedgerDelta, UserNonFundingLedgerUpdate,
+    Withdraw3, MINIMUM_BRIDGE_DEPOSIT_USDC,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -412,6 +412,24 @@ impl HyperliquidNode {
         self.core.lock().await.set_book_depth(base, quote, depth);
     }
 
+    /// Install an explicit multi-level L2 book (`(px, sz)` ladders per side)
+    /// for a spot pair, replacing the single synthesized rate level in
+    /// `l2Book` responses. Useful for `nSigFigs` aggregation / book-walking
+    /// semantics. Affects ONLY `l2Book`; matching-engine fill caps remain
+    /// governed by [`Self::set_book_depth`] (top-of-book), unchanged.
+    pub async fn set_book_levels(
+        &self,
+        base: &str,
+        quote: &str,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
+    ) {
+        self.core
+            .lock()
+            .await
+            .set_book_levels(base, quote, bids, asks);
+    }
+
     /// Seed a historical fill for `/info { type: "userFills" }` /
     /// `userFillsByTime` shape tests. Mirrors the former
     /// `MockIntegratorServer::record_hyperliquid_fill`.
@@ -604,6 +622,37 @@ fn validation_error(message: String) -> axum::response::Response {
     error_response(StatusCode::UNPROCESSABLE_ENTITY, message)
 }
 
+/// Parse the optional `nSigFigs` / `mantissa` params of an `l2Book` request
+/// into the closed [`L2BookResolution`] ladder. The accepted combinations
+/// (verified live, see `docs/hyperliquid-l2-book-cache-design.md` §3.2) are
+/// exactly: both absent (or JSON `null`, which the real API treats as absent
+/// — `nSigFigs: null` is byte-identical to `nSigFigs: 5` because HL prices
+/// carry ≤5 sig figs), `nSigFigs` ∈ {2,3,4,5} without a mantissa, and
+/// `mantissa` ∈ {2,5} alongside `nSigFigs: 5`. Everything else — wrong
+/// integers, non-integer JSON values, a mantissa with the wrong (or no)
+/// `nSigFigs` — is `Err(())`, which the handler turns into the real API's
+/// opaque 500/`null` reject.
+fn parse_l2_book_resolution(request: &Value) -> Result<Option<L2BookResolution>, ()> {
+    let n_sig_figs = match request.get("nSigFigs") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or(())?),
+    };
+    let mantissa = match request.get("mantissa") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or(())?),
+    };
+    match (n_sig_figs, mantissa) {
+        (None, None) => Ok(None),
+        (Some(5), None) => Ok(Some(L2BookResolution::SigFigs5)),
+        (Some(5), Some(2)) => Ok(Some(L2BookResolution::SigFigs5Mantissa2)),
+        (Some(5), Some(5)) => Ok(Some(L2BookResolution::SigFigs5Mantissa5)),
+        (Some(4), None) => Ok(Some(L2BookResolution::SigFigs4)),
+        (Some(3), None) => Ok(Some(L2BookResolution::SigFigs3)),
+        (Some(2), None) => Ok(Some(L2BookResolution::SigFigs2)),
+        _ => Err(()),
+    }
+}
+
 /// The node's `/info` read-only endpoint. Dispatches on the `type`
 /// discriminator and reuses the core's snapshot methods. Mirrors the venue
 /// mock's `/info` so clients speak the same wire shape, but reads from this
@@ -633,7 +682,17 @@ async fn node_info(
                     "l2Book requires a `coin` field",
                 );
             };
-            Json(hl.l2_book_snapshot(coin)).into_response()
+            let resolution = match parse_l2_book_resolution(&request) {
+                Ok(resolution) => resolution,
+                // Byte-parity with the real API (verified live 2026-06-09):
+                // every invalid `nSigFigs`/`mantissa` combination is answered
+                // with HTTP 500 and the literal 4-byte body `null` — NOT a
+                // 422 with an error message.
+                Err(()) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(Value::Null)).into_response();
+                }
+            };
+            Json(hl.l2_book_snapshot(coin, resolution)).into_response()
         }
         "orderStatus" => {
             let user = match required_user(&request, "orderStatus") {
@@ -1756,6 +1815,212 @@ mod tests {
             "l2Book requires a `coin` field",
         )
         .await;
+    }
+
+    /// The configured multi-level UBTC/USDC book shared by the `l2Book`
+    /// aggregation tests below: rate 61,670 with asks/bids straddling several
+    /// `nSigFigs: 2` ($1,000) bucket boundaries.
+    async fn l2_book_test_node() -> HyperliquidNode {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        node.set_rate("UBTC", "USDC", 61_670.0).await;
+        node.set_book_levels(
+            "UBTC",
+            "USDC",
+            vec![(61_667.0, 0.6), (61_640.0, 1.2), (59_800.0, 5.0)],
+            vec![
+                (61_671.0, 0.5),
+                (61_673.0, 0.4),
+                (61_707.0, 1.0),
+                (62_450.0, 3.0),
+            ],
+        )
+        .await;
+        node
+    }
+
+    /// Each side of a deserialized book as `(px, sz, n)` tuples for exact
+    /// whole-side comparison.
+    fn level_tuples(side: &[hyperliquid_client::info::L2Level]) -> Vec<(String, String, u64)> {
+        side.iter()
+            .map(|level| (level.px.clone(), level.sz.clone(), level.n))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_honors_n_sig_figs_aggregation() {
+        use hyperliquid_client::info::L2BookSnapshot;
+        let node = l2_book_test_node().await;
+        let book: L2BookSnapshot = info_post(
+            &node,
+            json!({ "type": "l2Book", "coin": "UBTC/USDC", "nSigFigs": 2 }),
+        )
+        .await
+        .json()
+        .await
+        .expect("deserialize L2BookSnapshot");
+
+        // $1,000 buckets at this magnitude, labeled away from the spread:
+        // asks ceil (61,671 / 61,673 / 61,707 → 62,000; 62,450 → 63,000) and
+        // bids floor (61,667 / 61,640 → 61,000; 59,800 → 59,000).
+        assert_eq!(
+            level_tuples(book.asks()),
+            vec![
+                ("62000".to_string(), "1.9".to_string(), 3),
+                ("63000".to_string(), "3".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            level_tuples(book.bids()),
+            vec![
+                ("61000".to_string(), "1.8".to_string(), 2),
+                ("59000".to_string(), "5".to_string(), 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_full_precision_returns_configured_levels() {
+        use hyperliquid_client::info::L2BookSnapshot;
+        let node = l2_book_test_node().await;
+        let book: L2BookSnapshot =
+            info_post(&node, json!({ "type": "l2Book", "coin": "UBTC/USDC" }))
+                .await
+                .json()
+                .await
+                .expect("deserialize L2BookSnapshot");
+
+        // No `nSigFigs` → every configured level verbatim, asks ascending and
+        // bids descending by price.
+        assert_eq!(
+            level_tuples(book.asks()),
+            vec![
+                ("61671".to_string(), "0.5".to_string(), 1),
+                ("61673".to_string(), "0.4".to_string(), 1),
+                ("61707".to_string(), "1".to_string(), 1),
+                ("62450".to_string(), "3".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            level_tuples(book.bids()),
+            vec![
+                ("61667".to_string(), "0.6".to_string(), 1),
+                ("61640".to_string(), "1.2".to_string(), 1),
+                ("59800".to_string(), "5".to_string(), 1),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_rejects_invalid_sig_figs_combos() {
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        // Every combination outside the verified six-setting ladder must be
+        // answered exactly like the real API: HTTP 500 with the literal
+        // 4-byte body `null` (verified live 2026-06-09) — not a 422.
+        let invalid_param_sets = [
+            json!({ "nSigFigs": 1 }),
+            json!({ "nSigFigs": 6 }),
+            json!({ "nSigFigs": 5, "mantissa": 1 }),
+            json!({ "nSigFigs": 5, "mantissa": 3 }),
+            json!({ "nSigFigs": 5, "mantissa": 4 }),
+            json!({ "nSigFigs": 5, "mantissa": 10 }),
+            json!({ "nSigFigs": 2, "mantissa": 2 }),
+            json!({ "nSigFigs": 3, "mantissa": 5 }),
+            json!({ "nSigFigs": 4, "mantissa": 2 }),
+            json!({ "mantissa": 2 }),
+            json!({ "mantissa": 5 }),
+            json!({ "nSigFigs": "5" }),
+            json!({ "nSigFigs": 2.5 }),
+            json!({ "nSigFigs": 5, "mantissa": "2" }),
+        ];
+        for params in invalid_param_sets {
+            let mut body = json!({ "type": "l2Book", "coin": "UBTC/USDC" });
+            body.as_object_mut()
+                .expect("body object")
+                .extend(params.as_object().expect("params object").clone());
+            let response = info_post(&node, body.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "params: {params}"
+            );
+            let raw = response.text().await.expect("raw body");
+            assert_eq!(raw, "null", "params: {params}");
+        }
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_caps_levels_at_twenty() {
+        use hyperliquid_client::info::L2BookSnapshot;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        node.set_rate("UBTC", "USDC", 61_670.0).await;
+        // 25 distinct $1-spaced ask levels: the full-precision response must
+        // keep exactly the 20 lowest (the cap applies at every resolution).
+        let asks: Vec<(f64, f64)> = (0..25).map(|i| (61_671.0 + f64::from(i), 0.1)).collect();
+        node.set_book_levels("UBTC", "USDC", vec![(61_667.0, 1.0)], asks)
+            .await;
+        let book: L2BookSnapshot =
+            info_post(&node, json!({ "type": "l2Book", "coin": "UBTC/USDC" }))
+                .await
+                .json()
+                .await
+                .expect("deserialize L2BookSnapshot");
+
+        assert_eq!(book.asks().len(), 20);
+        assert_eq!(book.asks().first().expect("first ask").px, "61671");
+        assert_eq!(book.asks().last().expect("last ask").px, "61690");
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_caps_aggregated_levels_at_twenty() {
+        use hyperliquid_client::info::L2BookSnapshot;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        node.set_rate("UBTC", "USDC", 61_670.0).await;
+        // 25 asks spaced $1,000 apart land in 25 distinct nSigFigs:2 buckets
+        // (61,500 ceils to 62,000; 62,500 to 63,000; ... 85,500 to 86,000):
+        // the cap must apply to the *aggregated* side — the path the router
+        // cache actually consumes — keeping the 20 lowest buckets.
+        let asks: Vec<(f64, f64)> = (0..25).map(|i| (61_500.0 + 1_000.0 * f64::from(i), 0.1)).collect();
+        node.set_book_levels("UBTC", "USDC", vec![(61_667.0, 1.0)], asks)
+            .await;
+        let book: L2BookSnapshot = info_post(
+            &node,
+            json!({ "type": "l2Book", "coin": "UBTC/USDC", "nSigFigs": 2 }),
+        )
+        .await
+        .json()
+        .await
+        .expect("deserialize L2BookSnapshot");
+
+        assert_eq!(book.asks().len(), 20);
+        assert_eq!(book.asks().first().expect("first ask").px, "62000");
+        assert_eq!(book.asks().last().expect("last ask").px, "81000");
+    }
+
+    #[tokio::test]
+    async fn info_l2_book_aggregation_of_default_single_level_book() {
+        use hyperliquid_client::info::L2BookSnapshot;
+        let node = HyperliquidNode::spawn().await.expect("spawn node");
+        node.set_rate("UBTC", "USDC", 61_670.0).await;
+        let book: L2BookSnapshot = info_post(
+            &node,
+            json!({ "type": "l2Book", "coin": "UBTC/USDC", "nSigFigs": 2 }),
+        )
+        .await
+        .json()
+        .await
+        .expect("deserialize L2BookSnapshot");
+
+        // Without `set_book_levels` the book is the single synthesized level
+        // at the rate (bid == ask == 61,670, default depth): one bucket per
+        // side at the away-from-spread label.
+        assert_eq!(
+            level_tuples(book.asks()),
+            vec![("62000".to_string(), "1000000".to_string(), 1)]
+        );
+        assert_eq!(
+            level_tuples(book.bids()),
+            vec![("61000".to_string(), "1000000".to_string(), 1)]
+        );
     }
 
     #[tokio::test]
