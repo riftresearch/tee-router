@@ -626,7 +626,8 @@ impl RouteCostService {
                 let outcome = self
                     .live_cost_snapshot(&transition, now, expires_at, tier, &pricing_inner)
                     .await;
-                let elapsed_ms = u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let elapsed_ms =
+                    u64::try_from(call_started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 (transition, tier, outcome, elapsed_ms)
             });
         }
@@ -920,15 +921,20 @@ impl RouteCostService {
                 self.live_bridge_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
             }
-            MarketOrderTransitionKind::UnitDeposit
-            | MarketOrderTransitionKind::UnitWithdrawal => {
+            MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
                 self.live_unit_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
                     .await
             }
             MarketOrderTransitionKind::UniversalRouterSwap
             | MarketOrderTransitionKind::HyperliquidTrade => {
-                self.live_exchange_cost_snapshot(transition, refreshed_at, expires_at, tier, pricing)
-                    .await
+                self.live_exchange_cost_snapshot(
+                    transition,
+                    refreshed_at,
+                    expires_at,
+                    tier,
+                    pricing,
+                )
+                .await
             }
         }
     }
@@ -1046,7 +1052,8 @@ impl RouteCostService {
             sender_address: Some(DUMMY_EVM_DEPOSITOR.to_string()),
             recipient_address: DUMMY_EVM_RECIPIENT.to_string(),
         };
-        let quote = match timeout(ROUTE_COST_PROVIDER_TIMEOUT, exchange.quote_trade(request)).await {
+        let quote = match timeout(ROUTE_COST_PROVIDER_TIMEOUT, exchange.quote_trade(request)).await
+        {
             Ok(Ok(Some(quote))) => quote,
             Ok(Ok(None)) => {
                 // A swap venue with no route at this size means it cannot fill
@@ -1302,7 +1309,9 @@ impl PricingSnapshotProvider for RouteCostService {
 
 enum LiveCostSnapshotOutcome {
     NotAttempted,
-    Succeeded { snapshot: Box<RouteCostSnapshot> },
+    Succeeded {
+        snapshot: Box<RouteCostSnapshot>,
+    },
     Failed(String),
     /// Provider reached but reported a benign expected condition (e.g. the
     /// orderbook is too shallow for this tier). Recorded as a neutral
@@ -1555,8 +1564,7 @@ pub fn amount_aware_path_score(
                     total_effective_cost_usd_micros,
                     effective_leg_cost_usd_micros(snapshot, request_usd_micros),
                 );
-                total_latency_ms =
-                    capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
+                total_latency_ms = capped_add_u64(total_latency_ms, snapshot.estimated_latency_ms);
             }
             None => {
                 missing_edges = missing_edges.saturating_add(1);
@@ -1577,10 +1585,7 @@ pub fn amount_aware_path_score(
 /// [`amount_aware_path_score`] sums, exposed so the route explainer can render
 /// per-leg and total bps that match the ranking metric.
 #[must_use]
-pub fn effective_leg_cost_usd_micros(
-    snapshot: &RouteCostSnapshot,
-    request_usd_micros: u64,
-) -> u64 {
+pub fn effective_leg_cost_usd_micros(snapshot: &RouteCostSnapshot, request_usd_micros: u64) -> u64 {
     let bps_derived = fee_usd_micros_from_bps(snapshot.estimated_fee_bps, request_usd_micros);
     let fee = snapshot.estimated_fee_usd_micros.max(bps_derived);
     capped_add_u64(fee, snapshot.estimated_gas_usd_micros)
@@ -1597,8 +1602,11 @@ fn rank_paths_in_place(
     paths.sort_by(|left, right| {
         let left_score = amount_aware_path_score(left, snapshots, pricing, request_usd_micros);
         let right_score = amount_aware_path_score(right, snapshots, pricing, request_usd_micros);
-        path_sort_key(left, left_score, request_usd_micros)
-            .cmp(&path_sort_key(right, right_score, request_usd_micros))
+        path_sort_key(left, left_score, request_usd_micros).cmp(&path_sort_key(
+            right,
+            right_score,
+            request_usd_micros,
+        ))
     });
 }
 
@@ -1746,9 +1754,7 @@ pub struct LiveQuoteOutcome {
 /// original input is returned unchanged so the downstream live-quote stage can
 /// still try to price a route end-to-end rather than failing outright.
 #[must_use]
-pub fn retain_viable_ranked(
-    ranked: Vec<RankedTransitionPath>,
-) -> Vec<RankedTransitionPath> {
+pub fn retain_viable_ranked(ranked: Vec<RankedTransitionPath>) -> Vec<RankedTransitionPath> {
     let viable: Vec<RankedTransitionPath> = ranked
         .iter()
         .filter(|ranked_path| ranked_path.score.missing_edges == 0)
@@ -2027,7 +2033,9 @@ mod tests {
         ));
         assert!(!is_benign_unsatisfiable_amount("429 Too Many Requests"));
         assert!(!is_benign_unsatisfiable_amount("provider timed out"));
-        assert!(!is_benign_unsatisfiable_amount("400 Bad Request: invalid token"));
+        assert!(!is_benign_unsatisfiable_amount(
+            "400 Bad Request: invalid token"
+        ));
     }
 
     #[test]
@@ -2050,7 +2058,10 @@ mod tests {
         let mut prev = Duration::ZERO;
         for attempts in 1..=8 {
             let delay = retry_delay(attempts, FailureCategory::Other);
-            assert!(delay >= prev, "delay should not shrink at attempt {attempts}");
+            assert!(
+                delay >= prev,
+                "delay should not shrink at attempt {attempts}"
+            );
             prev = delay;
         }
     }
@@ -2107,7 +2118,10 @@ mod tests {
         // Nothing due at t=0.
         assert_eq!(paced_target_index(360, Duration::ZERO, window), 0);
         // Halfway through the window -> half the units.
-        assert_eq!(paced_target_index(360, Duration::from_secs(900), window), 180);
+        assert_eq!(
+            paced_target_index(360, Duration::from_secs(900), window),
+            180
+        );
         // At/after the deadline -> the whole sweep, never more.
         assert_eq!(paced_target_index(360, window, window), 360);
         assert_eq!(
@@ -2146,9 +2160,12 @@ mod tests {
             .take(3)
             .map(|(decl, _)| decl.provider.as_str())
             .collect();
-        let distinct: std::collections::BTreeSet<&str> =
-            lead_providers.iter().copied().collect();
-        assert_eq!(distinct.len(), 3, "providers should interleave: {lead_providers:?}");
+        let distinct: std::collections::BTreeSet<&str> = lead_providers.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "providers should interleave: {lead_providers:?}"
+        );
     }
 
     #[test]
@@ -2171,10 +2188,17 @@ mod tests {
         // The first three consecutive Across units are the three distinct
         // routes (tier-outer ordering), not the same route three times.
         let lead: std::collections::BTreeSet<&str> = across.iter().take(3).copied().collect();
-        assert_eq!(lead.len(), 3, "first units should be distinct routes: {across:?}");
+        assert_eq!(
+            lead.len(),
+            3,
+            "first units should be distinct routes: {across:?}"
+        );
         // No two adjacent Across units share a route id.
         for pair in across.windows(2) {
-            assert_ne!(pair[0], pair[1], "adjacent units repeat a route: {across:?}");
+            assert_ne!(
+                pair[0], pair[1],
+                "adjacent units repeat a route: {across:?}"
+            );
         }
     }
 
@@ -2205,8 +2229,7 @@ mod tests {
         let mut max_per_provider_per_tick = 0usize;
         let mut elapsed = Duration::ZERO;
         while elapsed <= window {
-            let now = start
-                + chrono::Duration::from_std(elapsed).unwrap();
+            let now = start + chrono::Duration::from_std(elapsed).unwrap();
             let chunk = claim_due_units_paced(&mut cursors, &plan, now, window);
             let mut across_this_tick = 0usize;
             let mut cctp_this_tick = 0usize;
@@ -2218,8 +2241,9 @@ mod tests {
                 }
             }
             // Each provider advances at most one unit per tick at this rate.
-            max_per_provider_per_tick =
-                max_per_provider_per_tick.max(across_this_tick).max(cctp_this_tick);
+            max_per_provider_per_tick = max_per_provider_per_tick
+                .max(across_this_tick)
+                .max(cctp_this_tick);
             across += across_this_tick;
             cctp += cctp_this_tick;
             elapsed += tick;
@@ -2968,7 +2992,10 @@ mod tests {
         // low-tier row cannot under-price a large request: 20 bps of $1000 = $2.
         let request = 1_000 * USD_MICRO;
         let snapshot = make_snapshot("leg", 20, 1, 0, 0, 1);
-        assert_eq!(effective_leg_cost_usd_micros(&snapshot, request), 2 * USD_MICRO);
+        assert_eq!(
+            effective_leg_cost_usd_micros(&snapshot, request),
+            2 * USD_MICRO
+        );
     }
 
     #[test]
@@ -2998,8 +3025,14 @@ mod tests {
     #[test]
     fn path_sort_key_orders_by_total_cost_before_latency() {
         let req = 1_000 * USD_MICRO;
-        let cheap = path("z", vec![transition("e", MarketOrderTransitionKind::CctpBridge)]);
-        let pricey = path("a", vec![transition("f", MarketOrderTransitionKind::CctpBridge)]);
+        let cheap = path(
+            "z",
+            vec![transition("e", MarketOrderTransitionKind::CctpBridge)],
+        );
+        let pricey = path(
+            "a",
+            vec![transition("f", MarketOrderTransitionKind::CctpBridge)],
+        );
         // Cheaper total cost wins even with much higher latency.
         assert!(
             path_sort_key(&cheap, score_of(0, 100, 9_999), req)
@@ -3013,8 +3046,14 @@ mod tests {
         // A fully-priced route at $5 vs a partially-unknown route whose known
         // cost is only $1: the unknown-leg penalty (10% of $1000 = $100) must
         // make the fully-priced route sort first.
-        let priced = path("priced", vec![transition("p", MarketOrderTransitionKind::CctpBridge)]);
-        let missing = path("missing", vec![transition("m", MarketOrderTransitionKind::CctpBridge)]);
+        let priced = path(
+            "priced",
+            vec![transition("p", MarketOrderTransitionKind::CctpBridge)],
+        );
+        let missing = path(
+            "missing",
+            vec![transition("m", MarketOrderTransitionKind::CctpBridge)],
+        );
         assert!(
             path_sort_key(&priced, score_of(0, 5 * USD_MICRO, 0), req)
                 < path_sort_key(&missing, score_of(1, 1 * USD_MICRO, 0), req)
@@ -3024,8 +3063,14 @@ mod tests {
     #[test]
     fn path_sort_key_equal_missing_counts_compare_on_real_cost() {
         let req = 1_000 * USD_MICRO;
-        let cheaper = path("a", vec![transition("x", MarketOrderTransitionKind::CctpBridge)]);
-        let pricier = path("b", vec![transition("y", MarketOrderTransitionKind::CctpBridge)]);
+        let cheaper = path(
+            "a",
+            vec![transition("x", MarketOrderTransitionKind::CctpBridge)],
+        );
+        let pricier = path(
+            "b",
+            vec![transition("y", MarketOrderTransitionKind::CctpBridge)],
+        );
         assert!(
             path_sort_key(&cheaper, score_of(1, 1_000, 0), req)
                 < path_sort_key(&pricier, score_of(1, 2_000, 0), req)
@@ -3037,7 +3082,10 @@ mod tests {
     #[test]
     fn amount_aware_score_marks_uncached_leg_missing_with_zero_cost() {
         let pricing = PricingSnapshot::static_bootstrap(Utc::now());
-        let p = path("p", vec![transition("only", MarketOrderTransitionKind::CctpBridge)]);
+        let p = path(
+            "p",
+            vec![transition("only", MarketOrderTransitionKind::CctpBridge)],
+        );
         let score = amount_aware_path_score(&p, &HashMap::new(), &pricing, 1_000 * USD_MICRO);
         assert_eq!(score.missing_edges, 1);
         assert_eq!(score.total_effective_cost_usd_micros, 0);
@@ -3053,9 +3101,11 @@ mod tests {
         let across = transition("across", MarketOrderTransitionKind::AcrossBridge);
         let mut snapshots = HashMap::new();
         snapshots.insert(cctp.id.clone(), make_snapshot(&cctp.id, 1, 0, 0, 0, req));
-        snapshots.insert(across.id.clone(), make_snapshot(&across.id, 2, 0, 0, 0, req));
-        let cctp_score =
-            amount_aware_path_score(&path("c", vec![cctp]), &snapshots, &pricing, req);
+        snapshots.insert(
+            across.id.clone(),
+            make_snapshot(&across.id, 2, 0, 0, 0, req),
+        );
+        let cctp_score = amount_aware_path_score(&path("c", vec![cctp]), &snapshots, &pricing, req);
         let across_score =
             amount_aware_path_score(&path("a", vec![across]), &snapshots, &pricing, req);
         assert!(
@@ -3076,7 +3126,10 @@ mod tests {
         let v_eth = transition("v_eth", MarketOrderTransitionKind::UniversalRouterSwap);
         let unit = transition("unit", MarketOrderTransitionKind::UnitDeposit);
         let mut snapshots = HashMap::new();
-        snapshots.insert(v_usdc.id.clone(), make_snapshot(&v_usdc.id, 57, 0, 0, 0, req));
+        snapshots.insert(
+            v_usdc.id.clone(),
+            make_snapshot(&v_usdc.id, 57, 0, 0, 0, req),
+        );
         snapshots.insert(cctp.id.clone(), make_snapshot(&cctp.id, 1, 0, 0, 0, req));
         snapshots.insert(v_eth.id.clone(), make_snapshot(&v_eth.id, 39, 0, 0, 0, req));
         snapshots.insert(unit.id.clone(), make_snapshot(&unit.id, 13, 0, 0, 0, req));
@@ -3085,8 +3138,7 @@ mod tests {
         let eth_path =
             amount_aware_path_score(&path("eth", vec![v_eth, unit]), &snapshots, &pricing, req);
         assert!(
-            eth_path.total_effective_cost_usd_micros
-                < usdc_path.total_effective_cost_usd_micros,
+            eth_path.total_effective_cost_usd_micros < usdc_path.total_effective_cost_usd_micros,
             "cheaper Velora->ETH total (52 bps) must beat Velora->USDC (58 bps)"
         );
     }

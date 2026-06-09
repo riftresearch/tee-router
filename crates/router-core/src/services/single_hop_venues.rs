@@ -4,8 +4,9 @@ use crate::{
         asset_registry::ProviderId,
         http_body::{read_limited_response_text, response_body_error_preview},
         single_hop_assets::{
-            VenueAsset, VenueAssetMap, CHAINFLIP_ASSET_MAP_SPEC, GARDEN_ASSET_MAP_SPEC,
-            MAYAN_ASSET_MAP_SPEC, NEAR_INTENTS_ASSET_MAP_SPEC, RELAY_ASSET_MAP_SPEC,
+            VenueAsset, VenueAssetMap, CHAINFLIP_ASSET_MAP_SPEC, CHANGENOW_ASSET_MAP_SPEC,
+            GARDEN_ASSET_MAP_SPEC, MAYAN_ASSET_MAP_SPEC, NEAR_INTENTS_ASSET_MAP_SPEC,
+            RELAY_ASSET_MAP_SPEC,
         },
         upstream_proxy::ProxyUrl,
     },
@@ -31,7 +32,9 @@ pub type SingleHopQuoteFuture<'a, T> =
 #[derive(Debug, Clone)]
 pub struct SingleHopQuoteRequest {
     pub source_asset: DepositAsset,
+    pub source_decimals: u8,
     pub destination_asset: DepositAsset,
+    pub destination_decimals: u8,
     pub amount_in: String,
     pub source_depositor_address: String,
     pub destination_recipient_address: String,
@@ -619,6 +622,189 @@ impl SingleHopQuoteProvider for GardenQuoteProvider {
     }
 }
 
+#[derive(Clone)]
+pub struct ChangenowQuoteProvider {
+    base_url: String,
+    api_key: String,
+    http: reqwest::Client,
+    asset_map: VenueAssetMap,
+}
+
+impl ChangenowQuoteProvider {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        proxy_url: Option<&ProxyUrl>,
+    ) -> SingleHopQuoteResult<Self> {
+        let api_key = api_key.into().trim().to_string();
+        if api_key.is_empty() {
+            return Err("changenow api key must not be empty".to_string());
+        }
+        Ok(Self {
+            base_url: normalize_base_url(base_url)?,
+            api_key,
+            http: rustls_http_client(proxy_url)?,
+            asset_map: VenueAssetMap::new(CHANGENOW_ASSET_MAP_SPEC)?,
+        })
+    }
+}
+
+impl SingleHopQuoteProvider for ChangenowQuoteProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::Changenow
+    }
+
+    fn quote_market_order<'a>(
+        &'a self,
+        request: SingleHopQuoteRequest,
+    ) -> SingleHopQuoteFuture<'a, Option<SingleHopQuote>> {
+        Box::pin(async move {
+            let Some(from) = self
+                .asset_map
+                .to_venue_asset(&request.source_asset)
+                .into_asset()
+            else {
+                return Ok(None);
+            };
+            let Some(to) = self
+                .asset_map
+                .to_venue_asset(&request.destination_asset)
+                .into_asset()
+            else {
+                return Ok(None);
+            };
+
+            let from_amount =
+                format_raw_units_as_decimal(&request.amount_in, request.source_decimals)?;
+            let query = vec![
+                ("fromCurrency", from.asset.to_lowercase()),
+                ("toCurrency", to.asset.to_lowercase()),
+                ("fromNetwork", from.chain.to_lowercase()),
+                ("toNetwork", to.chain.to_lowercase()),
+                ("fromAmount", from_amount.clone()),
+                ("flow", "standard".to_string()),
+            ];
+
+            let Some((response, raw_body)) = send_changenow_json_request(
+                self.http
+                    .get(format!("{}/v2/exchange/estimated-amount", self.base_url))
+                    .query(&query)
+                    .header("x-changenow-api-key", &self.api_key),
+                "/v2/exchange/estimated-amount",
+            )
+            .await?
+            else {
+                return Ok(None);
+            };
+
+            let to_amount_decimal = json_decimal_field_from_body(&raw_body, "toAmount")
+                .ok_or_else(|| "changenow response missing toAmount".to_string())?;
+            let to_amount =
+                parse_decimal_to_raw_units_floor(&to_amount_decimal, request.destination_decimals)?;
+
+            Ok(Some(SingleHopQuote {
+                provider_id: ProviderId::Changenow,
+                amount_in: request.amount_in,
+                estimated_amount_out: to_amount,
+                // ChangeNOW's standard estimate response does not expose a guaranteed
+                // minimum destination amount. Its min-amount/range endpoints expose
+                // source-side pair bounds, which are not a slippage-protected output.
+                min_amount_out: None,
+                provider_quote: json!({
+                    "request": query,
+                    "request_amount_in_decimal": from_amount,
+                    "response": response,
+                    "response_to_amount_decimal": to_amount_decimal,
+                    "planner": "single_hop_quote_v1"
+                }),
+                expires_at: default_quote_expiry(),
+            }))
+        })
+    }
+}
+
+fn changenow_response_is_no_route(status: StatusCode, value: &Value, _body: &str) -> bool {
+    if status == StatusCode::BAD_REQUEST {
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            return matches!(error, "out_of_range" | "no_route" | "pair_not_supported");
+        }
+        if let Some(message) = value.get("message").and_then(Value::as_str) {
+            let msg = message.to_lowercase();
+            return msg.contains("out of range")
+                || msg.contains("pair is not supported")
+                || msg.contains("pair not supported")
+                || msg.contains("not available for exchange");
+        }
+    }
+    false
+}
+
+async fn send_changenow_json_request(
+    builder: RequestBuilder,
+    endpoint: &'static str,
+) -> SingleHopQuoteResult<Option<(Value, String)>> {
+    let started = Instant::now();
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) => {
+            telemetry::record_trading_venue_transport_error(
+                ProviderId::Changenow.as_str(),
+                "GET",
+                endpoint,
+                started.elapsed(),
+            );
+            return Err(format!(
+                "{} quote request failed: {}",
+                ProviderId::Changenow.as_str(),
+                err.without_url()
+            ));
+        }
+    };
+    let status = response.status();
+    telemetry::record_trading_venue_http_status(
+        ProviderId::Changenow.as_str(),
+        "GET",
+        endpoint,
+        status.as_u16(),
+        started.elapsed(),
+    );
+    let body = read_limited_response_text(response, SINGLE_HOP_QUOTE_RESPONSE_MAX_BYTES)
+        .await
+        .map_err(|err| {
+            format!(
+                "{} quote response body read failed: {err}",
+                ProviderId::Changenow.as_str()
+            )
+        })?;
+    if body.truncated {
+        return Err(format!(
+            "{} quote response body exceeded {SINGLE_HOP_QUOTE_RESPONSE_MAX_BYTES} bytes",
+            ProviderId::Changenow.as_str()
+        ));
+    }
+    let text = body.text;
+    let value: Value = serde_json::from_str(&text).map_err(|err| {
+        format!(
+            "{} quote response was not valid JSON ({}): {err}",
+            ProviderId::Changenow.as_str(),
+            response_body_error_preview(&text),
+        )
+    })?;
+
+    if status.is_success() {
+        return Ok(Some((value, text)));
+    }
+    if changenow_response_is_no_route(status, &value, &text) {
+        return Ok(None);
+    }
+
+    Err(format!(
+        "{} quote returned status {}: {}",
+        ProviderId::Changenow.as_str(),
+        status,
+        response_body_error_preview(&text)
+    ))
+}
 async fn send_json_request(
     builder: RequestBuilder,
     venue: &'static str,
@@ -898,6 +1084,95 @@ fn default_quote_expiry() -> DateTime<Utc> {
     Utc::now() + chrono::Duration::seconds(SINGLE_HOP_DEFAULT_QUOTE_TTL_SECONDS)
 }
 
+fn format_raw_units_as_decimal(raw_amount: &str, decimals: u8) -> SingleHopQuoteResult<String> {
+    let digits = raw_amount.trim();
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(format!("invalid base-unit amount {raw_amount:?}"));
+    }
+    let decimals = usize::from(decimals);
+    let normalized = digits.trim_start_matches('0');
+    let digits = if normalized.is_empty() {
+        "0"
+    } else {
+        normalized
+    };
+    if decimals == 0 {
+        return Ok(digits.to_string());
+    }
+    let padded;
+    let digits = if digits.len() <= decimals {
+        padded = format!("{:0>width$}", digits, width = decimals + 1);
+        padded.as_str()
+    } else {
+        digits
+    };
+    let split_at = digits.len() - decimals;
+    let (whole, frac) = digits.split_at(split_at);
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() {
+        Ok(whole.to_string())
+    } else {
+        Ok(format!("{whole}.{frac}"))
+    }
+}
+
+fn parse_decimal_to_raw_units_floor(value: &str, decimals: u8) -> SingleHopQuoteResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('+') {
+        return Err(format!("invalid decimal amount {value:?}"));
+    }
+    if trimmed.contains('e') || trimmed.contains('E') {
+        return Err(format!(
+            "decimal amount must not use exponent notation: {value:?}"
+        ));
+    }
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.chars().all(|ch| ch.is_ascii_digit())
+        || !frac.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return Err(format!("invalid decimal amount {value:?}"));
+    }
+
+    let decimals = usize::from(decimals);
+    let frac = if frac.len() > decimals {
+        &frac[..decimals]
+    } else {
+        frac
+    };
+    let combined = format!("{whole}{frac:0<width$}", width = decimals);
+    let normalized = combined.trim_start_matches('0');
+    if normalized.is_empty() {
+        Ok("0".to_string())
+    } else {
+        Ok(normalized.to_string())
+    }
+}
+
+fn json_decimal_field_from_body(body: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = body.find(&needle)? + needle.len();
+    let colon = body[start..].find(':')? + start + 1;
+    let rest = body[colon..].trim_start();
+    if let Some(unquoted) = rest.strip_prefix('"') {
+        let end = unquoted.find('"')?;
+        return Some(unquoted[..end].to_string());
+    }
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        None
+    } else {
+        Some(rest[..end].to_string())
+    }
+}
+
 fn parse_u128_string(value: &str) -> Option<u128> {
     value.parse::<u128>().ok()
 }
@@ -933,6 +1208,43 @@ mod tests {
             .expect("ethereum usdc");
         assert_eq!(usdc.chain, "1");
         assert_eq!(usdc.asset, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+    }
+
+    #[test]
+    fn maps_changenow_router_assets() {
+        let map = VenueAssetMap::new(CHANGENOW_ASSET_MAP_SPEC).expect("changenow map");
+        let btc = map
+            .to_venue_asset(&asset("bitcoin", AssetId::Native))
+            .into_asset()
+            .expect("btc");
+        assert_eq!(btc.chain, "btc");
+        assert_eq!(btc.asset, "btc");
+
+        let wbtc = map
+            .to_venue_asset(&asset(
+                "evm:1",
+                AssetId::reference("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
+            ))
+            .into_asset()
+            .expect("ethereum wbtc");
+        assert_eq!(wbtc.chain, "eth");
+        assert_eq!(wbtc.asset, "wbtc");
+    }
+
+    #[test]
+    fn changenow_amount_conversion_preserves_base_units() {
+        assert_eq!(
+            format_raw_units_as_decimal("150000000", 8).expect("raw to decimal"),
+            "1.5"
+        );
+        assert_eq!(
+            parse_decimal_to_raw_units_floor("3.709012", 18).expect("decimal to raw"),
+            "3709012000000000000"
+        );
+        assert_eq!(
+            parse_decimal_to_raw_units_floor("1.234567891", 8).expect("floors extra precision"),
+            "123456789"
+        );
     }
 
     #[test]

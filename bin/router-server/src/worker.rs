@@ -67,10 +67,7 @@ impl fmt::Debug for RouterWorkerConfig {
                 "order_execution_poll_interval",
                 &self.order_execution_poll_interval,
             )
-            .field(
-                "route_cost_refresh_window",
-                &self.route_cost_refresh_window,
-            )
+            .field("route_cost_refresh_window", &self.route_cost_refresh_window)
             .field(
                 "provider_health_poll_interval",
                 &self.provider_health_poll_interval,
@@ -148,9 +145,7 @@ impl RouterWorkerConfig {
             order_execution_poll_interval: Duration::from_secs(
                 args.worker_order_execution_poll_seconds,
             ),
-            route_cost_refresh_window: Duration::from_secs(
-                args.worker_route_cost_refresh_seconds,
-            ),
+            route_cost_refresh_window: Duration::from_secs(args.worker_route_cost_refresh_seconds),
             provider_health_poll_interval: Duration::from_secs(
                 args.worker_provider_health_poll_seconds,
             ),
@@ -631,7 +626,10 @@ fn spawn_route_cost_refresh_if_idle(
 ) {
     if route_cost_tasks.is_empty() && *pending_route_cost_refresh {
         *pending_route_cost_refresh = false;
-        route_cost_tasks.spawn(run_route_cost_refresh(route_costs, route_cost_refresh_window));
+        route_cost_tasks.spawn(run_route_cost_refresh(
+            route_costs,
+            route_cost_refresh_window,
+        ));
     }
 }
 

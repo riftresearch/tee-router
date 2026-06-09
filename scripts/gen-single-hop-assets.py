@@ -598,6 +598,83 @@ def generate_garden(api_key: str, base_url: str) -> VenueSpec:
         header_comments=(f"Source: {base}/chains",),
     )
 
+def generate_changenow() -> VenueSpec:
+    data = http_json("https://api.changenow.io/v2/exchange/currencies?active=true")
+    if not isinstance(data, list):
+        raise SystemExit("ChangeNOW /currencies response is not an array")
+
+    wanted = {
+        "evm:1": ("eth", "eth"),
+        "evm:42161": ("arbitrum", "arbitrum"),
+        "evm:8453": ("base", "base"),
+        "bitcoin": ("btc", "btc"),
+    }
+
+    entries_by_chain = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        ticker = item.get("ticker")
+        network = item.get("network")
+        contract = item.get("tokenContract")
+
+        if not isinstance(ticker, str) or not isinstance(network, str):
+            continue
+
+        for router_chain, (venue_chain, cn_network) in wanted.items():
+            if network == cn_network:
+                if not contract:
+                    if ticker.lower() in ["eth", "btc"]:
+                        router_asset = "Native"
+                    else:
+                        continue
+                else:
+                    if router_chain.startswith("evm:"):
+                        try:
+                            router_asset = normalize_evm_address(contract)
+                        except ValueError:
+                            continue
+                    else:
+                        continue
+
+                key = (router_chain, venue_chain)
+                entries_by_chain.setdefault(key, []).append(AssetEntry(router_asset, ticker))
+
+    chain_specs = []
+    ordered = sorted(wanted.keys())
+    for router_chain in ordered:
+        venue_chain, _ = wanted[router_chain]
+        entries = dedupe_entries(
+            entries_by_chain.get((router_chain, venue_chain), []),
+            "changenow",
+            router_chain,
+        )
+        if entries:
+            chain_specs.append(
+                ChainSpec(
+                    const_name=chain_const_name("changenow", router_chain),
+                    router_chain=router_chain,
+                    venue_chain=venue_chain,
+                    policy="VenueAssetPolicy::ListedOnly",
+                    assets=entries,
+                )
+            )
+
+    return VenueSpec(
+        provider_variant="Changenow",
+        const_name="CHANGENOW_ASSET_MAP_SPEC",
+        chains_const="CHANGENOW_CHAINS",
+        chains=tuple(chain_specs),
+        imports=(
+            "RouterAssetKind",
+            "VenueAssetEntry",
+            "VenueAssetMapSpec",
+            "VenueAssetPolicy",
+            "VenueChainAssetsSpec",
+        ),
+        header_comments=("Source: https://api.changenow.io/v2/exchange/currencies?active=true",),
+    )
+
 
 GENERATORS: dict[str, Callable[[argparse.Namespace], VenueSpec]] = {
     "relay": lambda args: generate_relay(),
@@ -605,7 +682,9 @@ GENERATORS: dict[str, Callable[[argparse.Namespace], VenueSpec]] = {
     "mayan": lambda args: generate_mayan(),
     "chainflip": lambda args: generate_chainflip(),
     "garden": lambda args: generate_garden(args.garden_api_key or os.environ.get("GARDEN_API_KEY", ""), args.garden_api_url),
+    "changenow": lambda args: generate_changenow(),
 }
+
 
 CONST_NAMES = {
     "relay": "RELAY_ASSET_MAP_SPEC",
@@ -613,7 +692,9 @@ CONST_NAMES = {
     "mayan": "MAYAN_ASSET_MAP_SPEC",
     "chainflip": "CHAINFLIP_ASSET_MAP_SPEC",
     "garden": "GARDEN_ASSET_MAP_SPEC",
+    "changenow": "CHANGENOW_ASSET_MAP_SPEC",
 }
+
 
 
 def selected_venues(value: str) -> list[str]:
@@ -631,7 +712,7 @@ def main() -> None:
     parser.add_argument(
         "--venue",
         default="all",
-        help="Venue to generate: all, or comma-separated relay,near_intents,mayan,chainflip,garden",
+        help="Venue to generate: all, or comma-separated relay,near_intents,mayan,chainflip,garden,changenow",
     )
     parser.add_argument("--check", action="store_true", help="Fail if generated files are not up to date")
     parser.add_argument(

@@ -1229,7 +1229,9 @@ async fn get_route_graph(
     headers: HeaderMap,
 ) -> RouterServerResult<Json<RouteGraphEnvelope>> {
     authorize_admin_api_request(&state, &headers)?;
-    Ok(Json(build_route_graph(state.order_manager.asset_registry())))
+    Ok(Json(build_route_graph(
+        state.order_manager.asset_registry(),
+    )))
 }
 
 /// Admin-only dry-run route explainer powering the interactive demo. Runs the

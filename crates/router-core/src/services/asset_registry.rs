@@ -40,7 +40,6 @@ pub enum ProviderId {
     Cctp,
     Unit,
     HyperliquidBridge,
-
     HyperliquidSpot,
     Velora,
     Relay,
@@ -48,10 +47,11 @@ pub enum ProviderId {
     Mayan,
     Chainflip,
     Garden,
+    Changenow,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Across,
         Self::Cctp,
         Self::Unit,
@@ -63,6 +63,7 @@ impl ProviderId {
         Self::Mayan,
         Self::Chainflip,
         Self::Garden,
+        Self::Changenow,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -71,7 +72,6 @@ impl ProviderId {
             "cctp" => Some(Self::Cctp),
             "unit" => Some(Self::Unit),
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
-
             "hyperliquid_spot" => Some(Self::HyperliquidSpot),
             "velora" => Some(Self::Velora),
             "relay" => Some(Self::Relay),
@@ -79,6 +79,7 @@ impl ProviderId {
             "mayan" => Some(Self::Mayan),
             "chainflip" => Some(Self::Chainflip),
             "garden" => Some(Self::Garden),
+            "changenow" => Some(Self::Changenow),
             _ => None,
         }
     }
@@ -90,7 +91,6 @@ impl ProviderId {
             Self::Cctp => "cctp",
             Self::Unit => "unit",
             Self::HyperliquidBridge => "hyperliquid_bridge",
-
             Self::HyperliquidSpot => "hyperliquid_spot",
             Self::Velora => "velora",
             Self::Relay => "relay",
@@ -98,6 +98,7 @@ impl ProviderId {
             Self::Mayan => "mayan",
             Self::Chainflip => "chainflip",
             Self::Garden => "garden",
+            Self::Changenow => "changenow",
         }
     }
 
@@ -113,9 +114,12 @@ impl ProviderId {
             Self::Velora => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::UniversalRouter,
             },
-            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden => {
-                ProviderVenueKind::SingleHop
-            }
+            Self::Relay
+            | Self::NearIntents
+            | Self::Mayan
+            | Self::Chainflip
+            | Self::Garden
+            | Self::Changenow => ProviderVenueKind::SingleHop,
         }
     }
 
@@ -131,7 +135,8 @@ impl ProviderId {
             | Self::NearIntents
             | Self::Mayan
             | Self::Chainflip
-            | Self::Garden => AssetSupportModel::OpenAddressQuote,
+            | Self::Garden
+            | Self::Changenow => AssetSupportModel::OpenAddressQuote,
         }
     }
 
@@ -139,7 +144,12 @@ impl ProviderId {
     pub fn is_single_hop_quote_provider(self) -> bool {
         matches!(
             self,
-            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden
+            Self::Relay
+                | Self::NearIntents
+                | Self::Mayan
+                | Self::Chainflip
+                | Self::Garden
+                | Self::Changenow
         )
     }
 
@@ -666,7 +676,10 @@ impl AssetRegistry {
     pub fn display_transition_declarations(&self) -> Vec<TransitionDecl> {
         let mut declarations = self.transition_declarations();
         for transition in self.curated_cacheable_transitions() {
-            if matches!(transition.kind, MarketOrderTransitionKind::UniversalRouterSwap) {
+            if matches!(
+                transition.kind,
+                MarketOrderTransitionKind::UniversalRouterSwap
+            ) {
                 declarations.push(transition);
             }
         }
@@ -745,11 +758,7 @@ impl AssetRegistry {
         self.velora_runtime_transition(source, destination)
     }
 
-    fn curated_chain_asset(
-        &self,
-        chain: &str,
-        canonical: CanonicalAsset,
-    ) -> Option<DepositAsset> {
+    fn curated_chain_asset(&self, chain: &str, canonical: CanonicalAsset) -> Option<DepositAsset> {
         self.chain_assets
             .iter()
             .find(|entry| entry.canonical == canonical && entry.chain.as_str() == chain)
@@ -1711,7 +1720,11 @@ mod tests {
         }));
 
         // CCTP USDC trio.
-        assert!(has(MarketOrderTransitionKind::CctpBridge, "evm:1", "evm:8453"));
+        assert!(has(
+            MarketOrderTransitionKind::CctpBridge,
+            "evm:1",
+            "evm:8453"
+        ));
         // Same-chain Velora swaps are present bidirectionally.
         assert!(has(
             MarketOrderTransitionKind::UniversalRouterSwap,
@@ -1725,10 +1738,12 @@ mod tests {
         )));
 
         // Hyperliquid's native USDC bridge is curated in both directions.
-        assert!(curated.iter().any(|decl| decl.kind
-            == MarketOrderTransitionKind::HyperliquidBridgeDeposit));
-        assert!(curated.iter().any(|decl| decl.kind
-            == MarketOrderTransitionKind::HyperliquidBridgeWithdrawal));
+        assert!(curated
+            .iter()
+            .any(|decl| decl.kind == MarketOrderTransitionKind::HyperliquidBridgeDeposit));
+        assert!(curated
+            .iter()
+            .any(|decl| decl.kind == MarketOrderTransitionKind::HyperliquidBridgeWithdrawal));
 
         // Hyperliquid spot trades are curated for the priced USDC<->BTC/ETH
         // pairs (bidirectional).

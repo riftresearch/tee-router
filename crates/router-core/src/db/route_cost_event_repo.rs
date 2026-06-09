@@ -1,6 +1,4 @@
-use crate::{
-    error::RouterCoreResult, services::route_costs::RouteCostSampleEvent, telemetry,
-};
+use crate::{error::RouterCoreResult, services::route_costs::RouteCostSampleEvent, telemetry};
 use chrono::Utc;
 use sqlx_postgres::PgPool;
 use std::time::Instant;

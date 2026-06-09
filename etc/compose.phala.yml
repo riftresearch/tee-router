@@ -352,6 +352,10 @@ x-router-environment: &router-environment
   # Required whenever GARDEN_API_URL is set (it is, above). Supply the real
   # garden-app-id key via the Phala deploy env/secrets — never hardcode it here.
   - GARDEN_API_KEY=${GARDEN_API_KEY:?set GARDEN_API_KEY (Garden garden-app-id) — required because GARDEN_API_URL is enabled}
+  - CHANGENOW_API_URL=${CHANGENOW_API_URL:-https://api.changenow.io}
+  # Required whenever CHANGENOW_API_URL is set (it is, above). Supply the real
+  # x-changenow-api-key via the Phala deploy env/secrets — never hardcode it here.
+  - CHANGENOW_API_KEY=${CHANGENOW_API_KEY:?set CHANGENOW_API_KEY (ChangeNOW x-changenow-api-key) — required because CHANGENOW_API_URL is enabled}
   - COINBASE_PRICE_API_BASE_URL=https://api.coinbase.com
   - ACROSS_INTEGRATOR_ID=${ACROSS_INTEGRATOR_ID:?set ACROSS_INTEGRATOR_ID}
   - CCTP_API_URL=https://iris-api.circle.com
