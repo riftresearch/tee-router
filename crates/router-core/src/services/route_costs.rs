@@ -87,15 +87,22 @@ pub struct RouteCostTier {
     pub sample_usd_micros: u64,
 }
 
-/// Cost-cache tier ladder. Aligned with the discussed `100 / 1k / 10k /
+/// Cost-cache tier ladder. Aligned with the discussed `100 / 500 / 1k / 10k /
 /// 25k / 50k / 75k / 100k / 200k / 500k / 1m` set, with extra `5m / 10m`
-/// rungs to cover HL-only routes. A request larger than the top tier clamps
-/// to the `usd_10000000` bucket; if that bucket has no cached row the leg is
-/// simply treated as uncached (no fabricated estimate).
+/// rungs to cover HL-only routes. The `usd_500` rung exists because round-up
+/// tier selection otherwise priced every $101-999 request off the $1k sample,
+/// overstating fixed-cost legs by up to 10x in bps terms. A request larger
+/// than the top tier clamps to the `usd_10000000` bucket; if that bucket has
+/// no cached row the leg is simply treated as uncached (no fabricated
+/// estimate).
 pub const ROUTE_COST_TIERS: &[RouteCostTier] = &[
     RouteCostTier {
         label: "usd_100",
         sample_usd_micros: 100 * USD_MICRO,
+    },
+    RouteCostTier {
+        label: "usd_500",
+        sample_usd_micros: 500 * USD_MICRO,
     },
     RouteCostTier {
         label: "usd_1000",
@@ -330,8 +337,8 @@ pub struct RoutePathCostScore {
     pub total_latency_ms: u64,
 }
 
-/// A `TransitionPath` ranked at a specific request size, with the score
-/// `confidence_band` needs to decide how far to fan out at quote time.
+/// A `TransitionPath` ranked at a specific request size, with the per-path
+/// score the quote pipeline uses to pick its fixed top-N live-quote fanout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RankedTransitionPath {
     pub path: TransitionPath,
@@ -782,8 +789,8 @@ impl RouteCostService {
 
     /// Rank `paths` against the request size in USD micros. The returned
     /// `Vec<RankedTransitionPath>` is aligned with `paths` after sorting and
-    /// carries the per-path score so the caller can compute a
-    /// `confidence_band` without re-scoring.
+    /// carries the per-path score so callers can inspect costs without
+    /// re-scoring.
     pub async fn rank_transition_paths_for_request(
         &self,
         paths: &mut [TransitionPath],
@@ -1666,72 +1673,6 @@ pub fn structural_path_score(
     amount_aware_path_score(path, &HashMap::new(), pricing, request_usd_micros)
 }
 
-/// Confidence band as a fraction of leader cost. 10% means "include any path
-/// whose total effective cost is within 10% of the leader". Values are in
-/// bps of 10_000 (so `1_000` = 10%).
-pub const CONFIDENCE_BAND_BPS: u64 = 1_000;
-/// Above this request size the band widens to include any path whose
-/// structural fallback covered a non-live-refreshed kind (HL spot, Velora,
-/// Unit). Below it, those legs are usually too small for slippage to matter
-/// vs. the cached leader.
-pub const CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS: u64 = 10_000 * USD_MICRO;
-
-/// Returns the number of `ranked` paths the caller should live-quote, with
-/// `ranked[0]` always included. The band widens beyond the leader when any
-/// of the following is true for a peer:
-///
-/// 1. peer cost is within `CONFIDENCE_BAND_BPS` of the leader (close-on-cost);
-/// 2. peer score has `missing_edges > 0` (partial cache coverage); or
-/// 3. peer path contains a non-live-refreshed leg AND
-///    `request_usd_micros >= CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS`.
-///
-/// Always capped at `top_k`. The output is in `1..=min(top_k, ranked.len())`.
-#[must_use]
-pub fn confidence_band(
-    ranked: &[RankedTransitionPath],
-    request_usd_micros: u64,
-    top_k: usize,
-) -> usize {
-    if ranked.is_empty() || top_k == 0 {
-        return 0;
-    }
-    let cap = top_k.min(ranked.len());
-    let leader_cost = ranked[0].score.total_effective_cost_usd_micros;
-    let band_extension = U512::from(leader_cost)
-        * U512::from(BPS_DENOMINATOR + CONFIDENCE_BAND_BPS)
-        / U512::from(BPS_DENOMINATOR);
-    let band_extension_u64 = band_extension
-        .to_string()
-        .parse::<u64>()
-        .unwrap_or(u64::MAX);
-    let mut included = 1_usize;
-    for ranked_path in &ranked[1..cap] {
-        let cost_within_band =
-            ranked_path.score.total_effective_cost_usd_micros <= band_extension_u64;
-        let partial_cache = ranked_path.score.missing_edges > 0;
-        let large_with_non_live = request_usd_micros >= CONFIDENCE_BAND_LARGE_ORDER_USD_MICROS
-            && path_contains_non_live_refreshed_leg(&ranked_path.path);
-        if cost_within_band || partial_cache || large_with_non_live {
-            included += 1;
-        } else {
-            break;
-        }
-    }
-    included
-}
-
-fn path_contains_non_live_refreshed_leg(path: &TransitionPath) -> bool {
-    path.transitions.iter().any(|transition| {
-        matches!(
-            transition.kind,
-            MarketOrderTransitionKind::HyperliquidTrade
-                | MarketOrderTransitionKind::UniversalRouterSwap
-                | MarketOrderTransitionKind::UnitDeposit
-                | MarketOrderTransitionKind::UnitWithdrawal
-        )
-    })
-}
-
 /// A live quote outcome that survived `validate_provider_quote`. Carries
 /// the fields `select_best_quote` needs to rank it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2222,13 +2163,16 @@ mod tests {
         let total = across_total + cctp_total;
 
         // Walk the whole window at the production tick (window / total) and
-        // count how many units each provider claimed.
+        // count how many units each provider claimed. One extra tick past the
+        // window lets each provider's deadline-paced cycle complete even when
+        // the tick does not divide the window exactly (the real worker keeps
+        // ticking past the window and the cursor re-anchors).
         let tick = window / u32::try_from(total).unwrap();
         let mut across = 0usize;
         let mut cctp = 0usize;
         let mut max_per_provider_per_tick = 0usize;
         let mut elapsed = Duration::ZERO;
-        while elapsed <= window {
+        while elapsed <= window + tick {
             let now = start + chrono::Duration::from_std(elapsed).unwrap();
             let chunk = claim_due_units_paced(&mut cursors, &plan, now, window);
             let mut across_this_tick = 0usize;
@@ -2680,7 +2624,7 @@ mod tests {
 
     // ----------------------------------------------------------------------
     // S1.2 / S2.2 / S2.3 - amount-aware ranking, size penalty, tier table,
-    // confidence band, select_best_quote, refresher fanout. Each test block
+    // select_best_quote, refresher fanout. Each test block
     // is grouped by surface.
     // ----------------------------------------------------------------------
 
@@ -2717,6 +2661,9 @@ mod tests {
     fn select_route_cost_tier_rounds_up_to_smallest_tier_that_covers_request() {
         assert_eq!(select_route_cost_tier(50 * USD_MICRO).label, "usd_100");
         assert_eq!(select_route_cost_tier(100 * USD_MICRO).label, "usd_100");
+        assert_eq!(select_route_cost_tier(101 * USD_MICRO).label, "usd_500");
+        assert_eq!(select_route_cost_tier(500 * USD_MICRO).label, "usd_500");
+        assert_eq!(select_route_cost_tier(501 * USD_MICRO).label, "usd_1000");
         assert_eq!(select_route_cost_tier(1_500 * USD_MICRO).label, "usd_10000");
         assert_eq!(
             select_route_cost_tier(50_000 * USD_MICRO).label,
@@ -2857,10 +2804,9 @@ mod tests {
         );
     }
 
-    // -- confidence band ---------------------------------------------------
+    // -- ranked-path test helper --------------------------------------------
 
     fn ranked_at(score_usd_micros: u64, hop_count: usize, path_id: &str) -> RankedTransitionPath {
-        // Build a one-hop path with a CCTP edge so it is not "non-live-refreshed".
         let mut transitions = Vec::with_capacity(hop_count.max(1));
         for i in 0..hop_count.max(1) {
             transitions.push(transition(
@@ -2876,69 +2822,6 @@ mod tests {
                 total_latency_ms: 0,
             },
         }
-    }
-
-    fn ranked_at_with_non_live(score_usd_micros: u64, path_id: &str) -> RankedTransitionPath {
-        RankedTransitionPath {
-            path: path(
-                path_id,
-                vec![transition(
-                    "hl",
-                    MarketOrderTransitionKind::HyperliquidTrade,
-                )],
-            ),
-            score: RoutePathCostScore {
-                missing_edges: 0,
-                total_effective_cost_usd_micros: score_usd_micros,
-                total_latency_ms: 0,
-            },
-        }
-    }
-
-    #[test]
-    fn confidence_band_is_one_when_leader_is_clearly_ahead() {
-        let ranked = vec![ranked_at(100, 1, "a"), ranked_at(1_000, 1, "b")];
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 1);
-    }
-
-    #[test]
-    fn confidence_band_widens_when_costs_are_close() {
-        let ranked = vec![ranked_at(100, 1, "a"), ranked_at(105, 1, "b")];
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 2);
-    }
-
-    #[test]
-    fn confidence_band_widens_when_path_has_missing_edges() {
-        let mut peer = ranked_at(10_000, 1, "b");
-        peer.score.missing_edges = 1;
-        let ranked = vec![ranked_at(100, 1, "a"), peer];
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 2);
-    }
-
-    #[test]
-    fn confidence_band_widens_for_non_live_refreshed_legs_above_threshold() {
-        let leader = ranked_at(100, 1, "a");
-        let non_live_peer = ranked_at_with_non_live(10_000, "b");
-        let ranked = vec![leader, non_live_peer];
-        // $1k -> no widening for size-zone.
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 1);
-        // $50k -> widen.
-        assert_eq!(confidence_band(&ranked, 50_000 * USD_MICRO, 8), 2);
-    }
-
-    #[test]
-    fn confidence_band_capped_at_top_k() {
-        // 12 paths all within the 10% band.
-        let ranked: Vec<_> = (0..12)
-            .map(|i| ranked_at(100 + i as u64, 1, &format!("p{i:02}")))
-            .collect();
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 8);
-    }
-
-    #[test]
-    fn confidence_band_always_at_least_one_for_non_empty_input() {
-        let ranked = vec![ranked_at(0, 1, "a")];
-        assert_eq!(confidence_band(&ranked, 1_000 * USD_MICRO, 8), 1);
     }
 
     // -- select_best_quote -------------------------------------------------

@@ -3391,6 +3391,41 @@ code,
   text-align: center;
 }
 
+/* Dark-mode zoom controls, pinned to the graph's bottom-right corner. */
+.route-graph-canvas .react-flow__controls {
+  bottom: 10px;
+  right: 10px;
+  box-shadow: none;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(9, 9, 9, 0.85);
+}
+
+.route-graph-canvas .react-flow__controls-button {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: #9aa6a0;
+}
+
+.route-graph-canvas .react-flow__controls-button:last-child {
+  border-bottom: none;
+}
+
+.route-graph-canvas .react-flow__controls-button:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: #e7ece9;
+}
+
+.route-graph-canvas .react-flow__controls-button svg {
+  fill: currentColor;
+  max-width: 11px;
+  max-height: 11px;
+}
+
 .route-graph-legend {
   position: absolute;
   bottom: 10px;
@@ -3783,6 +3818,76 @@ code,
   margin-left: auto;
   color: #fde68a;
   font-variant-numeric: tabular-nums;
+}
+
+/* Dust-floor rejection banner: production would return OutputBelowFloor. */
+.rg-floor-rejected {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(248, 113, 113, 0.5);
+  border-left-width: 4px;
+  border-left-color: #f87171;
+  border-radius: 10px;
+  background:
+    linear-gradient(
+      90deg,
+      rgba(248, 113, 113, 0.12),
+      rgba(248, 113, 113, 0.02) 60%
+    ),
+    var(--surface-raised);
+  font-size: 12.5px;
+  color: #f3d2d2;
+}
+
+.rg-floor-tag {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  color: #fecaca;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(248, 113, 113, 0.6);
+  background: rgba(248, 113, 113, 0.15);
+}
+
+/* Non-fatal explain warnings (silent-gap surfacing). */
+.rg-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.rg-warning-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgba(251, 191, 36, 0.4);
+  border-left-width: 3px;
+  border-left-color: #fbbf24;
+  border-radius: 8px;
+  background: rgba(251, 191, 36, 0.07);
+  font-size: 12px;
+  color: #f0e3c0;
+}
+
+.rg-warning-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 700;
+  color: #fde68a;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.12);
+  white-space: nowrap;
 }
 
 /* Stacked ranking sections (cached cost vs live output). */

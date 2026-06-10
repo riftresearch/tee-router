@@ -717,7 +717,8 @@ impl AssetRegistry {
     /// - CCTP: `*.USDC` across `ETH`/`BASE`/`ARB`
     /// - Unit: `HL.uETH <-> ETH.ETH`, `HL.uBTC <-> BTC.BTC`
     /// - Hyperliquid bridge: `ARB.USDC <-> HL.USDC` (native USDC bridge)
-    /// - Hyperliquid spot: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`
+    /// - Hyperliquid spot: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`,
+    ///   `HL.USDC <-> HL.USDT`
     /// - Velora (same-chain): `USDC <-> USDT` on `ETH`/`BASE`/`ARB`
     #[must_use]
     pub fn curated_cacheable_transitions(&self) -> Vec<TransitionDecl> {
@@ -774,8 +775,13 @@ impl AssetRegistry {
                 let Some(canonical) = self.canonical_for(&decl.input.asset) else {
                     return false;
                 };
-                // Across has no USDT liquidity on Arbitrum; never cache USDT
-                // legs that touch it (ETH.USDT <-> BASE.USDT remains curated).
+                // Deliberate exclusion: Across has no usable USDT liquidity on
+                // Arbitrum, so sampling these legs would only ever record
+                // failures. The edges stay declared for BFS, which means any
+                // path through them carries a missing-edge penalty or gets
+                // strict-dropped at ranking - intentional, since the venue
+                // cannot actually fill them. (ETH.USDT <-> BASE.USDT remains
+                // curated.)
                 if decl.provider == ProviderId::Across
                     && canonical == CanonicalAsset::Usdt
                     && (decl.input.asset.chain.as_str() == "evm:42161"
@@ -1278,12 +1284,15 @@ fn is_curated_l2_trio_pair(a: &str, b: &str) -> bool {
 
 /// Curated Hyperliquid spot trade pairs (bidirectional) the refresher samples.
 /// Both sides are USD-priced canonicals so the value-loss bps is well-defined;
-/// HYPE is intentionally excluded (no live USD reference price).
+/// HYPE is intentionally excluded (no live USD reference price). USDC <-> USDT
+/// is included because BFS routes through it (e.g. USDT exits via the HL
+/// bridge, which is USDC-only); leaving it uncached forced a missing-edge
+/// penalty or strict-drop onto every path using it.
 fn is_curated_hyperliquid_trade_pair(a: CanonicalAsset, b: CanonicalAsset) -> bool {
-    use CanonicalAsset::{Btc, Eth, Usdc};
+    use CanonicalAsset::{Btc, Eth, Usdc, Usdt};
     matches!(
         (a, b),
-        (Usdc, Btc) | (Btc, Usdc) | (Usdc, Eth) | (Eth, Usdc)
+        (Usdc, Btc) | (Btc, Usdc) | (Usdc, Eth) | (Eth, Usdc) | (Usdc, Usdt) | (Usdt, Usdc)
     )
 }
 
@@ -1758,6 +1767,8 @@ mod tests {
         assert!(curated_trade(CanonicalAsset::Btc, CanonicalAsset::Usdc));
         assert!(curated_trade(CanonicalAsset::Usdc, CanonicalAsset::Eth));
         assert!(curated_trade(CanonicalAsset::Eth, CanonicalAsset::Usdc));
+        assert!(curated_trade(CanonicalAsset::Usdc, CanonicalAsset::Usdt));
+        assert!(curated_trade(CanonicalAsset::Usdt, CanonicalAsset::Usdc));
 
         // HYPE spot trades and venue<->external identity edges never leak in.
         assert!(curated.iter().all(|decl| {
@@ -2497,9 +2508,7 @@ mod tests {
     //      (`AssetRegistry::select_transition_paths`)
     //   2. Filter to executable terminals + runtime-asset anchored bridges
     //      (mirror of `is_executable_transition_path`)
-    //   3. Prefer same-chain EVM paths when source/destination share an EVM
-    //      chain (mirror of `prefer_same_chain_evm_paths`)
-    //   4. Rank by structural cost in bps + latency
+    //   3. Rank by structural cost in bps + latency
     //      (`route_costs::rank_transition_paths_structurally`)
     //
     // The provider-configured filter (`path_has_configured_provider_set`)
@@ -2565,22 +2574,13 @@ mod tests {
         );
         print_paths(&executable, &pricing);
 
-        let mut same_chain_preferred = executable.clone();
-        prefer_same_chain_evm_paths_for_trace(source, destination, &mut same_chain_preferred);
-        eprintln!(
-            "[3] same-chain-EVM preference: {} -> {}",
-            executable.len(),
-            same_chain_preferred.len()
-        );
-        print_paths(&same_chain_preferred, &pricing);
-
-        let mut ranked = same_chain_preferred;
+        let mut ranked = executable;
         // Trace harness is intentionally fixed-anchor for reproducible
         // offline analysis. Pass DEFAULT_SAMPLE_AMOUNT_USD_MICROS so the
         // scoring is identical across runs.
         rank_transition_paths_structurally(&mut ranked, DEFAULT_SAMPLE_AMOUNT_USD_MICROS);
         eprintln!(
-            "[4] structural ranking ({} paths, lowest cost first):",
+            "[3] structural ranking ({} paths, lowest cost first):",
             ranked.len()
         );
         print_paths(&ranked, &pricing);
@@ -2597,31 +2597,6 @@ mod tests {
         // goal. Terminal bridge exits are valid whenever the bridge output is
         // the requested destination.
         !path.transitions.is_empty()
-    }
-
-    /// Mirror of `bin/router-server/src/services/order_manager.rs::
-    /// prefer_same_chain_evm_paths`.
-    fn prefer_same_chain_evm_paths_for_trace(
-        source: &DepositAsset,
-        destination: &DepositAsset,
-        paths: &mut Vec<TransitionPath>,
-    ) {
-        if source.chain != destination.chain || !source.chain.as_str().starts_with("evm:") {
-            return;
-        }
-        let chain = &source.chain;
-        let same_chain_paths: Vec<_> = paths
-            .iter()
-            .filter(|p| {
-                p.transitions
-                    .iter()
-                    .all(|t| t.input.asset.chain == *chain && t.output.asset.chain == *chain)
-            })
-            .cloned()
-            .collect();
-        if !same_chain_paths.is_empty() {
-            *paths = same_chain_paths;
-        }
     }
 
     fn print_paths(paths: &[TransitionPath], pricing: &crate::services::pricing::PricingSnapshot) {
@@ -2737,14 +2712,17 @@ mod tests {
             !ranked.is_empty(),
             "expected at least one same-chain route on Base"
         );
+        // No same-chain preference filter anymore: cross-chain candidates stay
+        // in the ranked set and must win on cost. The direct same-chain Velora
+        // route must still be among the candidates.
         assert!(
-            ranked.iter().all(|p| {
+            ranked.iter().any(|p| {
                 p.transitions.iter().all(|t| {
                     t.input.asset.chain.as_str() == "evm:8453"
                         && t.output.asset.chain.as_str() == "evm:8453"
                 })
             }),
-            "same-chain preference should restrict ranked paths to evm:8453"
+            "expected at least one all-same-chain candidate for a same-chain pair"
         );
     }
 

@@ -1594,6 +1594,7 @@ type RouteCostTierColumn = {
 // (with dashes) even before any bps sample lands.
 const ROUTE_COST_TIER_LADDER: ReadonlyArray<{ bucket: string; usdMicros: number }> = [
   { bucket: 'usd_100', usdMicros: 100_000_000 },
+  { bucket: 'usd_500', usdMicros: 500_000_000 },
   { bucket: 'usd_1000', usdMicros: 1_000_000_000 },
   { bucket: 'usd_10000', usdMicros: 10_000_000_000 },
   { bucket: 'usd_25000', usdMicros: 25_000_000_000 },

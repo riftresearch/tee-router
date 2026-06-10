@@ -284,7 +284,6 @@ struct SelectionCounts {
     paths_after_executable: usize,
     paths_after_provider: usize,
     paths_after_hyperevm: usize,
-    paths_after_same_chain: usize,
     ranked_count: usize,
     top_paths: usize,
 }
@@ -1171,7 +1170,7 @@ impl OrderManager {
     ///
     /// 1. enumerate candidate paths (BFS, depth 5);
     /// 2. filter: executable -> configured providers -> unpriceable HyperEVM ->
-    ///    same-chain preference (no provider sequence) -> provider sequence;
+    ///    provider sequence;
     /// 3. live-quote the Velora wrap legs, fold them into the cached hop costs,
     ///    rank by lowest combined bps, strict-drop routes with an unpriced leg;
     /// 4. live-quote the top-N ranked routes end-to-end (the real broken-leg
@@ -1210,10 +1209,6 @@ impl OrderManager {
         self.filter_unpriceable_hyperevm_paths(&mut paths).await;
         counts.paths_after_hyperevm = paths.len();
         let provider_sequence = request.routing.transition_provider_sequence();
-        if provider_sequence.is_none() {
-            prefer_same_chain_evm_paths(request, &mut paths);
-        }
-        counts.paths_after_same_chain = paths.len();
         let provider_sequence_paths_filtered =
             filter_provider_sequence_paths(&mut paths, provider_sequence);
 
@@ -1433,7 +1428,7 @@ impl OrderManager {
         // Run the multi-hop pipeline and the single-hop venue checks together so
         // the dashboard shows the full cross-family comparison a real `/quote`
         // makes (production runs both branches in parallel too).
-        let (outcome, single_hop) = tokio::join!(
+        let (outcome, (single_hop, warnings)) = tokio::join!(
             self.run_market_quote_pipeline(
                 &normalized_request,
                 quote_id,
@@ -1464,13 +1459,6 @@ impl OrderManager {
             .collect();
         let winner_path_id = outcome.winner_path_id.clone();
         let estimated_out_by_path = &outcome.outputs_by_path;
-
-        // Surface the live Velora per-leg bps for the visualizer overlay.
-        let mut live_bps_by_transition: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
-        for (transition_id, snapshot) in &outcome.velora_overrides {
-            live_bps_by_transition.insert(transition_id.clone(), snapshot.estimated_fee_bps as f64);
-        }
 
         // Source->destination corridor for the visualizer: the full declared
         // topology (incl. curated same-chain Velora swaps) restricted to the
@@ -1565,7 +1553,6 @@ impl OrderManager {
                     rank: index + 1,
                     path_id: path.id.clone(),
                     top_path: live_quoted_ids.contains(path.id.as_str()),
-                    winner: winner_path_id.as_deref() == Some(path.id.as_str()),
                     hop_count: path.transitions.len(),
                     missing_edges: ranked_path.score.missing_edges,
                     total_effective_cost_usd_micros: ranked_path
@@ -1582,14 +1569,19 @@ impl OrderManager {
             })
             .collect();
 
-        // Cross-family winner: the higher of the best multi-hop route's output
-        // and the best single-hop venue's output (production's
-        // `choose_better_quote` is higher-output-wins). This is what a real
+        // Cross-family winner: mirrors production's `is_better_quote` exactly
+        // — higher output wins; on an exact output tie the quote with fewer
+        // hops wins (a single-hop venue counts as 1 hop). This is what a real
         // `/quote` would return for this request.
         let multi_hop_best = winner_path_id.as_deref().and_then(|id| {
+            let hop_count = ranked
+                .iter()
+                .find(|ranked_path| ranked_path.path.id == id)
+                .map(|ranked_path| ranked_path.path.transitions.len())
+                .unwrap_or(usize::MAX);
             estimated_out_by_path
                 .get(id)
-                .map(|out| (id.to_string(), out.clone()))
+                .map(|out| (id.to_string(), out.clone(), hop_count))
         });
         let single_hop_best = single_hop
             .iter()
@@ -1601,10 +1593,12 @@ impl OrderManager {
                     .map(|out| (venue.provider.clone(), out))
             });
         let overall_winner = match (multi_hop_best, single_hop_best) {
-            (Some((mh_label, mh_out)), Some((sh_label, sh_out))) => {
+            (Some((mh_label, mh_out, mh_hops)), Some((sh_label, sh_out))) => {
                 let mh_value = U256::from_str(&mh_out).unwrap_or_default();
                 let sh_value = U256::from_str(&sh_out).unwrap_or_default();
-                Some(if sh_value > mh_value {
+                let single_hop_wins =
+                    sh_value > mh_value || (sh_value == mh_value && mh_hops > 1);
+                Some(if single_hop_wins {
                     RouteExplainWinner {
                         family: "single_hop".to_string(),
                         label: sh_label,
@@ -1618,7 +1612,7 @@ impl OrderManager {
                     }
                 })
             }
-            (Some((mh_label, mh_out)), None) => Some(RouteExplainWinner {
+            (Some((mh_label, mh_out, _)), None) => Some(RouteExplainWinner {
                 family: "multi_hop".to_string(),
                 label: mh_label,
                 estimated_amount_out: mh_out,
@@ -1630,6 +1624,19 @@ impl OrderManager {
             }),
             (None, None) => None,
         };
+
+        // Production parity for the economic-viability gate: a real `/quote`
+        // rejects the cross-family winner with `OutputBelowFloor` when its
+        // output is under the destination dust floor. Surface that rejection
+        // (keeping the would-be winner visible for debugging).
+        let floor_rejection = overall_winner.as_ref().and_then(|winner| {
+            let output_floor = route_output_floor(&self.asset_registry, &destination_asset)?;
+            let estimated_out = U256::from_str(&winner.estimated_amount_out).ok()?;
+            (estimated_out < output_floor).then(|| crate::api::RouteExplainFloorRejection {
+                estimated_amount_out: winner.estimated_amount_out.clone(),
+                output_floor: output_floor.to_string(),
+            })
+        });
 
         Ok(RouteExplain {
             from_asset: source_asset,
@@ -1643,7 +1650,6 @@ impl OrderManager {
                 paths_after_executable: outcome.counts.paths_after_executable,
                 paths_after_provider: outcome.counts.paths_after_provider,
                 paths_after_hyperevm: outcome.counts.paths_after_hyperevm,
-                paths_after_same_chain: outcome.counts.paths_after_same_chain,
                 ranked_count,
                 top_paths: outcome.counts.top_paths,
             },
@@ -1655,9 +1661,10 @@ impl OrderManager {
             },
             ranked: ranked_views,
             winner_path_id,
-            live_bps_by_transition,
             single_hop,
             overall_winner,
+            floor_rejection,
+            warnings,
             graph,
         })
     }
@@ -1667,34 +1674,64 @@ impl OrderManager {
     /// (`success`/`no_route`/`disabled`/`timeout`/`error`/`invalid`) for the
     /// dashboard. Unlike [`Self::best_single_hop_provider_quote`] this never
     /// returns an error and always yields the full per-venue list (including
-    /// failures), and it flags the highest-output venue with `best`.
+    /// failures), and it flags the highest-output venue with `best`. The
+    /// second tuple element collects warnings for failures that would
+    /// otherwise be silent (policy/health snapshot errors, quote-address
+    /// derivation failures) so the dashboard can surface them.
     async fn explain_single_hop_venues(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
         quote_id: Uuid,
         source_depositor_address: &str,
-    ) -> Vec<crate::api::SingleHopVenueView> {
+    ) -> (Vec<crate::api::SingleHopVenueView>, Vec<String>) {
         use crate::api::SingleHopVenueView;
 
+        let mut warnings: Vec<String> = Vec::new();
         let providers = self.single_hop_venues.providers().to_vec();
         if providers.is_empty() {
-            return Vec::new();
+            return (Vec::new(), warnings);
         }
 
         let provider_policy_snapshot = match self.provider_policies.as_ref() {
-            Some(service) => service.snapshot().await.ok(),
+            Some(service) => match service.snapshot().await {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    warnings.push(format!(
+                        "provider policy snapshot failed; venue disable states unknown: {err}"
+                    ));
+                    None
+                }
+            },
             None => None,
         };
         let provider_health_snapshot = match self.provider_health.as_ref() {
-            Some(service) => service.snapshot().await.ok(),
+            Some(service) => match service.snapshot().await {
+                Ok(snapshot) => Some(snapshot),
+                Err(err) => {
+                    warnings.push(format!(
+                        "provider health snapshot failed; venue health states unknown: {err}"
+                    ));
+                    None
+                }
+            },
             None => None,
         };
 
-        let (Ok(destination_recipient_address), Ok(refund_address)) = (
+        let (destination_recipient_address, refund_address) = match (
             self.quote_address_for_chain(quote_id, &request.destination_asset.chain),
             self.quote_address_for_chain(quote_id, &request.source_asset.chain),
-        ) else {
-            return Vec::new();
+        ) {
+            (Ok(recipient), Ok(refund)) => (recipient, refund),
+            (recipient, refund) => {
+                for (label, result) in [("recipient", recipient), ("refund", refund)] {
+                    if let Err(err) = result {
+                        warnings.push(format!(
+                            "single-hop venues skipped: {label} address derivation failed: {err}"
+                        ));
+                    }
+                }
+                return (Vec::new(), warnings);
+            }
         };
 
         // Registry decimals are optional: address-form/venue-only tokens
@@ -1847,7 +1884,7 @@ impl OrderManager {
                 b.provider.as_str(),
             ))
         });
-        views
+        (views, warnings)
     }
 
     /// Live-sample the value-loss bps of every Velora (`UniversalRouterSwap`)
@@ -2281,7 +2318,7 @@ impl OrderManager {
     /// Rank `paths` against `request_usd_micros` using the route-cost
     /// service when available, falling back to the structural sort
     /// otherwise. The returned `RankedTransitionPath` list is aligned with
-    /// the sorted `paths` and includes per-path scores for `confidence_band`.
+    /// the sorted `paths` and carries per-path scores for display/telemetry.
     async fn rank_market_paths(
         &self,
         paths: &mut Vec<TransitionPath>,
@@ -4021,31 +4058,6 @@ fn quote_address_for_chain(
     )
     .map(|(address, _)| address)
     .map_err(MarketOrderError::deposit_address)
-}
-
-fn prefer_same_chain_evm_paths(
-    request: &NormalizedMarketOrderQuoteRequest,
-    paths: &mut Vec<TransitionPath>,
-) {
-    if request.source_asset.chain != request.destination_asset.chain
-        || !request.source_asset.chain.as_str().starts_with("evm:")
-    {
-        return;
-    }
-
-    let chain = &request.source_asset.chain;
-    let same_chain_paths = paths
-        .iter()
-        .filter(|path| {
-            path.transitions.iter().all(|transition| {
-                transition.input.asset.chain == *chain && transition.output.asset.chain == *chain
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !same_chain_paths.is_empty() {
-        *paths = same_chain_paths;
-    }
 }
 
 fn filter_provider_sequence_paths(

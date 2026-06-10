@@ -308,13 +308,6 @@ pub struct RouteExplain {
     pub timings: RouteExplainTimings,
     pub ranked: Vec<RankedPathView>,
     pub winner_path_id: Option<String>,
-    /// Per-transition value-loss bps for legs that were live-sampled during this
-    /// explain (notably uncached runtime Velora `UniversalRouterSwap` wrap legs
-    /// for arbitrary ERC20s). Keyed by transition id. The dashboard overlays
-    /// these onto the cached bps map so Velora legs show real per-step bps and
-    /// contribute to the path total.
-    #[serde(default)]
-    pub live_bps_by_transition: std::collections::HashMap<String, f64>,
     /// Single-hop venue checks: the cross-family alternative to the multi-hop
     /// `ranked` routes above. Every configured single-hop quote provider is
     /// queried in parallel (exactly as a real `/quote` does) and its per-venue
@@ -324,10 +317,21 @@ pub struct RouteExplain {
     pub single_hop: Vec<SingleHopVenueView>,
     /// The cross-family winner the router would actually return: the higher of
     /// the best multi-hop route's output and the best single-hop venue's output
-    /// (mirroring production's `choose_better_quote`). `None` when neither
-    /// family produced a quote.
+    /// (mirroring production's `is_better_quote`, including its fewer-hops
+    /// tie-break). `None` when neither family produced a quote.
     #[serde(default)]
     pub overall_winner: Option<RouteExplainWinner>,
+    /// Set when the cross-family winner's output is below the destination
+    /// asset's dust floor: a real `/quote` would reject this request with
+    /// `OutputBelowFloor` instead of returning the winner. The winner stays
+    /// populated above so the dashboard can show *what* got rejected.
+    #[serde(default)]
+    pub floor_rejection: Option<RouteExplainFloorRejection>,
+    /// Non-fatal gaps hit while building this explain that would otherwise be
+    /// silent (e.g. provider policy/health snapshot errors or quote-address
+    /// derivation failures that skipped the single-hop venue checks).
+    #[serde(default)]
+    pub warnings: Vec<String>,
     /// Source->destination candidate subgraph: exactly the nodes and edges that
     /// participate in a viable ranked path, laid out left-to-right by hop depth
     /// from the source (source at depth 0, destination forced to `max_depth`).
@@ -345,6 +349,17 @@ pub struct RouteExplainWinner {
     pub label: String,
     /// Winning output in destination base units.
     pub estimated_amount_out: String,
+}
+
+/// Economic-viability rejection mirrored from production's `OutputBelowFloor`:
+/// the winning quote's output was below the destination asset's dust floor, so
+/// a real `/quote` for this request would return an error, not a quote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteExplainFloorRejection {
+    /// The rejected winner's output in destination base units.
+    pub estimated_amount_out: String,
+    /// The destination asset's dust floor in base units.
+    pub output_floor: String,
 }
 
 /// One single-hop venue's result in a route-explain. Mirrors a single
@@ -414,7 +429,6 @@ pub struct RouteExplainCounts {
     pub paths_after_executable: usize,
     pub paths_after_provider: usize,
     pub paths_after_hyperevm: usize,
-    pub paths_after_same_chain: usize,
     pub ranked_count: usize,
     /// Number of top-ranked paths selected for live quoting (hardcoded top-N).
     pub top_paths: usize,
@@ -434,7 +448,6 @@ pub struct RankedPathView {
     pub path_id: String,
     /// True when this path is in the top-N set selected for live quoting.
     pub top_path: bool,
-    pub winner: bool,
     pub hop_count: usize,
     pub missing_edges: usize,
     pub total_effective_cost_usd_micros: u64,

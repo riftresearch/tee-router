@@ -672,7 +672,6 @@ function isRouteExplain(value: unknown): value is RouteExplain {
     typeof counts.paths_after_executable === 'number' &&
     typeof counts.paths_after_provider === 'number' &&
     typeof counts.paths_after_hyperevm === 'number' &&
-    typeof counts.paths_after_same_chain === 'number' &&
     typeof counts.ranked_count === 'number' &&
     typeof counts.top_paths === 'number' &&
     isRecord(timings) &&
@@ -683,14 +682,18 @@ function isRouteExplain(value: unknown): value is RouteExplain {
     Array.isArray(value.ranked) &&
     value.ranked.every(isRankedPathView) &&
     (value.winner_path_id === null || typeof value.winner_path_id === 'string') &&
-    (value.live_bps_by_transition === undefined ||
-      isRecord(value.live_bps_by_transition)) &&
     (value.single_hop === undefined ||
       (Array.isArray(value.single_hop) &&
         value.single_hop.every(isSingleHopVenueView))) &&
     (value.overall_winner === undefined ||
       value.overall_winner === null ||
       isRouteExplainWinner(value.overall_winner)) &&
+    (value.floor_rejection === undefined ||
+      value.floor_rejection === null ||
+      isRouteExplainFloorRejection(value.floor_rejection)) &&
+    (value.warnings === undefined ||
+      (Array.isArray(value.warnings) &&
+        value.warnings.every((entry) => typeof entry === 'string'))) &&
     isRouteExplainGraph(value.graph)
   )
 }
@@ -701,6 +704,14 @@ function isRouteExplainWinner(value: unknown): boolean {
     typeof value.family === 'string' &&
     typeof value.label === 'string' &&
     typeof value.estimated_amount_out === 'string'
+  )
+}
+
+function isRouteExplainFloorRejection(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.estimated_amount_out === 'string' &&
+    typeof value.output_floor === 'string'
   )
 }
 
@@ -764,7 +775,6 @@ function isRankedPathView(value: unknown): value is RankedPathView {
     typeof value.rank === 'number' &&
     typeof value.path_id === 'string' &&
     typeof value.top_path === 'boolean' &&
-    typeof value.winner === 'boolean' &&
     typeof value.hop_count === 'number' &&
     typeof value.missing_edges === 'number' &&
     typeof value.total_effective_cost_usd_micros === 'number' &&

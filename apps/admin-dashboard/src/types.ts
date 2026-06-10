@@ -464,7 +464,6 @@ export type RankedPathView = {
   rank: number
   path_id: string
   top_path: boolean
-  winner: boolean
   hop_count: number
   missing_edges: number
   total_effective_cost_usd_micros: number
@@ -485,7 +484,6 @@ export type RouteExplainCounts = {
   paths_after_executable: number
   paths_after_provider: number
   paths_after_hyperevm: number
-  paths_after_same_chain: number
   ranked_count: number
   top_paths: number
 }
@@ -550,6 +548,13 @@ export type RouteExplainWinner = {
   estimated_amount_out: string
 }
 
+/** Production parity for the dust-floor gate: when set, a real /quote would
+ * reject this request with OutputBelowFloor instead of returning the winner. */
+export type RouteExplainFloorRejection = {
+  estimated_amount_out: string
+  output_floor: string
+}
+
 export type RouteExplain = {
   from_asset: RouteExplainAsset
   to_asset: RouteExplainAsset
@@ -563,10 +568,6 @@ export type RouteExplain = {
   timings: RouteExplainTimings
   ranked: RankedPathView[]
   winner_path_id: string | null
-  /** Per-transition value-loss bps for legs live-sampled during this explain
-   * (notably uncached runtime Velora wrap legs). Keyed by transition id.
-   * Overlaid onto the cached bps map. */
-  live_bps_by_transition: Record<string, number>
   /** Single-hop venue checks queried in parallel alongside the multi-hop
    * routes (the full cross-family comparison a real /quote makes). Empty when
    * no single-hop venues are configured. */
@@ -575,6 +576,12 @@ export type RouteExplain = {
    * single-hop), i.e. what a real /quote would return. Null when neither
    * family produced a quote. */
   overall_winner?: RouteExplainWinner | null
+  /** Set when the winner's output is below the destination dust floor: a real
+   * /quote would reject this request with OutputBelowFloor. */
+  floor_rejection?: RouteExplainFloorRejection | null
+  /** Non-fatal gaps hit while building this explain (policy/health snapshot
+   * errors, quote-address failures that skipped single-hop checks). */
+  warnings?: string[]
   graph: RouteExplainGraph
 }
 
