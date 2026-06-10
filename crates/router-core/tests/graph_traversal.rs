@@ -432,14 +432,16 @@ fn bfs_does_not_expand_past_goal() {
         let n = path.transitions.len();
         for (i, transition) in path.transitions.iter().enumerate() {
             assert_ne!(
-                transition.input.asset, destination,
+                transition.input.asset,
+                destination,
                 "path {} has destination as input on hop {i} (kinds={:?})",
                 path.id,
                 path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>(),
             );
             if i + 1 != n {
                 assert_ne!(
-                    transition.output.asset, destination,
+                    transition.output.asset,
+                    destination,
                     "path {} has destination as intermediate output on hop {i} (kinds={:?})",
                     path.id,
                     path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>(),
@@ -448,4 +450,3 @@ fn bfs_does_not_expand_past_goal() {
         }
     }
 }
-

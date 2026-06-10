@@ -47,11 +47,10 @@ pub enum ProviderId {
     Mayan,
     Chainflip,
     Garden,
-    Changenow,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::Across,
         Self::Cctp,
         Self::Unit,
@@ -63,7 +62,6 @@ impl ProviderId {
         Self::Mayan,
         Self::Chainflip,
         Self::Garden,
-        Self::Changenow,
     ];
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -79,7 +77,6 @@ impl ProviderId {
             "mayan" => Some(Self::Mayan),
             "chainflip" => Some(Self::Chainflip),
             "garden" => Some(Self::Garden),
-            "changenow" => Some(Self::Changenow),
             _ => None,
         }
     }
@@ -98,7 +95,6 @@ impl ProviderId {
             Self::Mayan => "mayan",
             Self::Chainflip => "chainflip",
             Self::Garden => "garden",
-            Self::Changenow => "changenow",
         }
     }
 
@@ -114,12 +110,9 @@ impl ProviderId {
             Self::Velora => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::UniversalRouter,
             },
-            Self::Relay
-            | Self::NearIntents
-            | Self::Mayan
-            | Self::Chainflip
-            | Self::Garden
-            | Self::Changenow => ProviderVenueKind::SingleHop,
+            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden => {
+                ProviderVenueKind::SingleHop
+            }
         }
     }
 
@@ -135,8 +128,7 @@ impl ProviderId {
             | Self::NearIntents
             | Self::Mayan
             | Self::Chainflip
-            | Self::Garden
-            | Self::Changenow => AssetSupportModel::OpenAddressQuote,
+            | Self::Garden => AssetSupportModel::OpenAddressQuote,
         }
     }
 
@@ -144,12 +136,7 @@ impl ProviderId {
     pub fn is_single_hop_quote_provider(self) -> bool {
         matches!(
             self,
-            Self::Relay
-                | Self::NearIntents
-                | Self::Mayan
-                | Self::Chainflip
-                | Self::Garden
-                | Self::Changenow
+            Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden
         )
     }
 

@@ -1,12 +1,10 @@
 pub mod chainflip;
-pub mod changenow;
 pub mod garden;
 pub mod mayan;
 pub mod near_intents;
 pub mod relay;
 
 pub use chainflip::CHAINFLIP_ASSET_MAP_SPEC;
-pub use changenow::CHANGENOW_ASSET_MAP_SPEC;
 pub use garden::GARDEN_ASSET_MAP_SPEC;
 pub use mayan::MAYAN_ASSET_MAP_SPEC;
 pub use near_intents::NEAR_INTENTS_ASSET_MAP_SPEC;

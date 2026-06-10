@@ -25,9 +25,9 @@ use router_core::{
         custody_action_executor::{evm_address_from_private_key, PaymasterRegistry},
         route_costs::RouteCostService,
         single_hop_venues::{
-            ChainflipQuoteProvider, ChangenowQuoteProvider, GardenQuoteProvider,
-            MayanQuoteProvider, NearIntentsQuoteProvider, RelayQuoteProvider,
-            SingleHopQuoteProvider, SingleHopVenueRegistry,
+            ChainflipQuoteProvider, GardenQuoteProvider, MayanQuoteProvider,
+            NearIntentsQuoteProvider, RelayQuoteProvider, SingleHopQuoteProvider,
+            SingleHopVenueRegistry,
         },
         upstream_proxy::{
             effective_proxy, normalize_optional_string as normalize_proxy_string, ProxyUrl,
@@ -177,7 +177,6 @@ struct ResolvedUpstreamProxies {
     mayan: Option<ProxyUrl>,
     chainflip: Option<ProxyUrl>,
     garden: Option<ProxyUrl>,
-    changenow: Option<ProxyUrl>,
     chainalysis: Option<ProxyUrl>,
     coinbase: Option<ProxyUrl>,
     ethereum_rpc: Option<ProxyUrl>,
@@ -236,12 +235,6 @@ fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedUpstreamP
         garden: effective_proxy(
             args.garden_proxy_url.as_deref(),
             "GARDEN_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        changenow: effective_proxy(
-            args.changenow_proxy_url.as_deref(),
-            "CHANGENOW_PROXY_URL",
             upstream,
         )
         .map_err(invalid_proxy_config)?,
@@ -386,12 +379,6 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         "Garden API URL",
         args.garden_api_url.as_deref(),
     );
-    optional_http_url(
-        &mut errors,
-        "CHANGENOW_API_URL",
-        "ChangeNOW API URL",
-        args.changenow_api_url.as_deref(),
-    );
     if args
         .garden_api_url
         .as_deref()
@@ -402,18 +389,6 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             "GARDEN_API_KEY",
             "Garden API key",
             args.garden_api_key.as_deref(),
-        );
-    }
-    if args
-        .changenow_api_url
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        require_present(
-            &mut errors,
-            "CHANGENOW_API_KEY",
-            "ChangeNOW API key",
-            args.changenow_api_key.as_deref(),
         );
     }
     optional_http_url(
@@ -946,18 +921,6 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
                 .map_err(invalid_config)?,
         ));
     }
-    if let Some(base_url) =
-        normalize_optional_url(args.changenow_api_url.as_deref(), "ChangeNOW API URL")?
-    {
-        let api_key =
-            normalize_proxy_string(args.changenow_api_key.as_deref()).ok_or_else(|| {
-                invalid_config("CHANGENOW_API_KEY is required when CHANGENOW_API_URL is configured")
-            })?;
-        providers.push(Arc::new(
-            ChangenowQuoteProvider::new(base_url, api_key, proxies.changenow.as_ref())
-                .map_err(invalid_config)?,
-        ));
-    }
     Ok(SingleHopVenueRegistry::new(providers))
 }
 
@@ -1236,9 +1199,6 @@ mod tests {
             garden_api_url: None,
             garden_api_key: None,
             garden_proxy_url: None,
-            changenow_api_url: None,
-            changenow_api_key: None,
-            changenow_proxy_url: None,
             hyperliquid_paymaster_private_key: None,
             temporal_address: "http://127.0.0.1:7233".to_string(),
             temporal_namespace: "default".to_string(),

@@ -124,9 +124,7 @@ impl RouterServerError {
             Self::Forbidden { .. } => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
-            Self::NoRoute { .. } | Self::InsufficientLiquidity => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::NoRoute { .. } | Self::InsufficientLiquidity => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotReady { .. } => StatusCode::TOO_EARLY,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {

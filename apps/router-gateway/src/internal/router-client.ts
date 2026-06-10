@@ -38,7 +38,6 @@ export type InternalProviderId =
   | 'mayan'
   | 'chainflip'
   | 'garden'
-  | 'changenow'
 
 export type InternalQuoteRouting = {
   provider_sequence?: InternalProviderId[]

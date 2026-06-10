@@ -542,7 +542,10 @@ mod tests {
             HL_BOOK_CACHE_TTL,
         );
 
-        cache.pair_books("UBTC/USDC").await.expect("slow cold fetch");
+        cache
+            .pair_books("UBTC/USDC")
+            .await
+            .expect("slow cold fetch");
         tokio::time::advance(Duration::from_secs(8)).await;
         cache.pair_books("UBTC/USDC").await.expect("warm fetch");
         assert_eq!(source.calls_for(L2BookResolution::SigFigs5), 1);

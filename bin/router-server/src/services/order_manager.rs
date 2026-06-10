@@ -176,10 +176,7 @@ fn is_insufficient_liquidity_failure(error: &MarketOrderError) -> bool {
 /// liquidity-class error arrives and the kept one is not liquidity-class.
 /// "A size reduction can plausibly fix this" beats venue weather from a
 /// lower-ranked path; among same-class errors the better-ranked path wins.
-fn keep_representative_error(
-    kept: &mut Option<MarketOrderError>,
-    candidate: MarketOrderError,
-) {
+fn keep_representative_error(kept: &mut Option<MarketOrderError>, candidate: MarketOrderError) {
     let upgrade = match kept {
         None => true,
         Some(kept) => {
@@ -1596,8 +1593,7 @@ impl OrderManager {
             (Some((mh_label, mh_out, mh_hops)), Some((sh_label, sh_out))) => {
                 let mh_value = U256::from_str(&mh_out).unwrap_or_default();
                 let sh_value = U256::from_str(&sh_out).unwrap_or_default();
-                let single_hop_wins =
-                    sh_value > mh_value || (sh_value == mh_value && mh_hops > 1);
+                let single_hop_wins = sh_value > mh_value || (sh_value == mh_value && mh_hops > 1);
                 Some(if single_hop_wins {
                     RouteExplainWinner {
                         family: "single_hop".to_string(),
@@ -1734,19 +1730,6 @@ impl OrderManager {
             }
         };
 
-        // Registry decimals are optional: address-form/venue-only tokens
-        // (e.g. WBTC) have none, and only human-decimal venue APIs
-        // (ChangeNow) need them — those providers decline individually
-        // rather than the whole single-hop family going dark.
-        let source_decimals = self
-            .asset_registry
-            .chain_asset(&request.source_asset)
-            .map(|asset| asset.decimals);
-        let destination_decimals = self
-            .asset_registry
-            .chain_asset(&request.destination_asset)
-            .map(|asset| asset.decimals);
-
         let mut views: Vec<SingleHopVenueView> = Vec::new();
         let mut tasks = tokio::task::JoinSet::new();
         for provider in providers {
@@ -1768,9 +1751,7 @@ impl OrderManager {
             }
             let provider_request = SingleHopQuoteRequest {
                 source_asset: request.source_asset.clone(),
-                source_decimals,
                 destination_asset: request.destination_asset.clone(),
-                destination_decimals,
                 amount_in: request.amount_in.clone(),
                 source_depositor_address: source_depositor_address.to_string(),
                 destination_recipient_address: destination_recipient_address.clone(),
@@ -2409,17 +2390,6 @@ impl OrderManager {
         let destination_recipient_address =
             self.quote_address_for_chain(quote_id, &request.destination_asset.chain)?;
         let refund_address = self.quote_address_for_chain(quote_id, &request.source_asset.chain)?;
-        // Registry decimals are optional (see the single-hop view builder):
-        // only ChangeNow consumes them, declining individually on `None`.
-        let source_decimals = self
-            .asset_registry
-            .chain_asset(&request.source_asset)
-            .map(|asset| asset.decimals);
-        let destination_decimals = self
-            .asset_registry
-            .chain_asset(&request.destination_asset)
-            .map(|asset| asset.decimals);
-
         let mut candidates = include_candidates.then(Vec::new);
         let mut tasks = tokio::task::JoinSet::new();
         for provider in providers {
@@ -2443,9 +2413,7 @@ impl OrderManager {
             }
             let provider_request = SingleHopQuoteRequest {
                 source_asset: request.source_asset.clone(),
-                source_decimals,
                 destination_asset: request.destination_asset.clone(),
-                destination_decimals,
                 amount_in: request.amount_in.clone(),
                 source_depositor_address: source_depositor_address.to_string(),
                 destination_recipient_address: destination_recipient_address.clone(),
