@@ -1707,7 +1707,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 71
+        "y": 78
       },
       "id": 22,
       "options": {
@@ -1775,7 +1775,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 71
+        "y": 78
       },
       "id": 23,
       "options": {
@@ -1871,7 +1871,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 71
+        "y": 78
       },
       "id": 24,
       "options": {
@@ -1927,7 +1927,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 128
+        "y": 135
       },
       "id": 12,
       "options": {
@@ -1964,7 +1964,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 99
+        "y": 106
       },
       "id": 35,
       "panels": [],
@@ -2031,7 +2031,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 100
+        "y": 107
       },
       "id": 36,
       "options": {
@@ -2124,7 +2124,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 100
+        "y": 107
       },
       "id": 37,
       "options": {
@@ -2217,7 +2217,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 107
+        "y": 114
       },
       "id": 38,
       "options": {
@@ -2310,7 +2310,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 107
+        "y": 114
       },
       "id": 39,
       "options": {
@@ -2403,7 +2403,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 114
+        "y": 121
       },
       "id": 40,
       "options": {
@@ -2496,7 +2496,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 114
+        "y": 121
       },
       "id": 41,
       "options": {
@@ -2589,7 +2589,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 121
+        "y": 128
       },
       "id": 42,
       "options": {
@@ -2682,7 +2682,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 78
+        "y": 85
       },
       "id": 25,
       "options": {
@@ -2775,7 +2775,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 78
+        "y": 85
       },
       "id": 26,
       "options": {
@@ -2868,7 +2868,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 85
+        "y": 92
       },
       "id": 27,
       "options": {
@@ -2961,7 +2961,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 85
+        "y": 92
       },
       "id": 28,
       "options": {
@@ -3054,7 +3054,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 92
+        "y": 99
       },
       "id": 29,
       "options": {
@@ -3147,7 +3147,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 92
+        "y": 99
       },
       "id": 30,
       "options": {
@@ -3190,7 +3190,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 138
+        "y": 145
       },
       "id": 31,
       "panels": [],
@@ -3257,7 +3257,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 139
+        "y": 146
       },
       "id": 32,
       "options": {
@@ -3383,7 +3383,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 139
+        "y": 146
       },
       "id": 33,
       "options": {
@@ -3476,7 +3476,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 147
+        "y": 154
       },
       "id": 34,
       "options": {
@@ -3508,6 +3508,101 @@
       ],
       "title": "Order Executor Wait Total p95",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "victoriametrics"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "429s / 5m",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "id": 43,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "victoriametrics"
+          },
+          "editorMode": "code",
+          "expr": "sum by (service) (increase(tee_router_upstream_requests_total{kind=\"trading_venue\", status_code=\"429\"}[5m]))",
+          "legendFormat": "{{service}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Venue Rate Limiting — 429s (5m)",
+      "type": "timeseries",
+      "description": "Per-venue HTTP 429 (Too Many Requests) responses over 5m, from the exact status_code label on tee_router_upstream_requests_total. A non-zero series means that venue is rate-limiting our egress IP."
     }
   ],
   "refresh": "5s",
