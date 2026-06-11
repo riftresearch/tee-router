@@ -5,6 +5,7 @@ import {
   GatewayValidationError,
   UpstreamHttpError,
   UpstreamInsufficientLiquidityError,
+  UpstreamVenueUnavailableError,
   normalizeError
 } from '../errors'
 
@@ -66,6 +67,18 @@ test('normalizeError renders insufficient liquidity with its dedicated code', ()
     error: {
       code: 'INSUFFICIENT_LIQUIDITY',
       message: 'insufficient liquidity for the requested size'
+    }
+  })
+})
+
+test('normalizeError renders venue-unavailable cleanly without leaking upstream detail', () => {
+  const normalized = normalizeError(new UpstreamVenueUnavailableError())
+
+  expect(normalized.status).toBe(503)
+  expect(normalized.body).toEqual({
+    error: {
+      code: 'SERVICE_UNAVAILABLE',
+      message: 'a venue is temporarily unavailable; please retry shortly'
     }
   })
 })

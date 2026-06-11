@@ -44,6 +44,13 @@ pub enum RouterServerError {
     #[snafu(display("insufficient liquidity for the requested size"))]
     InsufficientLiquidity,
 
+    /// Venue-agnostic no-route classification: the representative path failure
+    /// was a transient upstream error (rate limit / timeout / 5xx). Carries no
+    /// provider detail by design; `kind: "venue_unavailable"` is the
+    /// machine-readable signal the gateway maps to its public error code.
+    #[snafu(display("a venue is temporarily unavailable; please retry shortly"))]
+    VenueUnavailable,
+
     #[snafu(display("Not ready: {}", message))]
     NotReady { message: String },
 
@@ -125,6 +132,7 @@ impl RouterServerError {
             Self::Validation { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::NoRoute { .. } | Self::InsufficientLiquidity => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::VenueUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotReady { .. } => StatusCode::TOO_EARLY,
             Self::InvalidData { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseQuery { .. } | Self::Migration { .. } | Self::Internal { .. } => {
@@ -136,6 +144,7 @@ impl RouterServerError {
     fn kind(&self) -> Option<&'static str> {
         match self {
             Self::InsufficientLiquidity => Some("insufficient_liquidity"),
+            Self::VenueUnavailable => Some("venue_unavailable"),
             _ => None,
         }
     }
@@ -153,6 +162,7 @@ impl RouterServerError {
             | Self::Conflict { .. }
             | Self::NoRoute { .. }
             | Self::InsufficientLiquidity
+            | Self::VenueUnavailable
             | Self::NotReady { .. } => self.to_string(),
         }
     }
@@ -261,6 +271,7 @@ impl From<crate::services::order_manager::MarketOrderError> for RouterServerErro
             MarketOrderError::InvalidRouting { reason } => Self::Validation { message: reason },
             MarketOrderError::NoRoute { reason } => Self::NoRoute { message: reason },
             MarketOrderError::InsufficientLiquidity => Self::InsufficientLiquidity,
+            MarketOrderError::VenueTemporarilyUnavailable => Self::VenueUnavailable,
             MarketOrderError::OutputBelowFloor {
                 estimated_amount_out,
                 output_floor,

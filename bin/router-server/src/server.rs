@@ -849,9 +849,10 @@ fn provider_hint_shape_for_hint(
         router_core::models::ProviderOperationHintKind::CctpReceiveObserved => {
             (ProviderKind::Bridge, ProviderHintKind::CctpReceiveObserved)
         }
-        router_core::models::ProviderOperationHintKind::VeloraSwapSettled => {
-            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
-        }
+        router_core::models::ProviderOperationHintKind::UniversalRouterSwapSettled => (
+            ProviderKind::Exchange,
+            ProviderHintKind::UniversalRouterSwapSettled,
+        ),
         router_core::models::ProviderOperationHintKind::HyperUnitDepositCredited => (
             ProviderKind::Unit,
             ProviderHintKind::HyperUnitDepositCredited,
@@ -910,9 +911,10 @@ fn provider_hint_shape_for_operation(
         | ProviderOperationType::HyperliquidBridgeWithdrawal => {
             (ProviderKind::Bridge, ProviderHintKind::ProviderObservation)
         }
-        ProviderOperationType::UniversalRouterSwap => {
-            (ProviderKind::Exchange, ProviderHintKind::VeloraSwapSettled)
-        }
+        ProviderOperationType::UniversalRouterSwap => (
+            ProviderKind::Exchange,
+            ProviderHintKind::UniversalRouterSwapSettled,
+        ),
     }
 }
 
@@ -961,9 +963,9 @@ fn provider_hint_evidence_for_signal(
             return typed_hint_evidence(evidence)
                 .map(|e| Some(ProviderOperationHintEvidence::HlWithdrawalSettled(e)));
         }
-        ProviderHintKind::VeloraSwapSettled => {
+        ProviderHintKind::UniversalRouterSwapSettled => {
             return typed_hint_evidence(evidence)
-                .map(|e| Some(ProviderOperationHintEvidence::VeloraSwapSettled(e)));
+                .map(|e| Some(ProviderOperationHintEvidence::UniversalRouterSwapSettled(e)));
         }
         ProviderHintKind::CctpReceiveObserved => {
             return typed_hint_evidence(evidence)
@@ -1222,8 +1224,8 @@ async fn get_order_flow(
 }
 
 /// Admin-only export of the static routing graph for the dashboard visualizer.
-/// Emits every declared transition plus the curated Velora same-chain swap
-/// edges so live-priced Velora legs still render on the graph.
+/// Emits every declared transition plus the curated universal-router same-chain swap
+/// edges so live-priced universal-router legs still render on the graph.
 async fn get_route_graph(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1275,7 +1277,7 @@ fn build_route_graph(registry: &AssetRegistry) -> RouteGraphEnvelope {
         .map(|decl| decl.id.clone())
         .collect();
 
-    // Edges: declared transitions + curated Velora swap edges (which are not
+    // Edges: declared transitions + curated universal-router swap edges (which are not
     // part of the static declaration set but should still be visible).
     let declarations = registry.display_transition_declarations();
 
@@ -1826,6 +1828,20 @@ mod tests {
     };
     use router_primitives::ChainType;
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn universal_router_swap_hint_shape_uses_settlement_hint() {
+        assert_eq!(
+            provider_hint_shape_for_hint(
+                ProviderOperationType::UniversalRouterSwap,
+                router_core::models::ProviderOperationHintKind::UniversalRouterSwapSettled,
+            ),
+            (
+                ProviderKind::Exchange,
+                ProviderHintKind::UniversalRouterSwapSettled
+            )
+        );
+    }
 
     #[test]
     fn create_order_request_rejects_cancellation_commitment() {

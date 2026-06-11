@@ -235,7 +235,7 @@ pub struct OrderFlowEnvelope {
 
 /// Response body for `GET /internal/v1/route-graph`. A static snapshot of the
 /// `AssetRegistry` routing graph (every declared transition plus the curated
-/// Velora same-chain swap edges) used by the admin dashboard visualizer.
+/// universal-router same-chain swap edges) used by the admin dashboard visualizer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteGraphEnvelope {
     pub nodes: Vec<RouteGraphNode>,
@@ -699,7 +699,7 @@ mod tests {
             "to_asset": {"chain": "evm:8453", "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
             "amount_in": "5000000",
             "routing": {
-                "provider_sequence": ["velora", "hyperliquid_spot"]
+                "provider_sequence": ["kyberswap", "velora", "hyperliquid_spot"]
             }
         }))
         .expect("market order request with routing");
@@ -709,7 +709,11 @@ mod tests {
         };
         assert_eq!(
             request.routing.provider_sequence,
-            Some(vec![ProviderId::Velora, ProviderId::HyperliquidSpot])
+            Some(vec![
+                ProviderId::Kyberswap,
+                ProviderId::Velora,
+                ProviderId::HyperliquidSpot,
+            ])
         );
     }
 

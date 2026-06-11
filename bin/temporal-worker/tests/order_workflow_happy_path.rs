@@ -38,7 +38,7 @@ use router_core::{
             PaymasterRegistry,
         },
         AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-        CctpHttpProviderConfig, RouteCostService, VeloraHttpProviderConfig,
+        CctpHttpProviderConfig, RouteCostService, KyberswapHttpProviderConfig,
     },
 };
 use router_primitives::ChainType;
@@ -46,7 +46,7 @@ use router_server::{
     api::{CreateOrderRequest, CreateVaultRequest, MarketOrderQuoteRequest},
     services::{order_manager::OrderManager, vault_manager::VaultManager},
 };
-use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
+use router_temporal::{CctpReceiveObservedEvidence, UniversalRouterSwapSettledEvidence};
 use router_test_support::temporal::TestTemporal;
 use serde_json::{json, Value};
 use sqlx_core::connection::Connection;
@@ -111,16 +111,16 @@ struct WorkflowRun {
 #[derive(Clone, Copy, Default)]
 enum WorkflowRoute {
     #[default]
-    VeloraBaseEthToBaseUsdc,
-    // A single-Velora-swap order whose *source* asset is Ethereum-native ETH.
+    KyberswapBaseEthToBaseUsdc,
+    // A single-Kyberswap-swap order whose *source* asset is Ethereum-native ETH.
     // The HyperliquidSpot refund test needs a source asset that a
     // HyperliquidSpot position can actually be refunded back to via a Unit
     // withdrawal. Unit only registers an ETH withdrawal capability on Ethereum
     // (`evm:1`), never Base — so the default Base-ETH source has *no* reachable
     // HyperliquidSpot -> Unit refund path. The primary execution still fails
-    // through the deterministic Velora injection lever (it is a Velora swap),
+    // through the deterministic Kyberswap injection lever (it is a Kyberswap swap),
     // so the retry budget exhausts identically to the other refund tests.
-    VeloraEthereumEthToEthereumUsdc,
+    KyberswapEthereumEthToEthereumUsdc,
     AcrossBaseEthToEthereumUsdc,
     CctpBaseUsdcToArbitrumEth,
     CctpBaseUsdcToBitcoin,
@@ -131,16 +131,16 @@ enum WorkflowRoute {
 #[derive(Default)]
 struct WorkflowOptions {
     route: WorkflowRoute,
-    velora_transaction_failures: usize,
-    velora_stale_quote_failures: usize,
+    kyberswap_transaction_failures: usize,
+    kyberswap_stale_quote_failures: usize,
     expire_quote_legs: bool,
     expire_quote_transition_kinds: Vec<&'static str>,
     refreshed_eth_usd_micro: Option<u128>,
     expect_external_custody_across_refund: bool,
     expect_hyperliquid_spot_unit_refund: bool,
     expect_external_custody_cctp_refund: bool,
-    expect_external_custody_velora_refund: bool,
-    expect_external_custody_across_then_velora_refund: bool,
+    expect_external_custody_kyberswap_refund: bool,
+    expect_external_custody_across_then_kyberswap_refund: bool,
     simulate_across_lost_intent_checkpoint: bool,
 }
 
@@ -314,7 +314,7 @@ async fn order_workflow_completes_unit_deposit_via_hint() {
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_retries_failed_step_then_completes() {
     let run = run_order_workflow(WorkflowOptions {
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS,
         ..WorkflowOptions::default()
     })
     .await;
@@ -378,7 +378,7 @@ async fn order_workflow_retries_failed_step_then_completes() {
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         ..WorkflowOptions::default()
     })
     .await;
@@ -464,7 +464,7 @@ async fn order_workflow_refunds_after_retry_exhaustion() {
 async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::AcrossBaseEthToEthereumUsdc,
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         expect_external_custody_across_refund: true,
         ..WorkflowOptions::default()
     })
@@ -514,7 +514,7 @@ async fn order_workflow_refunds_external_custody_across_after_retry_exhaustion()
 async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
         route: WorkflowRoute::CctpBaseUsdcToArbitrumEth,
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         expect_external_custody_cctp_refund: true,
         ..WorkflowOptions::default()
     })
@@ -580,8 +580,8 @@ async fn order_workflow_refunds_external_custody_cctp_after_retry_exhaustion() {
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_external_custody_universal_router_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
-        expect_external_custody_velora_refund: true,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_kyberswap_refund: true,
         ..WorkflowOptions::default()
     })
     .await;
@@ -620,7 +620,7 @@ async fn order_workflow_refunds_external_custody_universal_router_after_retry_ex
         refund_step.step_type,
         OrderExecutionStepType::UniversalRouterSwap
     );
-    assert_eq!(refund_step.provider, "velora");
+    assert_eq!(refund_step.provider, "kyberswap");
     assert_eq!(refund_step.status, OrderExecutionStepStatus::Completed);
     let expected_refund_amount = refund_step
         .request
@@ -639,8 +639,8 @@ async fn order_workflow_refunds_external_custody_universal_router_after_retry_ex
 async fn order_workflow_refunds_external_custody_across_then_universal_router_after_retry_exhaustion(
 ) {
     let run = run_order_workflow(WorkflowOptions {
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
-        expect_external_custody_across_then_velora_refund: true,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        expect_external_custody_across_then_kyberswap_refund: true,
         ..WorkflowOptions::default()
     })
     .await;
@@ -706,8 +706,8 @@ async fn order_workflow_refunds_external_custody_across_then_universal_router_af
 #[ignore = "integration: spawns devnet stack"]
 async fn order_workflow_refunds_hyperliquid_spot_unit_withdrawal_after_retry_exhaustion() {
     let run = run_order_workflow(WorkflowOptions {
-        route: WorkflowRoute::VeloraEthereumEthToEthereumUsdc,
-        velora_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
+        route: WorkflowRoute::KyberswapEthereumEthToEthereumUsdc,
+        kyberswap_transaction_failures: EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2,
         expect_hyperliquid_spot_unit_refund: true,
         ..WorkflowOptions::default()
     })
@@ -860,11 +860,11 @@ async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
         .find(|step| step.step_type == OrderExecutionStepType::AcrossBridge)
         .expect("stale attempt should contain the completed Across step");
     assert_eq!(across_step.status, OrderExecutionStepStatus::Completed);
-    let stale_velora_step = stale_attempt_steps
+    let stale_kyberswap_step = stale_attempt_steps
         .iter()
         .find(|step| step.step_type == OrderExecutionStepType::UniversalRouterSwap)
-        .expect("stale attempt should contain the failed Velora step");
-    assert_eq!(stale_velora_step.status, OrderExecutionStepStatus::Failed);
+        .expect("stale attempt should contain the failed Kyberswap step");
+    assert_eq!(stale_kyberswap_step.status, OrderExecutionStepStatus::Failed);
 
     let stale_attempt_legs = run
         .db
@@ -898,7 +898,7 @@ async fn order_workflow_refreshes_stale_quote_multi_leg_then_completes() {
     );
     assert_eq!(
         refreshed_attempt_steps[0].step_index,
-        stale_velora_step.step_index
+        stale_kyberswap_step.step_index
     );
 
     let refreshed_attempt_legs = run
@@ -1381,15 +1381,15 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     )
     .await;
     let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
-        || options.expect_external_custody_across_then_velora_refund;
-    // The Ethereum-source Velora route needs the Ethereum chain, its mock-USDC
-    // clone, and the Ethereum Velora contract/provider wired even though it is
+        || options.expect_external_custody_across_then_kyberswap_refund;
+    // The Ethereum-source Kyberswap route needs the Ethereum chain, its mock-USDC
+    // clone, and the Ethereum Kyberswap contract/provider wired even though it is
     // not an Across route.
-    let ethereum_velora_enabled = matches!(
+    let ethereum_kyberswap_enabled = matches!(
         options.route,
-        WorkflowRoute::VeloraEthereumEthToEthereumUsdc
+        WorkflowRoute::KyberswapEthereumEthToEthereumUsdc
     );
-    let ethereum_enabled = across_enabled || ethereum_velora_enabled;
+    let ethereum_enabled = across_enabled || ethereum_kyberswap_enabled;
     let cctp_enabled = matches!(
         options.route,
         WorkflowRoute::CctpBaseUsdcToArbitrumEth | WorkflowRoute::CctpBaseUsdcToBitcoin
@@ -1465,7 +1465,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
     let custody_executor = Arc::new(custody_executor);
 
     let seeded = match options.route {
-        WorkflowRoute::VeloraBaseEthToBaseUsdc => {
+        WorkflowRoute::KyberswapBaseEthToBaseUsdc => {
             seed_funded_single_step_order(
                 &db,
                 settings.clone(),
@@ -1476,8 +1476,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
             )
             .await
         }
-        WorkflowRoute::VeloraEthereumEthToEthereumUsdc => {
-            seed_funded_ethereum_velora_order(
+        WorkflowRoute::KyberswapEthereumEthToEthereumUsdc => {
+            seed_funded_ethereum_kyberswap_order(
                 &db,
                 settings.clone(),
                 chain_registry.clone(),
@@ -1548,7 +1548,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         )
         .await;
     }
-    if options.expect_external_custody_velora_refund {
+    if options.expect_external_custody_kyberswap_refund {
         seed_external_custody_universal_router_refund_position(
             &custody_executor,
             &devnet,
@@ -1557,7 +1557,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         )
         .await;
     }
-    if options.expect_external_custody_across_then_velora_refund {
+    if options.expect_external_custody_across_then_kyberswap_refund {
         seed_external_custody_across_then_universal_router_refund_position(
             &custody_executor,
             &devnet,
@@ -1575,7 +1575,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
         .await;
     }
     if let Some(usd_micro) = options.refreshed_eth_usd_micro {
-        mocks.set_velora_usd_price_micro("ETH", usd_micro).await;
+        mocks.set_kyberswap_usd_price_micro("ETH", usd_micro).await;
     }
 
     let task_queue = format!("{DEFAULT_TASK_QUEUE}-{}", Uuid::now_v7());
@@ -1624,12 +1624,12 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await
                 .expect("start OrderWorkflow");
-            let should_signal_primary_velora =
-                should_signal_primary_velora_settled_hint(&options);
-            if should_signal_primary_velora
-                && matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc)
+            let should_signal_primary_kyberswap =
+                should_signal_primary_kyberswap_settled_hint(&options);
+            if should_signal_primary_kyberswap
+                && matches!(options.route, WorkflowRoute::KyberswapBaseEthToBaseUsdc)
             {
-                signal_order_velora_settled(
+                signal_order_kyberswap_settled(
                     &client,
                     &db_for_workflow,
                     &workflow_id,
@@ -1706,8 +1706,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     signal_result,
                     "send Across provider-operation hint signal",
                 );
-                if should_signal_primary_velora {
-                    signal_order_velora_settled(
+                if should_signal_primary_kyberswap {
+                    signal_order_kyberswap_settled(
                         &client,
                         &db_for_workflow,
                         &workflow_id,
@@ -1747,10 +1747,10 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     order_id,
                 )
                 .await;
-                if should_signal_primary_velora
+                if should_signal_primary_kyberswap
                     && matches!(options.route, WorkflowRoute::CctpBaseUsdcToArbitrumEth)
                 {
-                    signal_order_velora_settled(
+                    signal_order_kyberswap_settled(
                         &client,
                         &db_for_workflow,
                         &workflow_id,
@@ -1810,7 +1810,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await;
             }
-            if options.expect_external_custody_across_then_velora_refund {
+            if options.expect_external_custody_across_then_kyberswap_refund {
                 signal_external_custody_refund_across_fill(
                     &client,
                     &db_for_workflow,
@@ -1821,7 +1821,7 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                     true,
                 )
                 .await;
-                signal_external_custody_refund_velora_settled(
+                signal_external_custody_refund_kyberswap_settled(
                     &client,
                     &db_for_workflow,
                     order_id,
@@ -1844,8 +1844,8 @@ async fn run_order_workflow(options: WorkflowOptions) -> WorkflowRun {
                 )
                 .await;
             }
-            if options.expect_external_custody_velora_refund {
-                signal_external_custody_refund_velora_settled(
+            if options.expect_external_custody_kyberswap_refund {
+                signal_external_custody_refund_kyberswap_settled(
                     &client,
                     &db_for_workflow,
                     order_id,
@@ -2078,18 +2078,18 @@ fn test_action_providers(
         hyperunit_proxy_url: None,
         hyperliquid_base_url: hyperliquid_node_url,
         hyperliquid_proxy_url: None,
-        velora: matches!(
+        kyberswap: matches!(
             route,
-            WorkflowRoute::VeloraBaseEthToBaseUsdc
-                | WorkflowRoute::VeloraEthereumEthToEthereumUsdc
+            WorkflowRoute::KyberswapBaseEthToBaseUsdc
+                | WorkflowRoute::KyberswapEthereumEthToEthereumUsdc
                 | WorkflowRoute::AcrossBaseEthToEthereumUsdc
                 | WorkflowRoute::CctpBaseUsdcToArbitrumEth
         )
-        .then(|| VeloraHttpProviderConfig {
-            base_url: mocks.velora_url(),
-            partner: Some("temporal-worker-e2e".to_string()),
+        .then(|| KyberswapHttpProviderConfig {
+            base_url: mocks.kyberswap_url(),
             proxy_url: None,
         }),
+        velora: None,
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
     })
@@ -2099,7 +2099,7 @@ fn test_action_providers(
 async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockIntegratorServer {
     let mut config = MockIntegratorConfig::default();
     let across_enabled = matches!(options.route, WorkflowRoute::AcrossBaseEthToEthereumUsdc)
-        || options.expect_external_custody_across_then_velora_refund;
+        || options.expect_external_custody_across_then_kyberswap_refund;
     let unit_enabled = matches!(options.route, WorkflowRoute::UnitBitcoinToBaseEth)
         || matches!(options.route, WorkflowRoute::CctpBaseUsdcToBitcoin)
         || matches!(
@@ -2107,30 +2107,30 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             WorkflowRoute::HyperliquidArbitrumUsdcToBitcoin
         )
         || options.expect_hyperliquid_spot_unit_refund;
-    if matches!(options.route, WorkflowRoute::VeloraBaseEthToBaseUsdc) {
-        config = config.with_velora_swap_contract_address(
+    if matches!(options.route, WorkflowRoute::KyberswapBaseEthToBaseUsdc) {
+        config = config.with_kyberswap_swap_contract_address(
             devnet.base.anvil.chain_id(),
-            format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+            format!("{:#x}", devnet.base.mock_kyberswap_swap_contract.address()),
         );
     }
     if matches!(
         options.route,
-        WorkflowRoute::VeloraEthereumEthToEthereumUsdc
+        WorkflowRoute::KyberswapEthereumEthToEthereumUsdc
     ) {
-        config = config.with_velora_swap_contract_address(
+        config = config.with_kyberswap_swap_contract_address(
             devnet.ethereum.anvil.chain_id(),
-            format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
+            format!("{:#x}", devnet.ethereum.mock_kyberswap_swap_contract.address()),
         );
     }
     if across_enabled {
         config = config
-            .with_velora_swap_contract_address(
+            .with_kyberswap_swap_contract_address(
                 devnet.base.anvil.chain_id(),
-                format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
+                format!("{:#x}", devnet.base.mock_kyberswap_swap_contract.address()),
             )
-            .with_velora_swap_contract_address(
+            .with_kyberswap_swap_contract_address(
                 devnet.ethereum.anvil.chain_id(),
-                format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
+                format!("{:#x}", devnet.ethereum.mock_kyberswap_swap_contract.address()),
             )
             .with_across_chain(
                 devnet.ethereum.anvil.chain_id(),
@@ -2154,9 +2154,9 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
         WorkflowRoute::CctpBaseUsdcToArbitrumEth | WorkflowRoute::CctpBaseUsdcToBitcoin
     ) {
         config = config
-            .with_velora_swap_contract_address(
+            .with_kyberswap_swap_contract_address(
                 devnet.arbitrum.anvil.chain_id(),
-                format!("{:#x}", devnet.arbitrum.mock_velora_swap_contract.address()),
+                format!("{:#x}", devnet.arbitrum.mock_kyberswap_swap_contract.address()),
             )
             .with_cctp_chain(
                 devnet.base.anvil.chain_id(),
@@ -2211,8 +2211,8 @@ async fn spawn_mocks(devnet: &RiftDevnet, options: &WorkflowOptions) -> MockInte
             );
     }
     config = config
-        .with_velora_transaction_fail_next_n(options.velora_transaction_failures)
-        .with_velora_transaction_stale_quote_fail_next_n(options.velora_stale_quote_failures);
+        .with_kyberswap_transaction_fail_next_n(options.kyberswap_transaction_failures)
+        .with_kyberswap_transaction_stale_quote_fail_next_n(options.kyberswap_stale_quote_failures);
     MockIntegratorServer::spawn_with_config(config)
         .await
         .expect("spawn mock integrators")
@@ -2446,22 +2446,22 @@ fn assert_signal_sent_or_workflow_completed<T, E: std::fmt::Debug>(
     }
 }
 
-fn should_signal_primary_velora_settled_hint(options: &WorkflowOptions) -> bool {
+fn should_signal_primary_kyberswap_settled_hint(options: &WorkflowOptions) -> bool {
     if options.refreshed_eth_usd_micro.is_some() {
         return false;
     }
-    if options.velora_transaction_failures >= EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2 {
+    if options.kyberswap_transaction_failures >= EXECUTE_STEP_TEMPORAL_ATTEMPTS * 2 {
         return false;
     }
     matches!(
         options.route,
-        WorkflowRoute::VeloraBaseEthToBaseUsdc
+        WorkflowRoute::KyberswapBaseEthToBaseUsdc
             | WorkflowRoute::AcrossBaseEthToEthereumUsdc
             | WorkflowRoute::CctpBaseUsdcToArbitrumEth
     )
 }
 
-async fn signal_order_velora_settled(
+async fn signal_order_kyberswap_settled(
     client: &Client,
     db: &Database,
     workflow_id: &str,
@@ -2478,10 +2478,10 @@ async fn signal_order_velora_settled(
         ) => operation,
         result = handle_before_hint.get_result(WorkflowGetResultOptions::default()) => {
             let state = workflow_state_summary(db, order_id).await;
-            panic!("OrderWorkflow ended before the Velora provider operation reached WaitingExternal: {result:?}\n{state}");
+            panic!("OrderWorkflow ended before the Kyberswap provider operation reached WaitingExternal: {result:?}\n{state}");
         }
     };
-    let evidence = velora_swap_settled_evidence(&operation);
+    let evidence = universal_router_swap_settled_evidence(&operation);
     let signal_result = handle_before_hint
         .signal(
             OrderWorkflow::provider_operation_hint,
@@ -2489,21 +2489,23 @@ async fn signal_order_velora_settled(
                 order_id: order_id.into(),
                 execution_step_id: operation
                     .execution_step_id
-                    .expect("Velora operation should carry execution_step_id")
+                    .expect("universal router operation should carry execution_step_id")
                     .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(operation.id.into()),
                 provider: ProviderKind::Exchange,
-                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                hint_kind: ProviderHintKind::UniversalRouterSwapSettled,
                 provider_ref: operation.provider_ref.clone(),
-                evidence: Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)),
+                evidence: Some(ProviderOperationHintEvidence::UniversalRouterSwapSettled(
+                    evidence,
+                )),
             },
             WorkflowSignalOptions::default(),
         )
         .await;
     assert_signal_sent_or_workflow_completed(
         signal_result,
-        "send VeloraSwapSettled provider-operation hint signal",
+        "send UniversalRouterSwapSettled provider-operation hint signal",
     );
 }
 
@@ -2766,19 +2768,24 @@ fn provider_operation_request_str_any(
     })
 }
 
-fn velora_swap_settled_evidence(operation: &OrderProviderOperation) -> VeloraSwapSettledEvidence {
-    let amount_out =
-        provider_operation_request_str_any(operation, &["amount_out", "min_amount_out"]).expect(
-            "VeloraSwapSettled operation request should carry amount_out or min_amount_out",
-        );
-    VeloraSwapSettledEvidence {
-        tx_hash: provider_operation_provider_ref(operation, "VeloraSwapSettled"),
+fn universal_router_swap_settled_evidence(
+    operation: &OrderProviderOperation,
+) -> UniversalRouterSwapSettledEvidence {
+    let amount_out = provider_operation_request_str_any(
+        operation,
+        &["amount_out", "min_amount_out"],
+    )
+    .expect(
+        "UniversalRouterSwapSettled operation request should carry amount_out or min_amount_out",
+    );
+    UniversalRouterSwapSettledEvidence {
+        tx_hash: provider_operation_provider_ref(operation, "UniversalRouterSwapSettled"),
         log_index: 0,
         amount_out,
         recipient: provider_operation_request_str(
             operation,
             "recipient_address",
-            "VeloraSwapSettled",
+            "UniversalRouterSwapSettled",
         ),
         executor: None,
         token_address: None,
@@ -3316,7 +3323,7 @@ async fn signal_external_custody_refund_cctp_receive_observed(
     );
 }
 
-async fn signal_external_custody_refund_velora_settled(
+async fn signal_external_custody_refund_kyberswap_settled(
     client: &Client,
     db: &Database,
     order_id: Uuid,
@@ -3348,7 +3355,7 @@ async fn signal_external_custody_refund_velora_settled(
         Duration::from_secs(120),
     )
     .await;
-    let evidence = velora_swap_settled_evidence(&refund_operation);
+    let evidence = universal_router_swap_settled_evidence(&refund_operation);
     let refund_workflow = client.get_workflow_handle::<RefundWorkflow>(&refund_workflow_id(
         order_id.into(),
         parent_attempt.id.into(),
@@ -3360,21 +3367,23 @@ async fn signal_external_custody_refund_velora_settled(
                 order_id: order_id.into(),
                 execution_step_id: refund_operation
                     .execution_step_id
-                    .expect("refund Velora operation should carry execution_step_id")
+                    .expect("refund universal router operation should carry execution_step_id")
                     .into(),
                 hint_id: Uuid::now_v7().into(),
                 provider_operation_id: Some(refund_operation.id.into()),
                 provider: ProviderKind::Exchange,
-                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                hint_kind: ProviderHintKind::UniversalRouterSwapSettled,
                 provider_ref: refund_operation.provider_ref.clone(),
-                evidence: Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)),
+                evidence: Some(ProviderOperationHintEvidence::UniversalRouterSwapSettled(
+                    evidence,
+                )),
             },
             WorkflowSignalOptions::default(),
         )
         .await;
     assert_signal_sent_or_workflow_completed(
         signal_result,
-        "send refund VeloraSwapSettled provider-operation hint signal",
+        "send refund UniversalRouterSwapSettled provider-operation hint signal",
     );
 }
 
@@ -3905,8 +3914,8 @@ async fn seed_funded_single_step_order(
     assert!(
         market_quote
             .provider_id
-            .contains("universal_router_swap:velora"),
-        "expected a single Velora step, got {}",
+            .contains("universal_router_swap:kyberswap"),
+        "expected a single Kyberswap step, got {}",
         market_quote.provider_id
     );
 
@@ -3965,13 +3974,13 @@ async fn seed_funded_single_step_order(
     }
 }
 
-/// Seeds a single-Velora-swap order whose source asset is Ethereum-native ETH
+/// Seeds a single-Kyberswap-swap order whose source asset is Ethereum-native ETH
 /// (`evm:1`). Used by the HyperliquidSpot refund test: the refund returns to the
 /// order's source asset, and Unit only supports an ETH withdrawal *to Ethereum*,
 /// so the source must live on Ethereum for the HyperliquidSpot -> Unit refund
-/// path to exist. The primary swap is still a Velora step, so it exhausts via
-/// the same deterministic `velora_transaction_fail_next_n` lever.
-async fn seed_funded_ethereum_velora_order(
+/// path to exist. The primary swap is still a Kyberswap step, so it exhausts via
+/// the same deterministic `kyberswap_transaction_fail_next_n` lever.
+async fn seed_funded_ethereum_kyberswap_order(
     db: &Database,
     settings: Arc<Settings>,
     chain_registry: Arc<ChainRegistry>,
@@ -4002,7 +4011,7 @@ async fn seed_funded_ethereum_velora_order(
             amount_in,
         })
         .await
-        .expect("quote Ethereum Velora order");
+        .expect("quote Ethereum Kyberswap order");
     let market_quote = match quote.quote {
         RouterOrderQuote::MarketOrder(quote) => quote,
         RouterOrderQuote::LimitOrder(_) => panic!("expected market quote"),
@@ -4010,8 +4019,8 @@ async fn seed_funded_ethereum_velora_order(
     assert!(
         market_quote
             .provider_id
-            .contains("universal_router_swap:velora"),
-        "expected a single Velora step, got {}",
+            .contains("universal_router_swap:kyberswap"),
+        "expected a single Kyberswap step, got {}",
         market_quote.provider_id
     );
 
@@ -4021,10 +4030,10 @@ async fn seed_funded_ethereum_velora_order(
             recipient_address: valid_evm_address(),
             refund_address: valid_evm_address(),
             idempotency_key: None,
-            metadata: json!({ "test": "temporal_order_workflow_ethereum_velora" }),
+            metadata: json!({ "test": "temporal_order_workflow_ethereum_kyberswap" }),
         })
         .await
-        .expect("create Ethereum Velora order from quote");
+        .expect("create Ethereum Kyberswap order from quote");
     let vault = vault_manager
         .create_vault(CreateVaultRequest {
             order_id: Some(order.id),
@@ -4034,7 +4043,7 @@ async fn seed_funded_ethereum_velora_order(
             cancellation_commitment:
                 "0x1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             cancel_after: None,
-            metadata: json!({ "test": "temporal_order_workflow_ethereum_velora" }),
+            metadata: json!({ "test": "temporal_order_workflow_ethereum_kyberswap" }),
         })
         .await
         .expect("create Ethereum funding vault");
@@ -4109,8 +4118,8 @@ async fn seed_funded_across_order(
         market_quote.provider_id.contains("across_bridge:across")
             && market_quote
                 .provider_id
-                .contains("universal_router_swap:velora"),
-        "expected an Across + Velora route, got {}",
+                .contains("universal_router_swap:kyberswap"),
+        "expected an Across + Kyberswap route, got {}",
         market_quote.provider_id
     );
 
@@ -4208,8 +4217,8 @@ async fn seed_funded_cctp_order(
         market_quote.provider_id.contains("cctp_bridge:cctp")
             && market_quote
                 .provider_id
-                .contains("universal_router_swap:velora"),
-        "expected a CCTP + Velora route, got {}",
+                .contains("universal_router_swap:kyberswap"),
+        "expected a CCTP + Kyberswap route, got {}",
         market_quote.provider_id
     );
 
@@ -4734,7 +4743,7 @@ async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Addr
     // is the contract that needs minting rights on the mock USDC.
     let minters = [
         admin,
-        *devnet.mock_velora_swap_contract.address(),
+        *devnet.mock_kyberswap_swap_contract.address(),
         Address::from_str(MOCK_CCTP_TOKEN_MESSENGER_V2_ADDRESS)
             .expect("valid mock CCTP TokenMessengerV2 address"),
     ];

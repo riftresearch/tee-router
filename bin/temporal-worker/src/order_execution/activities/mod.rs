@@ -263,7 +263,7 @@ fn provider_operation_hint_kind_label(
         Some(
             ProviderOperationType::HyperliquidTrade | ProviderOperationType::HyperliquidLimitOrder,
         ) => "hyperliquid_trade",
-        Some(ProviderOperationType::UniversalRouterSwap) => "velora_swap_settled",
+        Some(ProviderOperationType::UniversalRouterSwap) => "universal_router_swap_settled",
         Some(
             ProviderOperationType::UnitWithdrawal
             | ProviderOperationType::HyperliquidBridgeDeposit

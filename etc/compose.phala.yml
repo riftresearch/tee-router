@@ -328,7 +328,7 @@ x-router-environment: &router-environment
   - ACROSS_PROXY_URL
   - CCTP_PROXY_URL
   - HYPERLIQUID_PROXY_URL
-  - VELORA_PROXY_URL
+  - KYBERSWAP_PROXY_URL
   - RELAY_PROXY_URL
   - NEAR_INTENTS_PROXY_URL
   - MAYAN_PROXY_URL
@@ -339,7 +339,7 @@ x-router-environment: &router-environment
   - HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
   - HYPERLIQUID_NETWORK=mainnet
   - HYPERLIQUID_ORDER_TIMEOUT_MS=${HYPERLIQUID_ORDER_TIMEOUT_MS:-30000}
-  - VELORA_API_URL=https://api.paraswap.io
+  - KYBERSWAP_API_URL=https://aggregator-api.kyberswap.com
   - RELAY_API_URL=${RELAY_API_URL:-https://api.relay.link}
   - RELAY_API_KEY
   - NEAR_INTENTS_API_URL=${NEAR_INTENTS_API_URL:-https://1click.chaindefuser.com}
@@ -359,7 +359,6 @@ x-router-environment: &router-environment
   - CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS=0x81D40F21F12A8F0E3252Bccb954D722d4c464B64
   - CCTP_TRANSFER_MODE=${CCTP_TRANSFER_MODE:-standard}
   - CORS_DOMAIN
-  - VELORA_PARTNER
   - LOKI_URL
   - TEMPORAL_ADDRESS=http://temporal:7233
   - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}

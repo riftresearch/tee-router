@@ -1,7 +1,8 @@
 import {
   GatewayConfigurationError,
   UpstreamHttpError,
-  UpstreamInsufficientLiquidityError
+  UpstreamInsufficientLiquidityError,
+  UpstreamVenueUnavailableError
 } from '../errors'
 import { readLimitedResponseText } from './http-body'
 
@@ -198,6 +199,9 @@ export class RouterClient {
         if (upstreamErrorKind(responseBody) === 'insufficient_liquidity') {
           throw new UpstreamInsufficientLiquidityError()
         }
+        if (upstreamErrorKind(responseBody) === 'venue_unavailable') {
+          throw new UpstreamVenueUnavailableError()
+        }
         throw new UpstreamHttpError(
           response.status,
           upstreamErrorMessage(response.status, responseBody),
@@ -209,6 +213,7 @@ export class RouterClient {
     } catch (error) {
       if (error instanceof UpstreamHttpError) throw error
       if (error instanceof UpstreamInsufficientLiquidityError) throw error
+      if (error instanceof UpstreamVenueUnavailableError) throw error
       if (isAbortError(error)) {
         throw new UpstreamHttpError(
           504,

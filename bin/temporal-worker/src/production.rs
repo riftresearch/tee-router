@@ -15,7 +15,8 @@ use router_core::{
     services::{
         action_providers::{
             AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-            CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
+            CctpHttpProviderConfig, CctpTransferMode, KyberswapHttpProviderConfig,
+            VeloraHttpProviderConfig,
         },
         custody_action_executor::{
             evm_address_from_private_key, CustodyActionExecutor, HyperliquidCallNetwork,
@@ -200,6 +201,14 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "VELORA_PROXY_URL")]
     pub velora_proxy_url: Option<String>,
 
+    /// KyberSwap Aggregator API base URL
+    #[arg(long, env = "KYBERSWAP_API_URL")]
+    pub kyberswap_api_url: Option<String>,
+
+    /// Optional KyberSwap SOCKS5 proxy URL
+    #[arg(long, env = "KYBERSWAP_PROXY_URL")]
+    pub kyberswap_proxy_url: Option<String>,
+
     /// Partner string sent to Velora for route analytics
     #[arg(long, env = "VELORA_PARTNER")]
     pub velora_partner: Option<String>,
@@ -270,6 +279,7 @@ struct ResolvedUpstreamProxies {
     hyperunit: Option<ProxyUrl>,
     hyperliquid: Option<ProxyUrl>,
     velora: Option<ProxyUrl>,
+    kyberswap: Option<ProxyUrl>,
     coinbase: Option<ProxyUrl>,
     ethereum_rpc: Option<ProxyUrl>,
     base_rpc: Option<ProxyUrl>,
@@ -307,6 +317,12 @@ fn resolve_upstream_proxies(
         velora: effective_proxy(
             args.velora_proxy_url.as_deref(),
             "VELORA_PROXY_URL",
+            upstream,
+        )
+        .map_err(|source| config_error(source.to_string()))?,
+        kyberswap: effective_proxy(
+            args.kyberswap_proxy_url.as_deref(),
+            "KYBERSWAP_PROXY_URL",
             upstream,
         )
         .map_err(|source| config_error(source.to_string()))?,
@@ -417,6 +433,12 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
     );
     optional_http_url(
         &mut errors,
+        "KYBERSWAP_API_URL",
+        "KyberSwap API URL",
+        args.kyberswap_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
         "COINBASE_PRICE_API_BASE_URL",
         "Coinbase price API base URL",
         args.coinbase_price_api_base_url.as_deref(),
@@ -464,6 +486,12 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
             "VELORA_API_URL",
             "Velora API URL",
             args.velora_api_url.as_deref(),
+        );
+        require_http_url(
+            &mut errors,
+            "KYBERSWAP_API_URL",
+            "KyberSwap API URL",
+            args.kyberswap_api_url.as_deref(),
         );
         require_http_url(
             &mut errors,
@@ -533,6 +561,12 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
             "VELORA_API_URL",
             "VELORA_PROXY_URL",
             &proxies.velora,
+        );
+        require_proxy(
+            &mut errors,
+            "KYBERSWAP_API_URL",
+            "KYBERSWAP_PROXY_URL",
+            &proxies.kyberswap,
         );
         require_proxy(
             &mut errors,
@@ -731,6 +765,10 @@ fn initialize_action_providers(
                 .with_partner(normalize_optional_string(args.velora_partner.as_deref()))
                 .with_proxy_url(proxies.velora.clone())
         });
+    let kyberswap = normalize_optional_url(args.kyberswap_api_url.as_deref(), "KyberSwap API URL")?
+        .map(|base_url| {
+            KyberswapHttpProviderConfig::new(base_url).with_proxy_url(proxies.kyberswap.clone())
+        });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
     let cctp_transfer_mode = cctp_transfer_mode_for_config(args.cctp_transfer_mode.as_deref())?;
@@ -757,6 +795,7 @@ fn initialize_action_providers(
             "Hyperliquid API URL",
         )?,
         hyperliquid_proxy_url: proxies.hyperliquid.clone(),
+        kyberswap,
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -901,5 +940,26 @@ fn parse_hyperliquid_network(value: &str) -> Result<HyperliquidCallNetwork, Stri
 fn config_error(message: impl Into<String>) -> WorkerError {
     WorkerError::Configuration {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_args_include_kyberswap_url_and_proxy_but_no_client_id() {
+        let command =
+            <OrderWorkerRuntimeArgs as clap::Args>::augment_args(clap::Command::new("worker"));
+        let ids: Vec<String> = command
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str().to_string())
+            .collect();
+
+        assert!(ids.iter().any(|id| id == "kyberswap_api_url"));
+        assert!(ids.iter().any(|id| id == "kyberswap_proxy_url"));
+        assert!(!ids
+            .iter()
+            .any(|id| id.contains("kyberswap") && id.contains("client")));
     }
 }

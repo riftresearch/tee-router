@@ -3292,7 +3292,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_resolves_serialized_runtime_velora_transitions_and_final_recipient() {
+    fn planner_resolves_serialized_runtime_kyberswap_transitions_and_final_recipient() {
         let registry = Arc::new(AssetRegistry::default());
         let source_asset = asset(
             "evm:8453",
@@ -3311,7 +3311,7 @@ mod tests {
                         transition.kind == MarketOrderTransitionKind::UniversalRouterSwap
                     })
             })
-            .expect("runtime Velora path");
+            .expect("runtime universal-router path");
         let transition_ids = path
             .transitions
             .iter()
@@ -3412,7 +3412,7 @@ mod tests {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
             recipient_address: None,
-            provider_id: "path:runtime-velora".to_string(),
+            provider_id: "path:runtime-kyberswap".to_string(),
             amount_in: "1000000000000000000".to_string(),
             estimated_amount_out: "999000000000000000".to_string(),
             provider_quote: json!({
@@ -3433,7 +3433,7 @@ mod tests {
 
         let plan = MarketOrderRoutePlanner::new(registry)
             .plan(&order, &source_vault, &quote, now)
-            .expect("runtime Velora path should plan");
+            .expect("runtime universal-router path should plan");
 
         assert_steps_are_materialized(&plan.steps);
         assert_eq!(plan.steps.len(), 2);
@@ -3487,7 +3487,7 @@ mod tests {
                 path.transitions.len() == 1
                     && path.transitions[0].kind == MarketOrderTransitionKind::UniversalRouterSwap
             })
-            .expect("direct Velora runtime path");
+            .expect("direct KyberSwap runtime path");
         let transition = &path.transitions[0];
         let transition_ids = vec![transition.id.clone()];
         let now = Utc::now();
@@ -3536,7 +3536,7 @@ mod tests {
             "transition_parent_decl_id": transition.id,
             "transition_kind": transition.kind.as_str(),
             "execution_step_type": "universal_router_swap",
-            "provider": "velora",
+            "provider": "kyberswap",
             "input_asset": {
                 "chain_id": source_asset.chain.as_str(),
                 "asset": source_asset.asset.as_str(),
@@ -3578,7 +3578,7 @@ mod tests {
             source_asset: source_asset.clone(),
             destination_asset: destination_asset.clone(),
             recipient_address: None,
-            provider_id: "path:velora".to_string(),
+            provider_id: "path:kyberswap".to_string(),
             amount_in: "1000000000000000000".to_string(),
             estimated_amount_out: "950000000000000000".to_string(),
             provider_quote: json!({
@@ -3599,13 +3599,13 @@ mod tests {
 
         let plan = MarketOrderRoutePlanner::new(registry)
             .plan(&order, &source_vault, &quote, now)
-            .expect("Velora path should plan");
+            .expect("KyberSwap path should plan");
 
         assert_steps_are_materialized(&plan.steps);
         assert_eq!(plan.steps.len(), 1);
         let step = &plan.steps[0];
         assert_eq!(step.step_type, OrderExecutionStepType::UniversalRouterSwap);
-        assert_eq!(step.provider, "velora");
+        assert_eq!(step.provider, "kyberswap");
         assert_eq!(
             step.request["source_custody_vault_id"],
             json!(source_vault_id)

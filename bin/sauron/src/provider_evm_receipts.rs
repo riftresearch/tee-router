@@ -12,7 +12,7 @@ use router_core::{
     protocol::{AssetId, ChainId, DepositAsset},
 };
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
-use router_temporal::{CctpReceiveObservedEvidence, VeloraSwapSettledEvidence};
+use router_temporal::{CctpReceiveObservedEvidence, UniversalRouterSwapSettledEvidence};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -243,7 +243,7 @@ async fn evm_receipt_hint_request(
 ) -> Result<Option<ProviderOperationHintRequest>> {
     match operation.operation_type {
         ProviderOperationType::UniversalRouterSwap => {
-            velora_swap_settled_hint(clients, operation).await
+            universal_router_swap_settled_hint(clients, operation).await
         }
         ProviderOperationType::CctpReceive => cctp_receive_observed_hint(clients, operation).await,
         _ => Ok(None),
@@ -260,7 +260,7 @@ async fn lookup_receipt(
     }
 }
 
-async fn velora_swap_settled_hint(
+async fn universal_router_swap_settled_hint(
     clients: &EvmReceiptObserverClients,
     operation: &SharedProviderOperationWatchEntry,
 ) -> Result<Option<ProviderOperationHintRequest>> {
@@ -288,7 +288,7 @@ async fn velora_swap_settled_hint(
         debug!(
             operation_id = %operation.operation_id,
             chain_id,
-            "no receipt watcher client configured for Velora operation chain"
+            "no receipt watcher client configured for universal-router swap operation chain"
         );
         return Ok(None);
     };
@@ -299,15 +299,15 @@ async fn velora_swap_settled_hint(
         return Ok(None);
     }
     let Some(expected_executor) =
-        velora_swap_expected_executor(&operation.request, &operation.response)
+        universal_router_swap_expected_executor(&operation.request, &operation.response)
     else {
         return Ok(None);
     };
-    // Gate: a settled Velora swap is a tx directed at the executor returned by
-    // Velora for this operation. Any other Transfer in any other tx the
-    // recipient happens to be in would be a forgery vector if we matched on it.
-    // Production responses point at AugustusV6; devnet responses point at the
-    // deterministic mock Velora router.
+    // Gate: a settled universal-router swap is a tx directed at the executor
+    // returned by the provider for this operation. Any other Transfer in any
+    // other tx the recipient happens to be in would be a forgery vector if we
+    // matched on it. Velora responses point at AugustusV6; KyberSwap normalized
+    // responses carry the router at top-level `to`.
     if receipt.to != Some(expected_executor) {
         return Ok(None);
     }
@@ -322,7 +322,7 @@ async fn velora_swap_settled_hint(
         .pointer("/output_asset/asset")
         .and_then(Value::as_str)
         .and_then(|asset| normalized_reference_asset(chain_id, asset));
-    let expected_min = velora_swap_expected_min_amount(&operation.request);
+    let expected_min = universal_router_swap_expected_min_amount(&operation.request);
 
     // V6 emits no swap event of its own. Detect ERC-20 settlement via the
     // destination token's `Transfer(_, recipient, value >= min)` log inside an
@@ -354,8 +354,8 @@ async fn velora_swap_settled_hint(
         };
         return Ok(Some(hint_request(
             operation,
-            ProviderOperationHintKind::VeloraSwapSettled,
-            velora_swap_settled_evidence(
+            ProviderOperationHintKind::UniversalRouterSwapSettled,
+            universal_router_swap_settled_evidence(
                 format!("{tx_hash:?}"),
                 log_index,
                 decoded.inner.data.value.to_string(),
@@ -369,17 +369,17 @@ async fn velora_swap_settled_hint(
             log_index,
         )));
     }
-    if velora_swap_output_is_native(chain_id, &operation.request) {
+    if universal_router_swap_output_is_native(chain_id, &operation.request) {
         let Some(recipient) = recipient else {
             return Ok(None);
         };
-        let Some(amount_out) = velora_swap_native_amount_out(&operation.request) else {
+        let Some(amount_out) = universal_router_swap_native_amount_out(&operation.request) else {
             return Ok(None);
         };
         return Ok(Some(hint_request(
             operation,
-            ProviderOperationHintKind::VeloraSwapSettled,
-            velora_swap_settled_evidence(
+            ProviderOperationHintKind::UniversalRouterSwapSettled,
+            universal_router_swap_settled_evidence(
                 format!("{tx_hash:?}"),
                 0,
                 amount_out,
@@ -496,7 +496,7 @@ async fn cctp_receive_observed_hint(
     Ok(None)
 }
 
-fn velora_swap_settled_evidence(
+fn universal_router_swap_settled_evidence(
     tx_hash: String,
     log_index: u64,
     amount_out: String,
@@ -505,7 +505,7 @@ fn velora_swap_settled_evidence(
     token_address: Option<String>,
     block_number: Option<u64>,
 ) -> Value {
-    typed_evidence(VeloraSwapSettledEvidence {
+    typed_evidence(UniversalRouterSwapSettledEvidence {
         tx_hash,
         log_index,
         amount_out,
@@ -516,7 +516,7 @@ fn velora_swap_settled_evidence(
     })
 }
 
-fn velora_swap_expected_min_amount(request: &Value) -> Option<U256> {
+fn universal_router_swap_expected_min_amount(request: &Value) -> Option<U256> {
     request
         .get("min_amount_out")
         .and_then(Value::as_str)
@@ -524,7 +524,7 @@ fn velora_swap_expected_min_amount(request: &Value) -> Option<U256> {
         .and_then(|amount| U256::from_str_radix(amount, 10).ok())
 }
 
-fn velora_swap_output_is_native(chain_id: &str, request: &Value) -> bool {
+fn universal_router_swap_output_is_native(chain_id: &str, request: &Value) -> bool {
     let Some(asset) = request
         .pointer("/output_asset/asset")
         .and_then(Value::as_str)
@@ -543,7 +543,7 @@ fn velora_swap_output_is_native(chain_id: &str, request: &Value) -> bool {
     matches!(deposit_asset.asset, AssetId::Native)
 }
 
-fn velora_swap_native_amount_out(request: &Value) -> Option<String> {
+fn universal_router_swap_native_amount_out(request: &Value) -> Option<String> {
     request
         .get("min_amount_out")
         .and_then(Value::as_str)
@@ -556,7 +556,7 @@ fn velora_swap_native_amount_out(request: &Value) -> Option<String> {
         })
         .map(ToOwned::to_owned)
 }
-fn velora_swap_expected_executor(request: &Value, response: &Value) -> Option<Address> {
+fn universal_router_swap_expected_executor(request: &Value, response: &Value) -> Option<Address> {
     let response_to = json_address(response.get("to"));
     let request_contract = json_address(request.pointer("/price_route/contractAddress"));
     let response_contract = json_address(response.pointer("/request/priceRoute/contractAddress"));
@@ -684,8 +684,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn velora_swap_settled_evidence_matches_router_typed_shape() {
-        let evidence = velora_swap_settled_evidence(
+    fn universal_router_swap_settled_evidence_matches_router_typed_shape() {
+        let evidence = universal_router_swap_settled_evidence(
             "0xswap".to_string(),
             7,
             "1000000".to_string(),
@@ -695,7 +695,7 @@ mod tests {
             Some(123),
         );
 
-        assert_typed_evidence::<VeloraSwapSettledEvidence>(
+        assert_typed_evidence::<UniversalRouterSwapSettledEvidence>(
             &evidence,
             &[
                 "tx_hash",
@@ -718,13 +718,13 @@ mod tests {
     }
 
     #[test]
-    fn velora_swap_expected_min_amount_ignores_quote_estimate() {
+    fn universal_router_swap_expected_min_amount_ignores_quote_estimate() {
         let request = serde_json::json!({
             "amount_out": "37025460",
             "min_amount_out": null,
         });
 
-        assert_eq!(velora_swap_expected_min_amount(&request), None);
+        assert_eq!(universal_router_swap_expected_min_amount(&request), None);
 
         let request = serde_json::json!({
             "amount_out": "37025460",
@@ -732,26 +732,26 @@ mod tests {
         });
 
         assert_eq!(
-            velora_swap_expected_min_amount(&request),
+            universal_router_swap_expected_min_amount(&request),
             Some(U256::from(36_000_000_u64))
         );
     }
 
     #[test]
-    fn velora_swap_native_amount_prefers_enforced_minimum() {
+    fn universal_router_swap_native_amount_prefers_enforced_minimum() {
         let request = serde_json::json!({
             "amount_out": "37025460",
             "min_amount_out": "36000000",
         });
 
         assert_eq!(
-            velora_swap_native_amount_out(&request),
+            universal_router_swap_native_amount_out(&request),
             Some("36000000".to_string())
         );
     }
 
     #[test]
-    fn velora_swap_output_is_native_after_normalization() {
+    fn universal_router_swap_output_is_native_after_normalization() {
         let request = serde_json::json!({
             "output_asset": {
                 "chain_id": "evm:8453",
@@ -759,10 +759,10 @@ mod tests {
             }
         });
 
-        assert!(velora_swap_output_is_native("evm:8453", &request));
+        assert!(universal_router_swap_output_is_native("evm:8453", &request));
     }
     #[test]
-    fn velora_swap_expected_executor_uses_operation_transaction_target() {
+    fn universal_router_swap_expected_executor_uses_operation_transaction_target() {
         let request = serde_json::json!({
             "price_route": {
                 "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
@@ -778,13 +778,32 @@ mod tests {
         });
 
         assert_eq!(
-            velora_swap_expected_executor(&request, &response),
+            universal_router_swap_expected_executor(&request, &response),
             Some(Address::from_str("0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9").unwrap())
         );
     }
 
     #[test]
-    fn velora_swap_expected_executor_rejects_conflicting_contracts() {
+    fn universal_router_swap_expected_executor_accepts_kyberswap_normalized_response_to() {
+        let request = serde_json::json!({
+            "price_route": {
+                "routeID": "mock-route"
+            }
+        });
+        let response = serde_json::json!({
+            "to": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9",
+            "data": "0x1234",
+            "value": "0"
+        });
+
+        assert_eq!(
+            universal_router_swap_expected_executor(&request, &response),
+            Some(Address::from_str("0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9").unwrap())
+        );
+    }
+
+    #[test]
+    fn universal_router_swap_expected_executor_rejects_conflicting_contracts() {
         let request = serde_json::json!({
             "price_route": {
                 "contractAddress": "0xcf7ed3acca5a467e9e704c703e8d87f634fb0fc9"
@@ -799,7 +818,10 @@ mod tests {
             }
         });
 
-        assert_eq!(velora_swap_expected_executor(&request, &response), None);
+        assert_eq!(
+            universal_router_swap_expected_executor(&request, &response),
+            None
+        );
     }
 
     #[test]

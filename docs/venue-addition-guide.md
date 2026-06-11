@@ -85,9 +85,9 @@ Required work:
    a new external asset representation routable.
 
 5. If the venue should use dynamic same-chain route discovery, add runtime
-   transition generation similar to Velora's runtime transition declarations.
-   Do not add arbitrary dynamic routes for venues that cannot quote arbitrary
-   addresses safely.
+   transition generation similar to universal-router providers such as Velora
+   and KyberSwap. Do not add arbitrary dynamic routes for venues that cannot
+   quote arbitrary addresses safely.
 
 6. If the venue introduces a new transition kind, update:
    - `MarketOrderTransitionKind`
@@ -226,7 +226,9 @@ Required work:
    - CLI/env fields in `RouterServerArgs`
    - validation in `initialize_action_providers`
    - default behavior when the provider is not configured
-   - API key/auth/partner/integrator fields
+   - API key/auth/partner/integrator fields only when the upstream actually
+     requires them; KyberSwap, for example, has no API key and generates
+     `x-client-id` per request rather than reading a configured client id
    - network selector if mainnet/testnet signatures differ
 
 6. Wire the provider into `ActionProviderRegistry`.
@@ -506,10 +508,14 @@ Touchpoints:
 Required work:
 
 1. Create a local mock service or devnet module for the exact external API
-   surface consumed by the provider adapter.
+   surface consumed by the provider adapter. For aggregator APIs, keep envelope
+   shapes, required fields, unsupported-network errors, and no-route errors
+   provider-shaped instead of returning router-only shortcuts.
 
 2. If the provider returns transaction calldata, the mock must return calldata
-   that can execute against local devnet contracts.
+   that can execute against local devnet contracts. Universal-router mocks can
+   reuse existing executable swap contracts when the returned calldata matches
+   the adapter's execution expectations.
 
 3. If worker progression depends on settlement, the mock must materialize local
    settlement state.

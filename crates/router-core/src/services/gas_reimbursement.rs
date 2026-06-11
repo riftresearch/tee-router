@@ -560,11 +560,19 @@ mod tests {
         let registry = AssetRegistry::default();
         let base_eth = asset("evm:8453", AssetId::Native);
         let btc = asset("bitcoin", AssetId::Native);
+        // The native-ETH route keeps the source as native ETH (it never swaps it
+        // into an ERC20), so it needs no paymaster sponsorship. Select that route
+        // explicitly rather than relying on path-enumeration order, which now also
+        // surfaces swap-first universal-router alternatives that do incur debt.
         let path = registry
             .select_transition_paths(&base_eth, &btc, 5)
             .into_iter()
-            .next()
-            .expect("base eth to btc path");
+            .find(|path| {
+                path.transitions
+                    .iter()
+                    .all(|t| t.kind != MarketOrderTransitionKind::UniversalRouterSwap)
+            })
+            .expect("native base eth to btc route without an erc20 swap leg");
 
         let plan = optimized_paymaster_reimbursement_plan(&registry, &path).unwrap();
 

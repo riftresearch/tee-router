@@ -701,7 +701,7 @@ mod tests {
             transition_decl_id: None,
             step_index: 0,
             step_type: OrderExecutionStepType::UniversalRouterSwap,
-            provider: "velora".to_string(),
+            provider: "kyberswap".to_string(),
             status: OrderExecutionStepStatus::Completed,
             input_asset: None,
             output_asset: None,

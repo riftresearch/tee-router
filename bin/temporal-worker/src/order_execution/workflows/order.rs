@@ -879,9 +879,9 @@ macro_rules! verify_hint_activity {
                     $options,
                 )
                 .boxed_local(),
-            ProviderHintKind::VeloraSwapSettled => $ctx
+            ProviderHintKind::UniversalRouterSwapSettled => $ctx
                 .start_activity(
-                    ProviderObservationActivities::verify_velora_swap_settled_hint,
+                    ProviderObservationActivities::verify_universal_router_swap_settled_hint,
                     $input,
                     $options,
                 )

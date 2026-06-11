@@ -13,3 +13,6 @@ temporalio-common = { workspace = true }
 tonic = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

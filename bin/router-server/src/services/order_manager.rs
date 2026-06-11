@@ -119,6 +119,14 @@ pub enum MarketOrderError {
     #[snafu(display("insufficient liquidity for the requested size"))]
     InsufficientLiquidity,
 
+    /// Venue-agnostic classification of a no-route outcome whose representative
+    /// path failure was a transient upstream error (rate limit / timeout /
+    /// 5xx / connection). Like [`Self::InsufficientLiquidity`] it deliberately
+    /// carries no provider detail — the raw upstream text stays in the WARN
+    /// logs; the caller learns the one thing that changes their behavior: retry.
+    #[snafu(display("a venue is temporarily unavailable; please retry shortly"))]
+    VenueTemporarilyUnavailable,
+
     #[snafu(display(
         "Estimated output {} is below the viable floor {} for {} {} (the order is too small to clear route fees)",
         estimated_amount_out,
@@ -169,6 +177,34 @@ fn is_insufficient_liquidity_failure(error: &MarketOrderError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Conservative substring classifier for transient upstream venue failures
+/// (rate limit / timeout / 5xx / dropped connection). Same pragmatic
+/// string-matching bridge as [`is_insufficient_liquidity_failure`]: a missed
+/// pattern degrades to the generic no-route response, never misclassifies a
+/// genuine no-route as transient. Matches specific phrases (not bare status
+/// numbers) so it can't false-positive on amounts in the error text.
+fn is_transient_venue_failure(error: &MarketOrderError) -> bool {
+    let MarketOrderError::NoRoute { reason } = error else {
+        return false;
+    };
+    let reason = reason.to_ascii_lowercase();
+    [
+        "too many requests", // 429
+        "timed out",
+        "timeout",
+        "service unavailable", // 503
+        "bad gateway",         // 502
+        "gateway timeout",     // 504
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "connection error",
+    ]
+    .iter()
+    .any(|needle| reason.contains(needle))
 }
 
 /// Keep the most representative no-route failure across candidate paths:
@@ -307,10 +343,10 @@ struct MarketQuotePipelineOutcome {
     /// specific `NoRoute` when nothing survived.
     representative_error: Option<MarketOrderError>,
     request_usd_micros: u64,
-    /// Full ranked candidate set (cached hops + live Velora), post strict-drop.
+    /// Full ranked candidate set (cached hops + live universal-router), post strict-drop.
     ranked: Vec<RankedTransitionPath>,
-    /// Live-sampled Velora wrap-leg snapshots folded into the ranking.
-    velora_overrides: std::collections::HashMap<String, RouteCostSnapshot>,
+    /// Live-sampled universal-router wrap-leg snapshots folded into the ranking.
+    universal_router_overrides: std::collections::HashMap<String, RouteCostSnapshot>,
     /// Path ids that were live-quoted end-to-end (the top-N of `ranked`).
     live_quoted_path_ids: Vec<String>,
     /// Real `estimated_amount_out` per live-quoted survivor, keyed by path id.
@@ -1100,6 +1136,9 @@ impl OrderManager {
                 Some(err) if is_insufficient_liquidity_failure(&err) => {
                     Err(MarketOrderError::InsufficientLiquidity)
                 }
+                Some(err) if is_transient_venue_failure(&err) => {
+                    Err(MarketOrderError::VenueTemporarilyUnavailable)
+                }
                 Some(err) => Err(err),
                 None => Err(MarketOrderError::NoRoute {
                     reason: "no quote venue matched the requested constraints".to_string(),
@@ -1109,7 +1148,7 @@ impl OrderManager {
     }
 
     /// Multi-hop branch of [`Self::best_provider_quote`]. Thin wrapper over the
-    /// shared [`Self::run_market_quote_pipeline`] (BFS -> filters -> Velora-aware
+    /// shared [`Self::run_market_quote_pipeline`] (BFS -> filters -> universal-router-aware
     /// ranking -> top-N end-to-end live quote) that maps the pipeline trace into
     /// a [`MarketOrderQuoteSelection`]. The cross-family selector compares this
     /// against the single-hop branch.
@@ -1168,7 +1207,7 @@ impl OrderManager {
     /// 1. enumerate candidate paths (BFS, depth 5);
     /// 2. filter: executable -> configured providers -> unpriceable HyperEVM ->
     ///    provider sequence;
-    /// 3. live-quote the Velora wrap legs, fold them into the cached hop costs,
+    /// 3. live-quote the universal-router wrap legs, fold them into the cached hop costs,
     ///    rank by lowest combined bps, strict-drop routes with an unpriced leg;
     /// 4. live-quote the top-N ranked routes end-to-end (the real broken-leg
     ///    filter) and pick the best real output via [`select_best_quote`].
@@ -1234,7 +1273,7 @@ impl OrderManager {
                 representative_error: Some(MarketOrderError::NoRoute { reason }),
                 request_usd_micros,
                 ranked: Vec::new(),
-                velora_overrides: std::collections::HashMap::new(),
+                universal_router_overrides: std::collections::HashMap::new(),
                 live_quoted_path_ids: Vec::new(),
                 outputs_by_path: std::collections::HashMap::new(),
                 winner_path_id: None,
@@ -1243,11 +1282,11 @@ impl OrderManager {
             });
         }
 
-        // Live-quote the Velora wrap legs, fold them into the cached
+        // Live-quote the universal-router wrap legs, fold them into the cached
         // primary-asset hop costs, rank by lowest combined bps, and strict-drop
         // routes with an unpriced leg.
         let rank_started = Instant::now();
-        let (ranked, velora_overrides) = self
+        let (ranked, universal_router_overrides) = self
             .select_ranked_candidates(request, &mut paths, request_usd_micros)
             .await;
         timings.rank_ms = rank_started.elapsed().as_millis() as u64;
@@ -1276,10 +1315,10 @@ impl OrderManager {
         };
 
         // Live-quote the top-N ranked candidates end-to-end in parallel and pick
-        // the highest `estimated_amount_out`. The Velora legs were already
-        // priced into the ranking; this stage prices each whole route (incl. the
-        // same Velora leg) for execution and is the real broken-leg filter (a
-        // path whose end-to-end quote fails is simply dropped).
+        // the highest `estimated_amount_out`. The universal-router legs were
+        // already priced into the ranking; this stage prices each whole route
+        // for execution and is the real broken-leg filter (a path whose
+        // end-to-end quote fails is simply dropped).
         let live_started = Instant::now();
         let top_paths: Vec<&TransitionPath> = ranked
             .iter()
@@ -1367,7 +1406,7 @@ impl OrderManager {
             representative_error,
             request_usd_micros,
             ranked,
-            velora_overrides,
+            universal_router_overrides,
             live_quoted_path_ids,
             outputs_by_path,
             winner_path_id,
@@ -1458,16 +1497,17 @@ impl OrderManager {
         let estimated_out_by_path = &outcome.outputs_by_path;
 
         // Source->destination corridor for the visualizer: the full declared
-        // topology (incl. curated same-chain Velora swaps) restricted to the
+        // topology (incl. curated same-chain universal-router swaps) restricted to the
         // nodes between source and destination. The ranked routes are overlaid
         // as highlights by the dashboard; this is purely what we draw.
         let graph = self.build_explain_corridor(&source_asset, &destination_asset);
 
         // Authoritative per-leg cost source for display: the same active cached
-        // snapshots the ranker read at this tier, with the live Velora overrides
-        // folded on top. Rendering per-leg/total bps from this exact map (the
-        // same data the pipeline ranked on) guarantees the dashboard's per-step
-        // bps, the card total, and the chosen winner are all the same numbers.
+        // snapshots the ranker read at this tier, with the live universal-router
+        // overrides folded on top. Rendering per-leg/total bps from this exact
+        // map (the same data the pipeline ranked on) guarantees the dashboard's
+        // per-step bps, the card total, and the chosen winner are all the same
+        // numbers.
         let mut cost_snapshots: std::collections::HashMap<String, RouteCostSnapshot> =
             std::collections::HashMap::new();
         if let Some(route_costs) = self.route_costs.as_ref() {
@@ -1476,7 +1516,7 @@ impl OrderManager {
                 .await
                 .unwrap_or_default();
         }
-        for (transition_id, snapshot) in &outcome.velora_overrides {
+        for (transition_id, snapshot) in &outcome.universal_router_overrides {
             cost_snapshots.insert(transition_id.clone(), snapshot.clone());
         }
         let cost_bps_of = |usd_micros: u64| -> f64 {
@@ -1868,21 +1908,21 @@ impl OrderManager {
         (views, warnings)
     }
 
-    /// Live-sample the value-loss bps of every Velora (`UniversalRouterSwap`)
-    /// leg that appears across `paths`, deduplicated by transition id. These are
-    /// the runtime wrap legs that swap an arbitrary ERC20 (e.g. PEPE) into/out
-    /// of a primary anchor (USDC/USDT/ETH); they are never in the curated cache,
-    /// so they must be priced live whenever a niche ERC20 is involved.
+    /// Live-sample the value-loss bps of every universal-router leg that appears
+    /// across `paths`, deduplicated by transition id. These are the runtime wrap
+    /// legs that swap an arbitrary ERC20 (e.g. PEPE) into/out of a primary
+    /// anchor (USDC/USDT/ETH); they are never in the curated cache, so they must
+    /// be priced live whenever a niche ERC20 is involved.
     ///
-    /// The internal pricing oracle has no price for such a token, so we read
-    /// Velora's own `srcUSD`/`destUSD`/`gasCostUSD` from the quote's
-    /// `price_route` and derive `(srcUSD - destUSD) / srcUSD * 10_000` bps. This
-    /// is what lets us compare "PEPE -> ETH" against "PEPE -> USDC" and fold the
-    /// real cost into the ranking alongside the cached primary-asset hops.
+    /// The internal pricing oracle has no price for such a token, so we read the
+    /// provider's own USD fields from the quote's `price_route` and derive
+    /// `(srcUSD - destUSD) / srcUSD * 10_000` bps. This is what lets us compare
+    /// "PEPE -> ETH" against "PEPE -> USDC" and fold the real cost into the
+    /// ranking alongside the cached primary-asset hops.
     ///
     /// Legs that fail or are unpriceable are simply absent from the returned map
     /// (left as `missing_edges`).
-    async fn sample_live_velora_overrides(
+    async fn sample_live_universal_router_overrides(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
         paths: &[TransitionPath],
@@ -1911,9 +1951,15 @@ impl OrderManager {
         let sample_futures = unique.into_values().map(|decl| {
             let tier_label = tier_label.clone();
             async move {
-                self.sample_one_velora_leg(request, &decl, request_usd_micros, pricing, &tier_label)
-                    .await
-                    .map(|snapshot| (decl.id.clone(), snapshot))
+                self.sample_one_universal_router_leg(
+                    request,
+                    &decl,
+                    request_usd_micros,
+                    pricing,
+                    &tier_label,
+                )
+                .await
+                .map(|snapshot| (decl.id.clone(), snapshot))
             }
         });
         join_all(sample_futures)
@@ -1927,18 +1973,18 @@ impl OrderManager {
     /// and the dashboard explainer so they always agree. Given the filtered
     /// candidate `paths`:
     ///
-    /// 1. live-quote the Velora wrap legs (niche ERC20 -> primary asset) and
-    ///    fold them in as ranking overrides;
+    /// 1. live-quote the universal-router wrap legs (niche ERC20 -> primary
+    ///    asset) and fold them in as ranking overrides;
     /// 2. rank by lowest combined cost (cached primary-asset hops + the live
-    ///    Velora legs), monotonic with total bps;
+    ///    universal-router legs), monotonic with total bps;
     /// 3. drop any route that still has an unpriced leg (a broken/unavailable
     ///    provider) so an unknown leg is never counted as free.
     ///
     /// If the exclusion empties the set even though candidates existed (e.g. a
     /// momentarily cold cache), it falls back to the penalty-ranked set so a
     /// genuinely quotable route still reaches the live-quote stage rather than
-    /// failing outright. Returns the ranked candidates plus the Velora overrides
-    /// (so callers can surface the live per-leg bps).
+    /// failing outright. Returns the ranked candidates plus the universal-router
+    /// overrides (so callers can surface the live per-leg bps).
     async fn select_ranked_candidates(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
@@ -1948,19 +1994,24 @@ impl OrderManager {
         Vec<RankedTransitionPath>,
         std::collections::HashMap<String, RouteCostSnapshot>,
     ) {
-        let mut velora_overrides: std::collections::HashMap<String, RouteCostSnapshot> =
+        let mut universal_router_overrides: std::collections::HashMap<String, RouteCostSnapshot> =
             std::collections::HashMap::new();
 
         let ranked = if let Some(route_costs) = self.route_costs.as_ref() {
             let pricing = route_costs.current_or_refresh_pricing_snapshot().await;
-            velora_overrides = self
-                .sample_live_velora_overrides(request, paths, request_usd_micros, &pricing)
+            universal_router_overrides = self
+                .sample_live_universal_router_overrides(
+                    request,
+                    paths,
+                    request_usd_micros,
+                    &pricing,
+                )
                 .await;
             match route_costs
                 .rank_transition_paths_for_request_with_overrides(
                     paths,
                     request_usd_micros,
-                    &velora_overrides,
+                    &universal_router_overrides,
                 )
                 .await
             {
@@ -1977,22 +2028,23 @@ impl OrderManager {
             self.rank_market_paths(paths, request_usd_micros).await
         };
 
-        // Drop routes that still have an unpriced leg: with Velora priced above
-        // and the curated hops kept fresh in cache, a remaining missing edge
-        // means that leg is genuinely unavailable right now, so the route is not
-        // viable and must not be ranked or counted as free. Cold-cache safety
-        // (keep the set when the drop empties it) lives in the shared helper.
+        // Drop routes that still have an unpriced leg: with universal-router
+        // legs priced above and the curated hops kept fresh in cache, a
+        // remaining missing edge means that leg is genuinely unavailable right
+        // now, so the route is not viable and must not be ranked or counted as
+        // free. Cold-cache safety (keep the set when the drop empties it) lives
+        // in the shared helper.
         let selected = router_core::services::route_costs::retain_viable_ranked(ranked);
-        (selected, velora_overrides)
+        (selected, universal_router_overrides)
     }
 
-    /// Live-quote a single Velora leg and turn Velora's `srcUSD`/`destUSD` into
-    /// a `RouteCostSnapshot`. The leg's input amount is the real order amount
-    /// when the leg starts from the request's source asset (the common
-    /// source-side ERC20 wrap), otherwise a tier-notional amount derived from
-    /// the (priced) anchor input. Returns `None` if the provider is missing,
-    /// the quote fails/has no route, or Velora reports no usable USD valuation.
-    async fn sample_one_velora_leg(
+    /// Live-quote a single universal-router leg and turn the provider's USD
+    /// fields into a `RouteCostSnapshot`. The leg's input amount is the real
+    /// order amount when the leg starts from the request's source asset (the
+    /// common source-side ERC20 wrap), otherwise a tier-notional amount derived
+    /// from the (priced) anchor input. Returns `None` if the provider is missing,
+    /// the quote fails/has no route, or the provider reports no usable USD valuation.
+    async fn sample_one_universal_router_leg(
         &self,
         request: &NormalizedMarketOrderQuoteRequest,
         transition: &TransitionDecl,
@@ -2000,7 +2052,7 @@ impl OrderManager {
         pricing: &router_core::services::pricing::PricingSnapshot,
         tier_label: &str,
     ) -> Option<RouteCostSnapshot> {
-        const VELORA_PROBE_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
+        const UNIVERSAL_ROUTER_PROBE_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
 
         let exchange = self
             .action_providers
@@ -2046,20 +2098,20 @@ impl OrderManager {
                     amount_in: amount_in.to_string(),
                     min_amount_out: Some("1".to_string()),
                 },
-                sender_address: Some(VELORA_PROBE_ADDRESS.to_string()),
-                recipient_address: VELORA_PROBE_ADDRESS.to_string(),
+                sender_address: Some(UNIVERSAL_ROUTER_PROBE_ADDRESS.to_string()),
+                recipient_address: UNIVERSAL_ROUTER_PROBE_ADDRESS.to_string(),
             },
         )
         .await
         .ok()
         .flatten()?;
 
-        // Velora's quote carries its own USD valuation of both sides under
-        // `price_route`, which works even for tokens our oracle cannot price.
+        // Universal-router quotes carry their own USD valuation of both sides
+        // under `price_route`, which works even for tokens our oracle cannot
+        // price.
         let price_route = quote.provider_quote.get("price_route")?;
-        let src_usd = parse_velora_usd_field(price_route.get("srcUSD"))?;
-        let dest_usd = parse_velora_usd_field(price_route.get("destUSD"))?;
-        let gas_usd = parse_velora_usd_field(price_route.get("gasCostUSD")).unwrap_or(0.0);
+        let (src_usd, dest_usd, gas_usd) =
+            universal_router_usd_fields(transition.provider, price_route)?;
         if src_usd <= 0.0 {
             return None;
         }
@@ -2078,7 +2130,7 @@ impl OrderManager {
             estimated_gas_usd_micros: (gas_usd.max(0.0) * 1_000_000.0).round() as u64,
             estimated_latency_ms: 0,
             sample_amount_usd_micros: (src_usd * 1_000_000.0).round() as u64,
-            quote_source: format!("velora_live_explain:{}", quote.provider_id),
+            quote_source: format!("universal_router_live_explain:{}", quote.provider_id),
             refreshed_at: now,
             expires_at: now + chrono::Duration::minutes(5),
         })
@@ -2086,7 +2138,7 @@ impl OrderManager {
 
     /// Build the source->destination *corridor*: the full declared display
     /// topology (every bridge/Unit/HyperCore edge plus the curated same-chain
-    /// Velora swaps) restricted to nodes that are both forward-reachable from
+    /// universal-router swaps) restricted to nodes that are both forward-reachable from
     /// the source and backward-reachable to the destination. Nodes are laid out
     /// by hop depth from the source (destination pinned to `max_depth`). This is
     /// purely the visual topology - the engine's actual ranked routes are
@@ -2114,8 +2166,8 @@ impl OrderManager {
 
         // Full display edge universe keyed by node, in both directions. Uses
         // the endpoint-aware variant so arbitrary ERC20 source/destination
-        // assets contribute their runtime Velora wrap edges (ERC20 <-> anchor),
-        // letting the corridor draw the Velora in/out legs the engine would use.
+        // assets contribute their runtime universal-router wrap edges
+        // (ERC20 <-> anchor), letting the corridor draw the in/out legs the engine would use.
         let declarations = self
             .asset_registry
             .display_transition_declarations_for(source, destination);
@@ -4007,7 +4059,7 @@ fn is_executable_transition_path(path: &TransitionPath) -> bool {
     // `select_transition_paths` only returns paths that already reach the
     // requested destination node. The terminal provider does not need a second
     // allow-list here: a bridge exit to a registered destination asset is just
-    // as executable as a Velora or Unit exit. Provider availability and per-leg
+    // as executable as a universal-router or Unit exit. Provider availability and per-leg
     // quote support are checked in the following filters/quote pass.
     !path.transitions.is_empty()
 }
@@ -4937,16 +4989,38 @@ async fn quote_exchange(
         })
 }
 
-/// Parse a Velora `price_route` USD field (`srcUSD`/`destUSD`/`gasCostUSD`),
-/// which the upstream API returns as a decimal string (e.g. `"2.81"`) but may
-/// occasionally surface as a JSON number. Returns `None` when absent or
-/// unparseable.
-fn parse_velora_usd_field(value: Option<&serde_json::Value>) -> Option<f64> {
+/// Parse a provider `price_route` USD field, which upstream APIs return as a
+/// decimal string (e.g. `"2.81"`) but may occasionally surface as a JSON number.
+/// Returns `None` when absent or unparseable.
+fn parse_provider_usd_field(value: Option<&serde_json::Value>) -> Option<f64> {
     let value = value?;
     if let Some(number) = value.as_f64() {
         return Some(number);
     }
     value.as_str().and_then(|text| text.parse::<f64>().ok())
+}
+
+fn universal_router_usd_fields(
+    provider: ProviderId,
+    price_route: &serde_json::Value,
+) -> Option<(f64, f64, f64)> {
+    match provider {
+        ProviderId::Velora => Some((
+            parse_provider_usd_field(price_route.get("srcUSD"))?,
+            parse_provider_usd_field(price_route.get("destUSD"))?,
+            parse_provider_usd_field(price_route.get("gasCostUSD")).unwrap_or(0.0),
+        )),
+        ProviderId::Kyberswap => {
+            let gas_usd = parse_provider_usd_field(price_route.get("gasUsd")).unwrap_or(0.0)
+                + parse_provider_usd_field(price_route.get("l1FeeUsd")).unwrap_or(0.0);
+            Some((
+                parse_provider_usd_field(price_route.get("amountInUsd"))?,
+                parse_provider_usd_field(price_route.get("amountOutUsd"))?,
+                gas_usd,
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn reserve_hyperliquid_spot_send_quote_gas(
@@ -5089,25 +5163,25 @@ fn validate_and_normalize_quote_routing(
             ),
         });
     }
-    let has_single_hop = provider_sequence
-        .iter()
-        .any(|provider| provider.is_single_hop_quote_provider());
     let has_transition = provider_sequence
         .iter()
         .any(|provider| provider.is_transition_provider());
-    if has_single_hop && has_transition {
+    let has_single_hop_only = provider_sequence.iter().any(|provider| {
+        provider.is_single_hop_quote_provider() && !provider.is_transition_provider()
+    });
+    if has_transition && has_single_hop_only {
         return Err(MarketOrderError::InvalidRouting {
             reason:
-                "providerSequence cannot mix transition providers with single-hop quote providers"
+                "providerSequence cannot mix transition providers with single-hop-only quote providers"
                     .to_string(),
         });
     }
-    if has_single_hop {
-        Ok(NormalizedMarketOrderRouting::SingleHopQuoteProviderAllowlist(provider_sequence))
-    } else {
+    if has_transition {
         Ok(NormalizedMarketOrderRouting::TransitionProviderSequence(
             provider_sequence,
         ))
+    } else {
+        Ok(NormalizedMarketOrderRouting::SingleHopQuoteProviderAllowlist(provider_sequence))
     }
 }
 fn validate_positive_amount(field: &'static str, value: &str) -> MarketOrderResult<()> {
@@ -5305,6 +5379,35 @@ mod tests {
     }
 
     #[test]
+    fn transient_venue_classifier_matches_upstream_weather_not_genuine_no_route() {
+        // Real-shaped transient upstream failures (rate limit / timeout / 5xx).
+        for reason in [
+            "exchange provider kyberswap failed: kyberswap route request failed with 429 Too Many Requests: {\"message\":\"Forbidden\"}",
+            "exchange provider kyberswap timed out",
+            "bridge provider cctp failed: HTTP 503 Service Unavailable",
+            "single-hop quote provider mayan failed: 502 Bad Gateway",
+            "velora price request failed: connection reset by peer",
+        ] {
+            assert!(is_transient_venue_failure(&no_route(reason)), "{reason}");
+        }
+        // Liquidity exhaustion is NOT transient (it's size-actionable, classified
+        // separately) and a genuine no-route is not transient either.
+        assert!(!is_transient_venue_failure(&no_route(
+            "hyperliquid quote: book side could not absorb remaining input 37193000"
+        )));
+        assert!(!is_transient_venue_failure(&no_route(
+            "no quote venue matched the requested constraints"
+        )));
+        // Bare status-like digits in an amount must not false-positive.
+        assert!(!is_transient_venue_failure(&no_route(
+            "requested amount 504000000 exceeds configured maximum"
+        )));
+        assert!(!is_transient_venue_failure(
+            &MarketOrderError::InsufficientLiquidity
+        ));
+    }
+
+    #[test]
     fn representative_error_prefers_liquidity_class_then_arrival_order() {
         // Liquidity-class arrives after venue weather: it upgrades.
         let mut kept = None;
@@ -5488,25 +5591,25 @@ mod tests {
 
         assert!(filter_provider_sequence_paths(
             &mut paths,
-            Some(&[ProviderId::Velora, ProviderId::Cctp])
+            Some(&[ProviderId::Kyberswap, ProviderId::Cctp])
         ));
         assert!(
             paths
                 .iter()
                 .all(|path| transition_path_matches_provider_sequence(
                     path,
-                    &[ProviderId::Velora, ProviderId::Cctp]
+                    &[ProviderId::Kyberswap, ProviderId::Cctp]
                 )),
             "every surviving path must match the requested provider sequence"
         );
         assert!(
             !paths.is_empty(),
-            "Arbitrum USDT -> Base USDC should support Velora then CCTP"
+            "Arbitrum USDT -> Base USDC should support KyberSwap then CCTP"
         );
 
         assert!(filter_provider_sequence_paths(
             &mut paths,
-            Some(&[ProviderId::Across, ProviderId::Velora])
+            Some(&[ProviderId::Across, ProviderId::Kyberswap])
         ));
         assert!(paths.is_empty());
     }
@@ -5537,6 +5640,37 @@ mod tests {
     }
 
     #[test]
+    fn provider_sequence_routing_treats_kyberswap_as_transition_provider() {
+        let routing = validate_and_normalize_quote_routing(QuoteRoutingRequest {
+            provider_sequence: Some(vec![ProviderId::Kyberswap]),
+        })
+        .expect("kyberswap provider sequence");
+
+        assert!(routing.allows_transition_providers());
+        assert!(!routing.allows_single_hop_quote_providers());
+        assert_eq!(
+            routing.transition_provider_sequence(),
+            Some([ProviderId::Kyberswap].as_slice())
+        );
+    }
+
+    #[test]
+    fn provider_sequence_routing_rejects_kyberswap_with_single_hop_only_provider() {
+        let error = validate_and_normalize_quote_routing(QuoteRoutingRequest {
+            provider_sequence: Some(vec![ProviderId::Kyberswap, ProviderId::Relay]),
+        })
+        .expect_err("kyberswap plus relay must be rejected");
+
+        let MarketOrderError::InvalidRouting { reason } = error else {
+            panic!("expected invalid routing");
+        };
+        assert_eq!(
+            reason,
+            "providerSequence cannot mix transition providers with single-hop-only quote providers"
+        );
+    }
+
+    #[test]
     fn provider_sequence_routing_rejects_mixed_families() {
         let error = validate_and_normalize_quote_routing(QuoteRoutingRequest {
             provider_sequence: Some(vec![ProviderId::Cctp, ProviderId::Chainflip]),
@@ -5547,6 +5681,40 @@ mod tests {
             panic!("expected invalid routing");
         };
         assert!(reason.contains("cannot mix transition providers with single-hop"));
+    }
+
+    #[test]
+    fn universal_router_usd_fields_parse_velora_and_kyberswap_shapes() {
+        assert_eq!(
+            universal_router_usd_fields(
+                ProviderId::Velora,
+                &serde_json::json!({
+                    "srcUSD": "100.50",
+                    "destUSD": 99.25,
+                    "gasCostUSD": "0.75",
+                }),
+            ),
+            Some((100.50, 99.25, 0.75))
+        );
+        assert_eq!(
+            universal_router_usd_fields(
+                ProviderId::Kyberswap,
+                &serde_json::json!({
+                    "amountInUsd": "100.50",
+                    "amountOutUsd": "99.25",
+                    "gasUsd": "0.50",
+                    "l1FeeUsd": "0.25",
+                }),
+            ),
+            Some((100.50, 99.25, 0.75))
+        );
+        assert_eq!(
+            universal_router_usd_fields(
+                ProviderId::Relay,
+                &serde_json::json!({"amountInUsd": "1", "amountOutUsd": "1"}),
+            ),
+            None
+        );
     }
 
     #[test]

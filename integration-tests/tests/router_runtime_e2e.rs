@@ -162,8 +162,8 @@ struct RouteCase {
 
 #[derive(Clone, Copy)]
 enum RefundFailureKind {
-    VeloraTransactionFailures,
-    VeloraStaleQuoteFailures,
+    KyberswapTransactionFailures,
+    KyberswapStaleQuoteFailures,
 }
 
 #[derive(Clone, Copy)]
@@ -217,16 +217,16 @@ const ROUTE_CASES: &[RouteCase] = &[
         from: RouteAsset::native("evm:8453"),
         to: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         amount_in: "60000000000000000",
-        provider_sequence: &["velora"],
-        expected_provider_fragments: &["universal_router_swap:velora"],
+        provider_sequence: &["kyberswap"],
+        expected_provider_fragments: &["universal_router_swap:kyberswap"],
     },
     RouteCase {
         name: "usdc_to_eth_single_chain",
         from: RouteAsset::token("evm:8453", BASE_USDC_ADDRESS),
         to: RouteAsset::native("evm:8453"),
         amount_in: "60000000",
-        provider_sequence: &["velora"],
-        expected_provider_fragments: &["universal_router_swap:velora"],
+        provider_sequence: &["kyberswap"],
+        expected_provider_fragments: &["universal_router_swap:kyberswap"],
     },
     RouteCase {
         name: "eth_to_usdc_cross_chain",
@@ -265,15 +265,15 @@ const ROUTE_CASES: &[RouteCase] = &[
 
 const REFUND_FAILURE_ROUTE_CASES: &[RefundFailureRouteCase] = &[
     RefundFailureRouteCase {
-        name: "velora_single_chain_failure_refunds_funding_vault",
+        name: "kyberswap_single_chain_failure_refunds_funding_vault",
         route_case_name: "eth_to_usdc_single_chain",
-        failure: RefundFailureKind::VeloraTransactionFailures,
+        failure: RefundFailureKind::KyberswapTransactionFailures,
         failed_step_type: OrderExecutionStepType::UniversalRouterSwap,
     },
     RefundFailureRouteCase {
-        name: "velora_stale_quote_failure_refunds_erc20_funding_vault",
+        name: "kyberswap_stale_quote_failure_refunds_erc20_funding_vault",
         route_case_name: "usdc_to_eth_single_chain",
-        failure: RefundFailureKind::VeloraStaleQuoteFailures,
+        failure: RefundFailureKind::KyberswapStaleQuoteFailures,
         failed_step_type: OrderExecutionStepType::UniversalRouterSwap,
     },
 ];
@@ -898,6 +898,8 @@ fn order_worker_runtime_args_from_router_args(args: &RouterServerArgs) -> OrderW
         velora_api_url: args.velora_api_url.clone(),
         velora_proxy_url: args.velora_proxy_url.clone(),
         velora_partner: args.velora_partner.clone(),
+        kyberswap_api_url: args.kyberswap_api_url.clone(),
+        kyberswap_proxy_url: args.kyberswap_proxy_url.clone(),
         hyperliquid_paymaster_private_key: args.hyperliquid_paymaster_private_key.clone(),
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -1349,9 +1351,11 @@ fn router_args(
                 .url(),
         ),
         hyperliquid_proxy_url: None,
-        velora_api_url: Some(mocks.velora_url()),
+        velora_api_url: None,
         velora_proxy_url: None,
-        velora_partner: Some("router-e2e".to_string()),
+        velora_partner: None,
+        kyberswap_api_url: Some(mocks.kyberswap_url()),
+        kyberswap_proxy_url: None,
         relay_api_url: None,
         relay_api_key: None,
         relay_proxy_url: None,
@@ -1478,15 +1482,15 @@ async fn spawn_runtime_mocks(devnet: &RiftDevnet) -> MockIntegratorServer {
             devnet.base.anvil.endpoint_url().to_string(),
         )
         .with_unit_node(hyperliquid_node.url(), hyperliquid_node.guardian_key())
-        .with_velora_swap_contract_address(
+        .with_kyberswap_swap_contract_address(
             devnet.ethereum.anvil.chain_id(),
             format!("{:#x}", devnet.ethereum.mock_velora_swap_contract.address()),
         )
-        .with_velora_swap_contract_address(
+        .with_kyberswap_swap_contract_address(
             devnet.base.anvil.chain_id(),
             format!("{:#x}", devnet.base.mock_velora_swap_contract.address()),
         )
-        .with_velora_swap_contract_address(
+        .with_kyberswap_swap_contract_address(
             devnet.arbitrum.anvil.chain_id(),
             format!("{:#x}", devnet.arbitrum.mock_velora_swap_contract.address()),
         )
@@ -1651,14 +1655,14 @@ fn route_case_by_name(name: &str) -> RouteCase {
 
 async fn configure_refund_failure(mocks: &MockIntegratorServer, failure: RefundFailureKind) {
     match failure {
-        RefundFailureKind::VeloraTransactionFailures => {
+        RefundFailureKind::KyberswapTransactionFailures => {
             mocks
-                .set_velora_transaction_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
+                .set_kyberswap_transaction_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
                 .await;
         }
-        RefundFailureKind::VeloraStaleQuoteFailures => {
+        RefundFailureKind::KyberswapStaleQuoteFailures => {
             mocks
-                .set_velora_transaction_stale_quote_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
+                .set_kyberswap_transaction_stale_quote_fail_next_n(PROVIDER_FAILURES_TO_FORCE_REFUND)
                 .await;
         }
     }
@@ -2321,6 +2325,15 @@ async fn install_mock_usdc_clone(devnet: &devnet::EthDevnet, token_address: Addr
         .get_receipt()
         .await
         .expect("mock USDC configureMinter receipt");
+    // The KyberSwap router mock mints swap output, so it also needs minter rights.
+    token
+        .configureMinter(*devnet.mock_kyberswap_swap_contract.address(), U256::MAX)
+        .send()
+        .await
+        .expect("send mock USDC configureMinter for KyberSwap router")
+        .get_receipt()
+        .await
+        .expect("mock USDC configureMinter for KyberSwap router receipt");
 }
 
 async fn wait_until<T, Fut>(label: &str, timeout: Duration, mut check: impl FnMut() -> Fut) -> T

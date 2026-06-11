@@ -1979,7 +1979,9 @@ mod tests {
         // (61,500 ceils to 62,000; 62,500 to 63,000; ... 85,500 to 86,000):
         // the cap must apply to the *aggregated* side — the path the router
         // cache actually consumes — keeping the 20 lowest buckets.
-        let asks: Vec<(f64, f64)> = (0..25).map(|i| (61_500.0 + 1_000.0 * f64::from(i), 0.1)).collect();
+        let asks: Vec<(f64, f64)> = (0..25)
+            .map(|i| (61_500.0 + 1_000.0 * f64::from(i), 0.1))
+            .collect();
         node.set_book_levels("UBTC", "USDC", vec![(61_667.0, 1.0)], asks)
             .await;
         let book: L2BookSnapshot = info_post(

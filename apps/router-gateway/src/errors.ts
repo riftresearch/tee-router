@@ -7,6 +7,7 @@ export type ErrorCode =
   | 'CONFIGURATION_ERROR'
   | 'INSUFFICIENT_LIQUIDITY'
   | 'PAYLOAD_TOO_LARGE'
+  | 'SERVICE_UNAVAILABLE'
   | 'UPSTREAM_ERROR'
   | 'VALIDATION_ERROR'
 
@@ -59,6 +60,22 @@ export class UpstreamInsufficientLiquidityError extends Error {
 
   constructor() {
     super('insufficient liquidity for the requested size')
+  }
+}
+
+/**
+ * Upstream classified the failure as a transient venue outage
+ * (`error.kind === "venue_unavailable"` on the internal API: a venue rate
+ * limit / timeout / 5xx). Surfaced with a dedicated public code and a generic,
+ * venue-agnostic message — the caller learns the one thing that changes their
+ * behavior: retry shortly. The raw upstream error never reaches the client.
+ */
+export class UpstreamVenueUnavailableError extends Error {
+  readonly status = 503
+  readonly code = 'SERVICE_UNAVAILABLE' as const
+
+  constructor() {
+    super('a venue is temporarily unavailable; please retry shortly')
   }
 }
 
@@ -127,6 +144,13 @@ export function normalizeError(error: unknown): {
   }
 
   if (error instanceof UpstreamInsufficientLiquidityError) {
+    return {
+      status: error.status,
+      body: errorBody(error.code, error.message)
+    }
+  }
+
+  if (error instanceof UpstreamVenueUnavailableError) {
     return {
       status: error.status,
       body: errorBody(error.code, error.message)

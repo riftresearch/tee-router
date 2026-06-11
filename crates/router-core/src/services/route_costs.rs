@@ -510,7 +510,7 @@ impl RouteCostService {
         // Only the explicit curated allowlist is ever cached. The routing
         // graph (`transition_declarations`) is intentionally broader; this
         // narrows what gets a measured cost row so nothing outside the
-        // curated Across/CCTP/Unit/Velora set is persisted.
+        // curated Across/CCTP/Unit/universal-router set is persisted.
         let transitions = self.asset_registry.curated_cacheable_transitions();
         let plan = interleaved_refresh_plan(&transitions);
 
@@ -804,13 +804,6 @@ impl RouteCostService {
         .await
     }
 
-    /// Same as [`rank_transition_paths_for_request`] but lets the caller inject
-    /// live-sampled snapshots that take precedence over the cached rows for
-    /// their transition ids. This is how the route explainer folds the cost of
-    /// uncached Velora (`UniversalRouterSwap`) wrap legs into the score when
-    /// live quoting is enabled, so a leg that was previously a `missing_edge`
-    /// with zero cost contributes its real value-loss bps and the cheapest
-    /// total (e.g. the best ERC20 entry/exit anchor) sorts to the top.
     /// Active (non-expired) cached snapshots for the tier implied by
     /// `request_usd_micros`, keyed by transition id. Exposed so the route
     /// explainer can tell which legs already have a fresh cached cost and only
@@ -831,6 +824,13 @@ impl RouteCostService {
             .collect())
     }
 
+    /// Same as [`rank_transition_paths_for_request`] but lets the caller inject
+    /// live-sampled snapshots that take precedence over the cached rows for
+    /// their transition ids. This is how route explainers fold uncached
+    /// universal-router wrap legs (Velora or KyberSwap) into the score when live
+    /// quoting is enabled, so a leg that was previously a `missing_edge` with
+    /// zero cost contributes its real value-loss bps and the cheapest total
+    /// (e.g. the best ERC20 entry/exit anchor) sorts to the top.
     pub async fn rank_transition_paths_for_request_with_overrides(
         &self,
         paths: &mut [TransitionPath],
@@ -1887,21 +1887,31 @@ mod tests {
     }
 
     fn transition(id: &str, kind: MarketOrderTransitionKind) -> TransitionDecl {
+        let provider = match kind {
+            MarketOrderTransitionKind::HyperliquidTrade => ProviderId::HyperliquidSpot,
+            MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Kyberswap,
+            MarketOrderTransitionKind::HyperliquidBridgeDeposit
+            | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
+                ProviderId::HyperliquidBridge
+            }
+            MarketOrderTransitionKind::UnitDeposit | MarketOrderTransitionKind::UnitWithdrawal => {
+                ProviderId::Unit
+            }
+            MarketOrderTransitionKind::AcrossBridge => ProviderId::Across,
+            MarketOrderTransitionKind::CctpBridge => ProviderId::Cctp,
+        };
+        transition_with_provider(id, kind, provider)
+    }
+
+    fn transition_with_provider(
+        id: &str,
+        kind: MarketOrderTransitionKind,
+        provider: ProviderId,
+    ) -> TransitionDecl {
         TransitionDecl {
             id: id.to_string(),
             kind,
-            provider: match kind {
-                MarketOrderTransitionKind::HyperliquidTrade => ProviderId::HyperliquidSpot,
-                MarketOrderTransitionKind::UniversalRouterSwap => ProviderId::Velora,
-                MarketOrderTransitionKind::HyperliquidBridgeDeposit
-                | MarketOrderTransitionKind::HyperliquidBridgeWithdrawal => {
-                    ProviderId::HyperliquidBridge
-                }
-                MarketOrderTransitionKind::UnitDeposit
-                | MarketOrderTransitionKind::UnitWithdrawal => ProviderId::Unit,
-                MarketOrderTransitionKind::AcrossBridge => ProviderId::Across,
-                MarketOrderTransitionKind::CctpBridge => ProviderId::Cctp,
-            },
+            provider,
             input: AssetSlot {
                 asset: asset("evm:1"),
                 required_custody_role: RequiredCustodyRole::SourceOrIntermediate,
@@ -2079,7 +2089,12 @@ mod tests {
             transition("across-a", MarketOrderTransitionKind::AcrossBridge),
             transition("across-b", MarketOrderTransitionKind::AcrossBridge),
             transition("cctp-a", MarketOrderTransitionKind::CctpBridge),
-            transition("velora-a", MarketOrderTransitionKind::UniversalRouterSwap),
+            transition("kyberswap-b", MarketOrderTransitionKind::UniversalRouterSwap),
+            transition_with_provider(
+                "kyberswap-a",
+                MarketOrderTransitionKind::UniversalRouterSwap,
+                ProviderId::Kyberswap,
+            ),
         ];
 
         let plan = interleaved_refresh_plan(&transitions);
@@ -2710,7 +2725,7 @@ mod tests {
     #[test]
     fn amount_aware_score_uses_request_size_for_bps_legs() {
         let pricing = PricingSnapshot::static_bootstrap(Utc::now());
-        let edge = transition("velora_leg", MarketOrderTransitionKind::UniversalRouterSwap);
+        let edge = transition("kyberswap_leg", MarketOrderTransitionKind::UniversalRouterSwap);
         let p = path("p", vec![edge.clone()]);
         let mut snapshots = HashMap::new();
         snapshots.insert(
@@ -2742,7 +2757,7 @@ mod tests {
         // aware scorer must take the larger of the two.
         let pricing = PricingSnapshot::static_bootstrap(Utc::now());
         let edge = transition(
-            "cached_velora",
+            "cached_kyberswap",
             MarketOrderTransitionKind::UniversalRouterSwap,
         );
         let p = path("p", vec![edge.clone()]);
@@ -2998,10 +3013,10 @@ mod tests {
     }
 
     #[test]
-    fn velora_override_fold_reorders_anchor_choice_toward_cheaper_total() {
-        // PEPE -> USDC via Velora (57 bps) + CCTP (1 bps) = 58 bps, vs
-        // PEPE -> ETH via Velora (39 bps) + a 13 bps hop = 52 bps. Once the
-        // live Velora legs are folded in as snapshots, the ETH anchor wins.
+    fn kyberswap_override_fold_reorders_anchor_choice_toward_cheaper_total() {
+        // PEPE -> USDC via KyberSwap (57 bps) + CCTP (1 bps) = 58 bps, vs
+        // PEPE -> ETH via KyberSwap (39 bps) + a 13 bps hop = 52 bps. Once the
+        // live KyberSwap legs are folded in as snapshots, the ETH anchor wins.
         let pricing = PricingSnapshot::static_bootstrap(Utc::now());
         let req = 1_000 * USD_MICRO;
         let v_usdc = transition("v_usdc", MarketOrderTransitionKind::UniversalRouterSwap);
@@ -3022,7 +3037,7 @@ mod tests {
             amount_aware_path_score(&path("eth", vec![v_eth, unit]), &snapshots, &pricing, req);
         assert!(
             eth_path.total_effective_cost_usd_micros < usdc_path.total_effective_cost_usd_micros,
-            "cheaper Velora->ETH total (52 bps) must beat Velora->USDC (58 bps)"
+            "cheaper KyberSwap->ETH total (52 bps) must beat KyberSwap->USDC (58 bps)"
         );
     }
 

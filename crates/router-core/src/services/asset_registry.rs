@@ -6,8 +6,8 @@ use std::collections::{HashSet, VecDeque};
 #[serde(rename_all = "snake_case")]
 /// Canonical assets the router recognizes. This set is intentionally limited to
 /// exactly the assets that appear in the curated cache swap list (the
-/// Across/CCTP/Unit bridge legs and the same-chain Velora pairs); there is no
-/// separate "extra" asset universe. Adding a new routable asset means adding it
+/// Across/CCTP/Unit bridge legs and the same-chain universal-router pairs);
+/// there is no separate "extra" asset universe. Adding a new routable asset
 /// here *and* to the curated route tables below.
 pub enum CanonicalAsset {
     Btc,
@@ -41,6 +41,7 @@ pub enum ProviderId {
     Unit,
     HyperliquidBridge,
     HyperliquidSpot,
+    Kyberswap,
     Velora,
     Relay,
     NearIntents,
@@ -50,12 +51,13 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Across,
         Self::Cctp,
         Self::Unit,
         Self::HyperliquidBridge,
         Self::HyperliquidSpot,
+        Self::Kyberswap,
         Self::Velora,
         Self::Relay,
         Self::NearIntents,
@@ -71,6 +73,7 @@ impl ProviderId {
             "unit" => Some(Self::Unit),
             "hyperliquid_bridge" => Some(Self::HyperliquidBridge),
             "hyperliquid_spot" => Some(Self::HyperliquidSpot),
+            "kyberswap" => Some(Self::Kyberswap),
             "velora" => Some(Self::Velora),
             "relay" => Some(Self::Relay),
             "near_intents" => Some(Self::NearIntents),
@@ -89,6 +92,7 @@ impl ProviderId {
             Self::Unit => "unit",
             Self::HyperliquidBridge => "hyperliquid_bridge",
             Self::HyperliquidSpot => "hyperliquid_spot",
+            Self::Kyberswap => "kyberswap",
             Self::Velora => "velora",
             Self::Relay => "relay",
             Self::NearIntents => "near_intents",
@@ -107,7 +111,7 @@ impl ProviderId {
             Self::HyperliquidSpot => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             },
-            Self::Velora => ProviderVenueKind::MonoChain {
+            Self::Kyberswap | Self::Velora => ProviderVenueKind::MonoChain {
                 mono_chain_kind: MonoChainVenueKind::UniversalRouter,
             },
             Self::Relay | Self::NearIntents | Self::Mayan | Self::Chainflip | Self::Garden => {
@@ -123,7 +127,8 @@ impl ProviderId {
             Self::Cctp | Self::Unit | Self::HyperliquidBridge | Self::HyperliquidSpot => {
                 AssetSupportModel::StaticDeclared
             }
-            Self::Velora
+            Self::Kyberswap
+            | Self::Velora
             | Self::Relay
             | Self::NearIntents
             | Self::Mayan
@@ -142,7 +147,16 @@ impl ProviderId {
 
     #[must_use]
     pub fn is_transition_provider(self) -> bool {
-        !self.is_single_hop_quote_provider()
+        matches!(
+            self,
+            Self::Across
+                | Self::Cctp
+                | Self::Unit
+                | Self::HyperliquidBridge
+                | Self::HyperliquidSpot
+                | Self::Kyberswap
+                | Self::Velora
+        )
     }
 }
 
@@ -655,9 +669,9 @@ impl AssetRegistry {
 
     /// Full edge set used for *display* (the route-graph export and the
     /// route-explain corridor): every declared transition plus the curated
-    /// same-chain Velora `UniversalRouterSwap` swaps. These swap edges are not
-    /// part of [`Self::transition_declarations`] (BFS never routes through them
-    /// as intermediate hops), but they belong in the visual topology so the
+    /// same-chain universal-router swaps. These swap edges are not part of
+    /// [`Self::transition_declarations`] (BFS never routes through them as
+    /// intermediate hops), but they belong in the visual topology so the
     /// dashboard can show same-chain swap branches. Deduped by edge id.
     #[must_use]
     pub fn display_transition_declarations(&self) -> Vec<TransitionDecl> {
@@ -674,10 +688,10 @@ impl AssetRegistry {
     }
 
     /// Same as [`Self::display_transition_declarations`], but also includes the
-    /// runtime Velora wrap edges for a specific `source`/`destination` pair.
-    /// Used by the route-explain corridor so arbitrary ERC20 endpoints (which
-    /// are not part of the static graph) still render their live Velora in/out
-    /// legs to the anchor canonicals (`USDC`/`USDT`/`ETH`) on their chain.
+    /// runtime universal-router wrap edges for a specific `source`/`destination`
+    /// pair. Used by the route-explain corridor so arbitrary ERC20 endpoints
+    /// (which are not part of the static graph) still render their live DEX
+    /// in/out legs to the anchor canonicals (`USDC`/`USDT`/`ETH`) on their chain.
     #[must_use]
     pub fn display_transition_declarations_for(
         &self,
@@ -687,7 +701,7 @@ impl AssetRegistry {
         let mut declarations = self.display_transition_declarations();
         let start = self.source_node_for_asset(source);
         let goal = MarketOrderNode::External(destination.clone());
-        declarations.extend(self.runtime_velora_transition_declarations(&start, &goal));
+        declarations.extend(self.runtime_universal_router_transition_declarations(&start, &goal));
         dedupe_transition_declarations(declarations)
     }
 
@@ -706,7 +720,7 @@ impl AssetRegistry {
     /// - Hyperliquid bridge: `ARB.USDC <-> HL.USDC` (native USDC bridge)
     /// - Hyperliquid spot: `HL.USDC <-> HL.uBTC`, `HL.USDC <-> HL.uETH`,
     ///   `HL.USDC <-> HL.USDT`
-    /// - Velora (same-chain): `USDC <-> USDT` on `ETH`/`BASE`/`ARB`
+    /// - Universal routers (same-chain): `USDC <-> USDT` on `ETH`/`BASE`/`ARB`
     #[must_use]
     pub fn curated_cacheable_transitions(&self) -> Vec<TransitionDecl> {
         let mut out: Vec<TransitionDecl> = self
@@ -715,35 +729,42 @@ impl AssetRegistry {
             .filter(|decl| self.is_curated_static_transition(decl))
             .collect();
 
-        for (chain, canonical_a, canonical_b) in CURATED_VELORA_SWAP_PAIRS {
-            let Some(source) = self.curated_chain_asset(chain, *canonical_a) else {
-                continue;
-            };
-            let Some(destination) = self.curated_chain_asset(chain, *canonical_b) else {
-                continue;
-            };
-            if let Some(transition) = self.velora_swap_transition(&source, &destination) {
-                out.push(transition);
-            }
-            if let Some(transition) = self.velora_swap_transition(&destination, &source) {
-                out.push(transition);
+        for provider in universal_router_runtime_providers() {
+            for (chain, canonical_a, canonical_b) in CURATED_UNIVERSAL_ROUTER_SWAP_PAIRS {
+                let Some(source) = self.curated_chain_asset(chain, *canonical_a) else {
+                    continue;
+                };
+                let Some(destination) = self.curated_chain_asset(chain, *canonical_b) else {
+                    continue;
+                };
+                if let Some(transition) =
+                    self.universal_router_swap_transition(*provider, &source, &destination)
+                {
+                    out.push(transition);
+                }
+                if let Some(transition) =
+                    self.universal_router_swap_transition(*provider, &destination, &source)
+                {
+                    out.push(transition);
+                }
             }
         }
 
         dedupe_transition_declarations(out)
     }
 
-    /// Build the same-chain Velora `UniversalRouterSwap` transition declaration
-    /// for `source -> destination`. Shares the per-edge id format used by the
-    /// runtime Velora edges so a cached cost row matches the runtime lookup at
+    /// Build the same-chain `UniversalRouterSwap` transition declaration for
+    /// `source -> destination`. Shares the per-edge id format used by runtime
+    /// universal-router edges so a cached cost row matches the runtime lookup at
     /// quote time.
     #[must_use]
-    pub fn velora_swap_transition(
+    pub fn universal_router_swap_transition(
         &self,
+        provider: ProviderId,
         source: &DepositAsset,
         destination: &DepositAsset,
     ) -> Option<TransitionDecl> {
-        self.velora_runtime_transition(source, destination)
+        self.universal_router_runtime_transition(provider, source, destination)
     }
 
     fn curated_chain_asset(&self, chain: &str, canonical: CanonicalAsset) -> Option<DepositAsset> {
@@ -903,10 +924,18 @@ impl AssetRegistry {
             }
         }
 
-        paths.sort_by_key(|path| path.transitions.len());
+        paths.sort_by_key(|path| {
+            (
+                path.transitions.len(),
+                universal_router_path_provider_priority(&path.transitions),
+            )
+        });
         let mut unique = Vec::new();
         let mut seen = HashSet::new();
         for path in paths {
+            if has_mixed_universal_router_providers(&path.transitions) {
+                continue;
+            }
             if seen.insert(path.id.clone()) {
                 unique.push(path);
             }
@@ -920,11 +949,11 @@ impl AssetRegistry {
         goal: &MarketOrderNode,
     ) -> Vec<TransitionDecl> {
         let mut transitions = self.transition_declarations();
-        transitions.extend(self.runtime_velora_transition_declarations(start, goal));
+        transitions.extend(self.runtime_universal_router_transition_declarations(start, goal));
         dedupe_transition_declarations(transitions)
     }
 
-    fn runtime_velora_transition_declarations(
+    fn runtime_universal_router_transition_declarations(
         &self,
         start: &MarketOrderNode,
         goal: &MarketOrderNode,
@@ -934,19 +963,27 @@ impl AssetRegistry {
         let mut transitions = Vec::new();
 
         if let (Some(source), Some(destination)) = (start_external, goal_external) {
-            if self.can_runtime_velora_edge(source, destination) {
-                if let Some(transition) = self.velora_runtime_transition(source, destination) {
-                    transitions.push(transition);
+            if self.can_runtime_universal_router_edge(source, destination) {
+                for provider in universal_router_runtime_providers() {
+                    if let Some(transition) =
+                        self.universal_router_runtime_transition(*provider, source, destination)
+                    {
+                        transitions.push(transition);
+                    }
                 }
             }
         }
 
         if let Some(source) = start_external {
             if is_evm_external_asset(source) {
-                for anchor in self.velora_runtime_anchor_assets_on_chain(&source.chain) {
-                    if self.can_runtime_velora_edge(source, &anchor) {
-                        if let Some(transition) = self.velora_runtime_transition(source, &anchor) {
-                            transitions.push(transition);
+                for anchor in self.universal_router_runtime_anchor_assets_on_chain(&source.chain) {
+                    if self.can_runtime_universal_router_edge(source, &anchor) {
+                        for provider in universal_router_runtime_providers() {
+                            if let Some(transition) =
+                                self.universal_router_runtime_transition(*provider, source, &anchor)
+                            {
+                                transitions.push(transition);
+                            }
                         }
                     }
                 }
@@ -955,12 +992,18 @@ impl AssetRegistry {
 
         if let Some(destination) = goal_external {
             if is_evm_external_asset(destination) {
-                for anchor in self.velora_runtime_anchor_assets_on_chain(&destination.chain) {
-                    if self.can_runtime_velora_edge(&anchor, destination) {
-                        if let Some(transition) =
-                            self.velora_runtime_transition(&anchor, destination)
-                        {
-                            transitions.push(transition);
+                for anchor in
+                    self.universal_router_runtime_anchor_assets_on_chain(&destination.chain)
+                {
+                    if self.can_runtime_universal_router_edge(&anchor, destination) {
+                        for provider in universal_router_runtime_providers() {
+                            if let Some(transition) = self.universal_router_runtime_transition(
+                                *provider,
+                                &anchor,
+                                destination,
+                            ) {
+                                transitions.push(transition);
+                            }
                         }
                     }
                 }
@@ -970,7 +1013,10 @@ impl AssetRegistry {
         transitions
     }
 
-    fn velora_runtime_anchor_assets_on_chain(&self, chain: &ChainId) -> Vec<DepositAsset> {
+    fn universal_router_runtime_anchor_assets_on_chain(
+        &self,
+        chain: &ChainId,
+    ) -> Vec<DepositAsset> {
         self.chain_assets
             .iter()
             .filter(|entry| {
@@ -982,21 +1028,26 @@ impl AssetRegistry {
             .collect()
     }
 
-    fn can_runtime_velora_edge(&self, source: &DepositAsset, destination: &DepositAsset) -> bool {
+    fn can_runtime_universal_router_edge(
+        &self,
+        source: &DepositAsset,
+        destination: &DepositAsset,
+    ) -> bool {
         is_evm_external_asset(source)
             && is_evm_external_asset(destination)
             && source.chain == destination.chain
             && source != destination
     }
 
-    fn velora_runtime_transition(
+    fn universal_router_runtime_transition(
         &self,
+        provider: ProviderId,
         source: &DepositAsset,
         destination: &DepositAsset,
     ) -> Option<TransitionDecl> {
         self.transition_decl_from_edge(MarketOrderTransition {
             kind: MarketOrderTransitionKind::UniversalRouterSwap,
-            provider: ProviderId::Velora,
+            provider,
             from: MarketOrderNode::External(source.clone()),
             to: MarketOrderNode::External(destination.clone()),
         })
@@ -1222,9 +1273,9 @@ fn transition_path_id(transitions: &[TransitionDecl]) -> String {
         .join(">")
 }
 
-/// EVM anchor canonicals for the arbitrary-ERC20 Velora wrap: the random token
-/// is swapped into / out of one of these on its own chain before joining the
-/// cached graph. Exactly the three main tokens (no wrapped-BTC variants).
+/// EVM anchor canonicals for arbitrary-ERC20 universal-router wraps: the random
+/// token is swapped into / out of one of these on its own chain before joining
+/// the cached graph. Exactly the three main tokens (no wrapped-BTC variants).
 fn is_anchor_canonical(canonical: CanonicalAsset) -> bool {
     matches!(
         canonical,
@@ -1247,6 +1298,47 @@ const CURATED_TRIO_BRIDGE_ROUTES: &[(ProviderId, CanonicalAsset)] = &[
     (ProviderId::Across, CanonicalAsset::Eth),
     (ProviderId::Cctp, CanonicalAsset::Usdc),
 ];
+/// Providers that generate runtime universal-router swap edges. KyberSwap is the
+/// sole preferred mono-chain DEX router. Velora remains implemented as an
+/// `ExchangeProvider` (executable when an order already references it) but is
+/// intentionally excluded here so it no longer generates routes, even if
+/// `VELORA_API_URL` is configured.
+fn universal_router_runtime_providers() -> &'static [ProviderId] {
+    &[ProviderId::Kyberswap]
+}
+
+fn universal_router_path_provider_priority(transitions: &[TransitionDecl]) -> usize {
+    transitions
+        .iter()
+        .find(|transition| {
+            matches!(
+                transition.kind,
+                MarketOrderTransitionKind::UniversalRouterSwap
+            )
+        })
+        .map_or(usize::MAX, |transition| {
+            universal_router_runtime_providers()
+                .iter()
+                .position(|provider| *provider == transition.provider)
+                .unwrap_or(usize::MAX)
+        })
+}
+fn has_mixed_universal_router_providers(transitions: &[TransitionDecl]) -> bool {
+    let mut provider = None;
+    for transition in transitions.iter().filter(|transition| {
+        matches!(
+            transition.kind,
+            MarketOrderTransitionKind::UniversalRouterSwap
+        )
+    }) {
+        match provider {
+            Some(existing) if existing != transition.provider => return true,
+            Some(_) => {}
+            None => provider = Some(transition.provider),
+        }
+    }
+    false
+}
 
 /// Curated Unit deposit/withdrawal routes, identified by the external
 /// (non-Hyperliquid) side as `(external_chain, canonical)`. The Hyperliquid
@@ -1256,9 +1348,9 @@ const CURATED_UNIT_ROUTES: &[(&str, CanonicalAsset)] = &[
     ("bitcoin", CanonicalAsset::Btc),
 ];
 
-/// Curated same-chain Velora swap pairs: `(chain, canonical_a, canonical_b)`.
-/// Sampled bidirectionally by the route-cost refresher.
-const CURATED_VELORA_SWAP_PAIRS: &[(&str, CanonicalAsset, CanonicalAsset)] = &[
+/// Curated same-chain universal-router swap pairs: `(chain, canonical_a, canonical_b)`.
+/// Sampled bidirectionally by the route-cost refresher for every runtime provider.
+const CURATED_UNIVERSAL_ROUTER_SWAP_PAIRS: &[(&str, CanonicalAsset, CanonicalAsset)] = &[
     ("evm:1", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
     ("evm:8453", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
     ("evm:42161", CanonicalAsset::Usdc, CanonicalAsset::Usdt),
@@ -1721,12 +1813,28 @@ mod tests {
             "evm:1",
             "evm:8453"
         ));
-        // Same-chain Velora swaps are present bidirectionally.
-        assert!(has(
-            MarketOrderTransitionKind::UniversalRouterSwap,
-            "evm:1",
-            "evm:1"
-        ));
+        // Same-chain universal-router swaps are present bidirectionally for the
+        // sole runtime provider (KyberSwap).
+        for chain in ["evm:1", "evm:8453", "evm:42161"] {
+            for provider in [ProviderId::Kyberswap] {
+                assert!(curated.iter().any(|decl| {
+                    decl.kind == MarketOrderTransitionKind::UniversalRouterSwap
+                        && decl.provider == provider
+                        && decl.input.asset.chain.as_str() == chain
+                        && decl.output.asset.chain.as_str() == chain
+                        && registry.canonical_for(&decl.input.asset) == Some(CanonicalAsset::Usdc)
+                        && registry.canonical_for(&decl.output.asset) == Some(CanonicalAsset::Usdt)
+                }));
+                assert!(curated.iter().any(|decl| {
+                    decl.kind == MarketOrderTransitionKind::UniversalRouterSwap
+                        && decl.provider == provider
+                        && decl.input.asset.chain.as_str() == chain
+                        && decl.output.asset.chain.as_str() == chain
+                        && registry.canonical_for(&decl.input.asset) == Some(CanonicalAsset::Usdt)
+                        && registry.canonical_for(&decl.output.asset) == Some(CanonicalAsset::Usdc)
+                }));
+            }
+        }
         // Unit external sides: Ethereum ETH and Bitcoin BTC only.
         assert!(curated.iter().any(|decl| matches!(
             decl.kind,
@@ -1901,6 +2009,47 @@ mod tests {
     }
 
     #[test]
+    fn kyberswap_provider_id_serializes_and_is_transition_only() {
+        assert_eq!(ProviderId::Kyberswap.as_str(), "kyberswap");
+        assert_eq!(ProviderId::parse("kyberswap"), Some(ProviderId::Kyberswap));
+        assert_eq!(
+            serde_json::to_value(ProviderId::Kyberswap).unwrap(),
+            serde_json::json!("kyberswap")
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderId>(serde_json::json!("kyberswap")).unwrap(),
+            ProviderId::Kyberswap
+        );
+        assert!(ProviderId::ALL.contains(&ProviderId::Kyberswap));
+        // KyberSwap is a multi-hop universal-router transition provider only; it is
+        // intentionally not exposed as a quote-only single-hop venue.
+        assert!(!ProviderId::Kyberswap.is_single_hop_quote_provider());
+        assert!(ProviderId::Kyberswap.is_transition_provider());
+
+        for provider in [
+            ProviderId::Across,
+            ProviderId::Cctp,
+            ProviderId::Unit,
+            ProviderId::HyperliquidBridge,
+            ProviderId::HyperliquidSpot,
+            ProviderId::Velora,
+        ] {
+            assert!(provider.is_transition_provider());
+        }
+
+        for provider in [
+            ProviderId::Relay,
+            ProviderId::NearIntents,
+            ProviderId::Mayan,
+            ProviderId::Chainflip,
+            ProviderId::Garden,
+        ] {
+            assert!(provider.is_single_hop_quote_provider());
+            assert!(!provider.is_transition_provider());
+        }
+    }
+
+    #[test]
     fn provider_venue_kinds_classify_current_providers() {
         assert_eq!(
             ProviderId::Across.venue_kind(),
@@ -1919,12 +2068,14 @@ mod tests {
                 mono_chain_kind: MonoChainVenueKind::FixedPairExchange,
             }
         );
-        assert_eq!(
-            ProviderId::Velora.venue_kind(),
-            ProviderVenueKind::MonoChain {
-                mono_chain_kind: MonoChainVenueKind::UniversalRouter,
-            }
-        );
+        for provider in [ProviderId::Kyberswap, ProviderId::Velora] {
+            assert_eq!(
+                provider.venue_kind(),
+                ProviderVenueKind::MonoChain {
+                    mono_chain_kind: MonoChainVenueKind::UniversalRouter,
+                }
+            );
+        }
         for provider in [
             ProviderId::Relay,
             ProviderId::NearIntents,
@@ -1959,10 +2110,12 @@ mod tests {
             ProviderId::HyperliquidSpot.asset_support_model(),
             AssetSupportModel::StaticDeclared
         );
-        assert_eq!(
-            ProviderId::Velora.asset_support_model(),
-            AssetSupportModel::OpenAddressQuote
-        );
+        for provider in [ProviderId::Kyberswap, ProviderId::Velora] {
+            assert_eq!(
+                provider.asset_support_model(),
+                AssetSupportModel::OpenAddressQuote
+            );
+        }
         for provider in [
             ProviderId::Relay,
             ProviderId::NearIntents,
@@ -2228,12 +2381,12 @@ mod tests {
     }
 
     #[test]
-    fn velora_runtime_anchor_assets_include_usdt_but_not_cbbtc() {
+    fn universal_router_runtime_anchor_assets_include_usdt_but_not_cbbtc() {
         let registry = AssetRegistry::default();
         let base = ChainId::parse("evm:8453").unwrap();
         let arbitrum = ChainId::parse("evm:42161").unwrap();
-        let mut anchors = registry.velora_runtime_anchor_assets_on_chain(&base);
-        anchors.extend(registry.velora_runtime_anchor_assets_on_chain(&arbitrum));
+        let mut anchors = registry.universal_router_runtime_anchor_assets_on_chain(&base);
+        anchors.extend(registry.universal_router_runtime_anchor_assets_on_chain(&arbitrum));
 
         assert!(anchors.contains(&asset(
             "evm:8453",
@@ -2246,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_evm_source_can_route_to_bitcoin_through_velora_anchor() {
+    fn arbitrary_evm_source_can_route_to_bitcoin_through_kyberswap_anchor() {
         let registry = AssetRegistry::default();
         let random_base_token = asset(
             "evm:8453",
@@ -2259,6 +2412,7 @@ mod tests {
         assert!(paths.iter().any(|path| {
             path.transitions.first().is_some_and(|transition| {
                 transition.kind == MarketOrderTransitionKind::UniversalRouterSwap
+                    && transition.provider == ProviderId::Kyberswap
                     && transition.input.asset == random_base_token
                     && transition.output.asset.chain == random_base_token.chain
                     && registry.chain_asset(&transition.output.asset).is_some()
@@ -2294,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_can_route_to_arbitrary_evm_destination_through_velora_exit() {
+    fn bitcoin_can_route_to_arbitrary_evm_destination_through_kyberswap_exit() {
         let registry = AssetRegistry::default();
         let btc = asset("bitcoin", AssetId::Native);
         let random_base_token = asset(
@@ -2310,6 +2464,7 @@ mod tests {
                 .is_some_and(|transition| transition.kind == MarketOrderTransitionKind::UnitDeposit)
                 && path.transitions.last().is_some_and(|transition| {
                     transition.kind == MarketOrderTransitionKind::UniversalRouterSwap
+                        && transition.provider == ProviderId::Kyberswap
                         && transition.output.asset == random_base_token
                         && transition.input.asset.chain == random_base_token.chain
                         && registry.chain_asset(&transition.input.asset).is_some()
@@ -2318,7 +2473,8 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_evm_source_can_route_to_arbitrary_same_chain_destination_via_anchor() {
+    fn arbitrary_evm_source_can_route_to_arbitrary_same_chain_destination_via_same_provider_anchor()
+    {
         let registry = AssetRegistry::default();
         let random_base_input = asset(
             "evm:8453",
@@ -2336,6 +2492,7 @@ mod tests {
                 && path.transitions.iter().all(|transition| {
                     transition.kind == MarketOrderTransitionKind::UniversalRouterSwap
                 })
+                && path.transitions[0].provider == path.transitions[1].provider
                 && path.transitions[0].input.asset == random_base_input
                 && path.transitions[0].output.asset.chain == random_base_input.chain
                 && registry
@@ -2344,6 +2501,40 @@ mod tests {
                 && path.transitions[1].input.asset == path.transitions[0].output.asset
                 && path.transitions[1].output.asset == random_base_output
         }));
+
+        assert!(paths
+            .iter()
+            .all(|path| !has_mixed_universal_router_providers(&path.transitions)));
+    }
+
+    #[test]
+    fn same_chain_runtime_direct_paths_use_kyberswap_only() {
+        let registry = AssetRegistry::default();
+        let random_base_input = asset(
+            "evm:8453",
+            AssetId::reference("0x5555555555555555555555555555555555555555"),
+        );
+        let random_base_output = asset(
+            "evm:8453",
+            AssetId::reference("0x6666666666666666666666666666666666666666"),
+        );
+
+        let paths = registry.select_transition_paths(&random_base_input, &random_base_output, 3);
+        let direct_providers: Vec<_> = paths
+            .iter()
+            .filter(|path| {
+                path.transitions.len() == 1
+                    && path.transitions[0].kind == MarketOrderTransitionKind::UniversalRouterSwap
+                    && path.transitions[0].input.asset == random_base_input
+                    && path.transitions[0].output.asset == random_base_output
+            })
+            .map(|path| path.transitions[0].provider)
+            .collect();
+
+        // KyberSwap is the sole runtime universal-router provider; Velora must not
+        // generate any direct same-chain route.
+        assert_eq!(direct_providers, vec![ProviderId::Kyberswap]);
+        assert!(!direct_providers.contains(&ProviderId::Velora));
     }
 
     #[test]
@@ -2700,8 +2891,8 @@ mod tests {
             "expected at least one same-chain route on Base"
         );
         // No same-chain preference filter anymore: cross-chain candidates stay
-        // in the ranked set and must win on cost. The direct same-chain Velora
-        // route must still be among the candidates.
+        // in the ranked set and must win on cost. The direct same-chain
+        // universal-router route must still be among the candidates.
         assert!(
             ranked.iter().any(|p| {
                 p.transitions.iter().all(|t| {

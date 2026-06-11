@@ -56,7 +56,7 @@ struct SwapCmd {
     /// Recipient address on the destination chain.
     #[arg(long)]
     to_address: String,
-    /// Exact provider sequence to require, comma-separated (for example: velora,cctp).
+    /// Exact provider sequence to require, comma-separated (for example: kyberswap,cctp).
     #[arg(long)]
     provider_sequence: Option<String>,
     /// Accept the quote without an interactive confirmation prompt.

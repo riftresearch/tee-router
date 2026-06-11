@@ -17,9 +17,9 @@ pub mod usd_valuation;
 
 pub use action_providers::{
     AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-    CctpHttpProviderConfig, ProviderAddressIntent, ProviderExecutionIntent, ProviderExecutionState,
-    ProviderOperationIntent, ProviderOperationObservation, ProviderOperationObservationRequest,
-    VeloraHttpProviderConfig,
+    CctpHttpProviderConfig, KyberswapHttpProviderConfig, KyberswapProvider, ProviderAddressIntent,
+    ProviderExecutionIntent, ProviderExecutionState, ProviderOperationIntent,
+    ProviderOperationObservation, ProviderOperationObservationRequest, VeloraHttpProviderConfig,
 };
 pub use asset_registry::{
     AssetRegistry, AssetSupportModel, CanonicalAsset, ChainAsset, MonoChainVenueKind,
