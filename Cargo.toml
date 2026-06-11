@@ -143,3 +143,7 @@ zeromq = "0.6.0-pre.1"
 
 [patch.crates-io]
 corepc-node = { git = "https://github.com/alpinevm/corepc", rev = "2b21b2bfeb4b4c8bc71fccba87d86054a648f242" }
+# Vendored with one fix so socks5:// proxies receive locally-resolved IPv6
+# destinations as addresses instead of unresolvable bracketed "domains".
+# See vendor/hyper-util/RIFT-VENDOR.md.
+hyper-util = { path = "vendor/hyper-util" }

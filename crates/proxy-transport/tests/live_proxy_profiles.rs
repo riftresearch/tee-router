@@ -125,6 +125,10 @@ async fn probe(venue: &'static str, url: String, profile: Profile) -> Outcome {
     let result = async {
         let builder = reqwest::Client::builder()
             .use_rustls_tls()
+            // Transport check only: a redirect status is a pass, and following it
+            // can hop to a different host with different IPv6 support (coinbase's
+            // root redirects to a v4-only docs site).
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT);
         let client = apply_reqwest_proxy(builder, profile.upstream_proxy().as_ref())
             .map_err(|err| format!("proxy setup: {err}"))?
