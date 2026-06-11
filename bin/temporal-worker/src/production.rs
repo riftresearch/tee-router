@@ -477,12 +477,6 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
         );
         require_http_url(
             &mut errors,
-            "VELORA_API_URL",
-            "Velora API URL",
-            args.velora_api_url.as_deref(),
-        );
-        require_http_url(
-            &mut errors,
             "KYBERSWAP_API_URL",
             "KyberSwap API URL",
             args.kyberswap_api_url.as_deref(),
@@ -512,7 +506,6 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
                 ProxyTarget::Cctp,
                 ProxyTarget::Hyperunit,
                 ProxyTarget::Hyperliquid,
-                ProxyTarget::Velora,
                 ProxyTarget::Kyberswap,
                 ProxyTarget::Coinbase,
             ],

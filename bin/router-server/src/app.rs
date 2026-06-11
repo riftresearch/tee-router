@@ -402,12 +402,6 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         );
         require_http_url(
             &mut errors,
-            "VELORA_API_URL",
-            "Velora API URL",
-            args.velora_api_url.as_deref(),
-        );
-        require_http_url(
-            &mut errors,
             "KYBERSWAP_API_URL",
             "KyberSwap API URL",
             args.kyberswap_api_url.as_deref(),
@@ -447,7 +441,6 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             ProxyTarget::Cctp,
             ProxyTarget::Hyperunit,
             ProxyTarget::Hyperliquid,
-            ProxyTarget::Velora,
             ProxyTarget::Kyberswap,
             ProxyTarget::Chainalysis,
             ProxyTarget::Coinbase,
@@ -1120,7 +1113,6 @@ mod tests {
         args.cctp_api_url = Some("https://iris.example".to_string());
         args.hyperunit_api_url = Some("https://unit.example".to_string());
         args.hyperliquid_api_url = Some("https://hyperliquid.example".to_string());
-        args.velora_api_url = Some("https://velora.example".to_string());
         args.kyberswap_api_url = Some("https://kyberswap.example".to_string());
         args.chainalysis_host = Some("https://chainalysis.example".to_string());
         args.chainalysis_token = Some("chainalysis-token".to_string());
@@ -1137,7 +1129,6 @@ mod tests {
         args.cctp_proxy_profile = Some(profile.to_string());
         args.hyperunit_proxy_profile = Some(profile.to_string());
         args.hyperliquid_proxy_profile = Some(profile.to_string());
-        args.velora_proxy_profile = Some(profile.to_string());
         args.kyberswap_proxy_profile = Some(profile.to_string());
         args.chainalysis_proxy_profile = Some(profile.to_string());
         args.coinbase_proxy_profile = Some(profile.to_string());
