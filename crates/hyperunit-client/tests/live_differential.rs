@@ -24,6 +24,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitOperation,
     UnitOperationState, UnitOperationsRequest, UnitOperationsResponse,
 };
+use proxy_transport::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
 use serde_json::{json, Value};
 use url::Url;
 
@@ -1004,10 +1005,17 @@ fn unit_tx_hash_matches_submitted(observed: Option<&str>, submitted: &str) -> bo
 }
 
 fn live_unit_client() -> TestResult<HyperUnitClient> {
-    HyperUnitClient::new_with_proxy_url(
+    let proxy = env_var_any(&[HYPERUNIT_PROXY_URL])
+        .as_deref()
+        .map(|value| {
+            ProxyUrl::parse(value, HYPERUNIT_PROXY_URL)
+                .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+        })
+        .transpose()?;
+    HyperUnitClient::new_with_proxy(
         env_var_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])
             .ok_or("missing HYPERUNIT_LIVE_BASE_URL or HYPERUNIT_API_URL")?,
-        env_var_any(&[HYPERUNIT_PROXY_URL]),
+        proxy.as_ref(),
     )
     .map_err(Into::into)
 }

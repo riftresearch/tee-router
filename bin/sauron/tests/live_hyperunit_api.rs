@@ -20,6 +20,7 @@ use hyperunit_client::{
     GuardianNetwork, HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest,
     UnitOperationsRequest,
 };
+use router_core::services::upstream_proxy::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
 use std::{env, fs, path::PathBuf};
 
 /// Stable HL spot wallet for which we'll generate a BTC deposit address.
@@ -187,7 +188,10 @@ async fn real_hyperunit_gen_call_via_proxy_auto_verifies() {
         return;
     };
 
-    let client = HyperUnitClient::new_with_proxy_url("https://api.hyperunit.xyz", Some(proxy_url))
+    let proxy = ProxyUrl::parse(&proxy_url, "HYPERUNIT_LIVE_PROXY_URL")
+        .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+        .expect("proxy URL");
+    let client = HyperUnitClient::new_with_proxy("https://api.hyperunit.xyz", Some(&proxy))
         .expect("hyperunit client construction");
     assert_eq!(client.network(), GuardianNetwork::Mainnet);
 

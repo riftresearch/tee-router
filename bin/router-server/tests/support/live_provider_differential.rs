@@ -20,6 +20,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitGenerateAddressResponse,
     UnitOperation, UnitOperationsRequest, UnitOperationsResponse,
 };
+use proxy_transport::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
 use router_core::{
     models::ProviderOrderKind,
     protocol::{AssetId, ChainId, DepositAsset},
@@ -400,9 +401,16 @@ pub async fn live_vs_mock_hyperunit_generate_address_contract() -> TestResult<()
         dst_addr: format!("{user:#x}"),
     };
 
-    let live_client = HyperUnitClient::new_with_proxy_url(
+    let proxy = env_var_any(&[HYPERUNIT_PROXY_URL])
+        .as_deref()
+        .map(|value| {
+            ProxyUrl::parse(value, HYPERUNIT_PROXY_URL)
+                .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+        })
+        .transpose()?;
+    let live_client = HyperUnitClient::new_with_proxy(
         required_env_any(&[HYPERUNIT_BASE_URL, HYPERUNIT_FALLBACK_BASE_URL])?,
-        env_var_any(&[HYPERUNIT_PROXY_URL]),
+        proxy.as_ref(),
     )?;
     let live_generated = live_client.generate_address(request.clone()).await?;
     let live_operations = live_client

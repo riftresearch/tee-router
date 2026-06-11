@@ -1,13 +1,14 @@
 use crate::error::{RouterServerError, RouterServerResult};
 use chrono::Utc;
+use proxy_transport::apply_reqwest_proxy;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE},
-    Client, Method, Proxy, StatusCode,
+    Client, Method, StatusCode,
 };
 use router_core::{
     db::Database,
     models::{ProviderHealthCheck, ProviderHealthStatus},
-    services::http_body::read_limited_response_text,
+    services::{http_body::read_limited_response_text, upstream_proxy::UpstreamProxy},
 };
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration, time::Instant};
@@ -243,7 +244,7 @@ pub struct ProviderHealthProbe {
     url: String,
     headers: Vec<(String, String)>,
     json_body: Option<Value>,
-    proxy_url: Option<String>,
+    proxy_url: Option<UpstreamProxy>,
     proxy_client: Option<Client>,
 }
 
@@ -288,69 +289,35 @@ impl ProviderHealthProbe {
     }
 
     #[must_use]
-    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
-        self.proxy_url = proxy_url
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+    pub fn with_proxy(mut self, proxy_url: Option<UpstreamProxy>) -> Self {
+        self.proxy_url = proxy_url;
         self
     }
 
     fn prepare(mut self, timeout: Duration) -> RouterServerResult<Self> {
-        let Some(proxy_url) = self.proxy_url.as_deref() else {
+        let Some(proxy) = self.proxy_url.as_ref() else {
             return Ok(self);
         };
-        let parsed = url::Url::parse(proxy_url).map_err(|err| RouterServerError::InvalidData {
-            message: format!(
-                "invalid provider health proxy URL for {}: {err}",
-                self.provider
-            ),
+        let builder = Client::builder().timeout(timeout).use_rustls_tls();
+        let builder = apply_reqwest_proxy(builder, Some(proxy)).map_err(|err| {
+            RouterServerError::InvalidData {
+                message: format!(
+                    "failed to configure provider health proxy for {}: {err}",
+                    self.provider
+                ),
+            }
         })?;
-        if parsed.scheme() != "socks5" {
-            return Err(RouterServerError::InvalidData {
-                message: format!(
-                    "unsupported provider health proxy scheme for {}; expected socks5",
-                    self.provider
-                ),
-            });
-        }
-        if parsed.host_str().is_none() || parsed.port().is_none() {
-            return Err(RouterServerError::InvalidData {
-                message: format!(
-                    "provider health proxy URL for {} must include host and port",
-                    self.provider
-                ),
-            });
-        }
-        if (!parsed.path().is_empty() && parsed.path() != "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(RouterServerError::InvalidData {
-                message: format!(
-                    "provider health proxy URL for {} must not include a path, query string, or fragment",
-                    self.provider
-                ),
-            });
-        }
-        let proxy = Proxy::all(proxy_url).map_err(|err| RouterServerError::InvalidData {
-            message: format!(
-                "failed to configure provider health proxy for {}: {err}",
-                self.provider
-            ),
-        })?;
-        self.proxy_client = Some(
-            Client::builder()
-                .timeout(timeout)
-                .use_rustls_tls()
-                .proxy(proxy)
-                .build()
-                .map_err(|err| RouterServerError::InvalidData {
-                    message: format!(
-                        "failed to build proxied provider health HTTP client for {}: {err}",
-                        self.provider
-                    ),
-                })?,
-        );
+        self.proxy_client =
+            Some(
+                builder
+                    .build()
+                    .map_err(|err| RouterServerError::InvalidData {
+                        message: format!(
+                            "failed to build proxied provider health HTTP client for {}: {err}",
+                            self.provider
+                        ),
+                    })?,
+            );
         Ok(self)
     }
 

@@ -1,138 +1,287 @@
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
-use url::Url;
+pub use proxy_transport::{
+    sanitize_proxy_url_for_error, ProxyDnsMode, ProxyDnsModeError, ProxyUrl, ProxyUrlError,
+    UpstreamProxy,
+};
 
 pub const PRODUCTION_ENV: &str = "PRODUCTION";
-pub const UPSTREAM_PROXY_URL_ENV: &str = "UPSTREAM_PROXY_URL";
 
-/// A validated upstream proxy URL.
-///
-/// The router intentionally supports only `socks5://` proxies. `socks5h://`
-/// moves DNS resolution to the proxy, which changes the endpoint-security
-/// assumptions for upstream providers.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ProxyUrl(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyProfile {
+    Direct,
+    Proxied(UpstreamProxy),
+}
 
-impl ProxyUrl {
-    pub fn parse(value: impl AsRef<str>, env_name: &'static str) -> Result<Self, ProxyUrlError> {
-        let value = value.as_ref().trim();
-        let parsed = Url::parse(value).map_err(|source| ProxyUrlError {
-            env_name,
-            value: sanitize_proxy_url_for_error(value),
-            reason: format!("invalid URL: {source}"),
-        })?;
-        if parsed.scheme() != "socks5" {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: format!("unsupported scheme {:?}", parsed.scheme()),
-            });
+impl ProxyProfile {
+    #[must_use]
+    pub const fn as_upstream_proxy(&self) -> Option<&UpstreamProxy> {
+        match self {
+            Self::Direct => None,
+            Self::Proxied(proxy) => Some(proxy),
         }
-        if parsed.host_str().is_none() {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: "missing host".to_string(),
-            });
-        }
-        if parsed.port().is_none() {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: "missing port".to_string(),
-            });
-        }
-        if !parsed.path().is_empty() && parsed.path() != "/" {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: "paths are not allowed".to_string(),
-            });
-        }
-        if parsed.query().is_some() {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: "query strings are not allowed".to_string(),
-            });
-        }
-        if parsed.fragment().is_some() {
-            return Err(ProxyUrlError {
-                env_name,
-                value: sanitize_proxy_url_for_error(value),
-                reason: "fragments are not allowed".to_string(),
-            });
-        }
-        Ok(Self(parsed.as_str().to_string()))
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-
-    #[must_use]
-    pub fn redacted(&self) -> String {
-        sanitize_proxy_url_for_error(&self.0)
+    pub fn into_upstream_proxy(self) -> Option<UpstreamProxy> {
+        match self {
+            Self::Direct => None,
+            Self::Proxied(proxy) => Some(proxy),
+        }
     }
 }
 
-impl fmt::Debug for ProxyUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("ProxyUrl").field(&self.redacted()).finish()
+/// Every upstream the router reaches over HTTP, paired with the env vars that
+/// configure it. The single source of truth for proxy-profile env names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProxyTarget {
+    Across,
+    Cctp,
+    Hyperunit,
+    Hyperliquid,
+    Velora,
+    Relay,
+    NearIntents,
+    Mayan,
+    Chainflip,
+    Garden,
+    Chainalysis,
+    Coinbase,
+    EthereumRpc,
+    BaseRpc,
+    ArbitrumRpc,
+    BitcoinRpc,
+    Esplora,
+}
+
+impl ProxyTarget {
+    #[must_use]
+    pub const fn profile_env(self) -> &'static str {
+        match self {
+            Self::Across => "ACROSS_PROXY_PROFILE",
+            Self::Cctp => "CCTP_PROXY_PROFILE",
+            Self::Hyperunit => "HYPERUNIT_PROXY_PROFILE",
+            Self::Hyperliquid => "HYPERLIQUID_PROXY_PROFILE",
+            Self::Velora => "VELORA_PROXY_PROFILE",
+            Self::Relay => "RELAY_PROXY_PROFILE",
+            Self::NearIntents => "NEAR_INTENTS_PROXY_PROFILE",
+            Self::Mayan => "MAYAN_PROXY_PROFILE",
+            Self::Chainflip => "CHAINFLIP_PROXY_PROFILE",
+            Self::Garden => "GARDEN_PROXY_PROFILE",
+            Self::Chainalysis => "CHAINALYSIS_PROXY_PROFILE",
+            Self::Coinbase => "COINBASE_PROXY_PROFILE",
+            Self::EthereumRpc => "ETH_RPC_PROXY_PROFILE",
+            Self::BaseRpc => "BASE_RPC_PROXY_PROFILE",
+            Self::ArbitrumRpc => "ARBITRUM_RPC_PROXY_PROFILE",
+            Self::BitcoinRpc => "BITCOIN_RPC_PROXY_PROFILE",
+            Self::Esplora => "ESPLORA_PROXY_PROFILE",
+        }
+    }
+
+    #[must_use]
+    pub const fn upstream_env(self) -> &'static str {
+        match self {
+            Self::Across => "ACROSS_API_URL",
+            Self::Cctp => "CCTP_API_URL",
+            Self::Hyperunit => "HYPERUNIT_API_URL",
+            Self::Hyperliquid => "HYPERLIQUID_API_URL",
+            Self::Velora => "VELORA_API_URL",
+            Self::Relay => "RELAY_API_URL",
+            Self::NearIntents => "NEAR_INTENTS_API_URL",
+            Self::Mayan => "MAYAN_API_URL",
+            Self::Chainflip => "CHAINFLIP_API_URL",
+            Self::Garden => "GARDEN_API_URL",
+            Self::Chainalysis => "CHAINALYSIS_HOST",
+            Self::Coinbase => "COINBASE_PRICE_API_BASE_URL",
+            Self::EthereumRpc => "ETH_RPC_URL",
+            Self::BaseRpc => "BASE_RPC_URL",
+            Self::ArbitrumRpc => "ARBITRUM_RPC_URL",
+            Self::BitcoinRpc => "BITCOIN_RPC_URL",
+            Self::Esplora => "ESPLORA_HTTP_SERVER_URL",
+        }
     }
 }
 
-impl fmt::Display for ProxyUrl {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.redacted())
+/// Proxy profiles resolved against the catalog, keyed by upstream target.
+/// A missing entry means no profile env was set for that target.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedProxies(BTreeMap<ProxyTarget, ProxyProfile>);
+
+impl ResolvedProxies {
+    pub fn resolve<'a>(
+        catalog: &ProxyProfileCatalog,
+        entries: impl IntoIterator<Item = (ProxyTarget, Option<&'a str>)>,
+    ) -> Result<Self, ProxyProfileError> {
+        let mut profiles = BTreeMap::new();
+        for (target, value) in entries {
+            if let Some(profile) = catalog.resolve(value, target.profile_env())? {
+                profiles.insert(target, profile);
+            }
+        }
+        Ok(Self(profiles))
     }
+
+    #[must_use]
+    pub fn profile(&self, target: ProxyTarget) -> Option<&ProxyProfile> {
+        self.0.get(&target)
+    }
+
+    #[must_use]
+    pub fn proxy_ref(&self, target: ProxyTarget) -> Option<&UpstreamProxy> {
+        self.profile(target)
+            .and_then(ProxyProfile::as_upstream_proxy)
+    }
+
+    #[must_use]
+    pub fn proxy_owned(&self, target: ProxyTarget) -> Option<UpstreamProxy> {
+        self.proxy_ref(target).cloned()
+    }
+
+    /// Append a `{PROFILE_ENV} is required for {UPSTREAM_ENV}` error for every
+    /// target without a configured profile.
+    pub fn require(
+        &self,
+        errors: &mut Vec<String>,
+        targets: impl IntoIterator<Item = ProxyTarget>,
+    ) {
+        for target in targets {
+            if self.profile(target).is_none() {
+                errors.push(format!(
+                    "{} is required for {}",
+                    target.profile_env(),
+                    target.upstream_env()
+                ));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProxyProfileCatalog {
+    ipv4_us_west_1: Option<UpstreamProxy>,
+    ipv6_us_west_1: Option<UpstreamProxy>,
+    ipv4_eu: Option<UpstreamProxy>,
+}
+
+impl ProxyProfileCatalog {
+    pub fn new(
+        ipv4_us_west_1_url: Option<&str>,
+        ipv4_us_west_1_dns_mode: &str,
+        ipv6_us_west_1_url: Option<&str>,
+        ipv6_us_west_1_dns_mode: &str,
+        ipv4_eu_url: Option<&str>,
+        ipv4_eu_dns_mode: &str,
+    ) -> Result<Self, ProxyProfileError> {
+        Ok(Self {
+            ipv4_us_west_1: configured_profile(
+                ipv4_us_west_1_url,
+                "PROXY_PROFILE_IPV4_US_WEST_1_URL",
+                ipv4_us_west_1_dns_mode,
+                "PROXY_PROFILE_IPV4_US_WEST_1_DNS_MODE",
+            )?,
+            ipv6_us_west_1: configured_profile(
+                ipv6_us_west_1_url,
+                "PROXY_PROFILE_IPV6_US_WEST_1_URL",
+                ipv6_us_west_1_dns_mode,
+                "PROXY_PROFILE_IPV6_US_WEST_1_DNS_MODE",
+            )?,
+            ipv4_eu: configured_profile(
+                ipv4_eu_url,
+                "PROXY_PROFILE_IPV4_EU_URL",
+                ipv4_eu_dns_mode,
+                "PROXY_PROFILE_IPV4_EU_DNS_MODE",
+            )?,
+        })
+    }
+
+    pub fn resolve(
+        &self,
+        profile_value: Option<&str>,
+        profile_env_name: &'static str,
+    ) -> Result<Option<ProxyProfile>, ProxyProfileError> {
+        let Some(profile) = normalize_optional_string(profile_value) else {
+            return Ok(None);
+        };
+        match profile.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Some(ProxyProfile::Direct)),
+            "ipv4-us-west-1" => {
+                self.profile_value(&self.ipv4_us_west_1, &profile, profile_env_name)
+            }
+            "ipv6-us-west-1" => {
+                self.profile_value(&self.ipv6_us_west_1, &profile, profile_env_name)
+            }
+            "ipv4-eu" => self.profile_value(&self.ipv4_eu, &profile, profile_env_name),
+            other => Err(ProxyProfileError::UnknownProfile {
+                env_name: profile_env_name,
+                profile: other.to_string(),
+            }),
+        }
+    }
+
+    fn profile_value(
+        &self,
+        value: &Option<UpstreamProxy>,
+        profile: &str,
+        env_name: &'static str,
+    ) -> Result<Option<ProxyProfile>, ProxyProfileError> {
+        value
+            .clone()
+            .map(ProxyProfile::Proxied)
+            .map(Some)
+            .ok_or_else(|| ProxyProfileError::MissingProfileUrl {
+                env_name,
+                profile: profile.to_string(),
+            })
+    }
+}
+
+fn configured_profile(
+    url: Option<&str>,
+    url_env_name: &'static str,
+    dns_mode: &str,
+    dns_mode_env_name: &'static str,
+) -> Result<Option<UpstreamProxy>, ProxyProfileError> {
+    let Some(url) = normalize_optional_string(url) else {
+        return Ok(None);
+    };
+    let url = ProxyUrl::parse(&url, url_env_name).map_err(ProxyProfileError::ProxyUrl)?;
+    let dns_mode =
+        ProxyDnsMode::parse(dns_mode, dns_mode_env_name).map_err(ProxyProfileError::DnsMode)?;
+    Ok(Some(UpstreamProxy::new(url, dns_mode)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProxyUrlError {
-    pub env_name: &'static str,
-    pub value: String,
-    pub reason: String,
+pub enum ProxyProfileError {
+    ProxyUrl(ProxyUrlError),
+    DnsMode(ProxyDnsModeError),
+    UnknownProfile {
+        env_name: &'static str,
+        profile: String,
+    },
+    MissingProfileUrl {
+        env_name: &'static str,
+        profile: String,
+    },
 }
 
-impl fmt::Display for ProxyUrlError {
+impl fmt::Display for ProxyProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} has invalid proxy URL {}: {}",
-            self.env_name, self.value, self.reason
-        )
+        match self {
+            Self::ProxyUrl(error) => write!(f, "{error}"),
+            Self::DnsMode(error) => write!(f, "{error}"),
+            Self::UnknownProfile { env_name, profile } => write!(
+                f,
+                "{env_name} references unknown proxy profile {profile:?}; expected direct, ipv4-us-west-1, ipv6-us-west-1, or ipv4-eu"
+            ),
+            Self::MissingProfileUrl { env_name, profile } => write!(
+                f,
+                "{env_name} references proxy profile {profile:?}, but that profile has no configured URL"
+            ),
+        }
     }
 }
 
-impl std::error::Error for ProxyUrlError {}
-
-pub fn optional_proxy(
-    value: Option<&str>,
-    env_name: &'static str,
-) -> Result<Option<ProxyUrl>, ProxyUrlError> {
-    let Some(value) = normalize_optional_string(value) else {
-        return Ok(None);
-    };
-    ProxyUrl::parse(value, env_name).map(Some)
-}
-
-pub fn effective_proxy(
-    specific_value: Option<&str>,
-    specific_env_name: &'static str,
-    upstream_value: Option<&str>,
-) -> Result<Option<ProxyUrl>, ProxyUrlError> {
-    match optional_proxy(specific_value, specific_env_name)? {
-        Some(proxy_url) => Ok(Some(proxy_url)),
-        None => optional_proxy(upstream_value, UPSTREAM_PROXY_URL_ENV),
-    }
-}
+impl std::error::Error for ProxyProfileError {}
 
 #[must_use]
 pub fn normalize_optional_string(value: Option<&str>) -> Option<String> {
@@ -140,34 +289,6 @@ pub fn normalize_optional_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-#[must_use]
-pub fn sanitize_proxy_url_for_error(value: &str) -> String {
-    let Ok(parsed) = Url::parse(value.trim()) else {
-        return "<invalid url>".to_string();
-    };
-
-    let host = parsed.host_str().unwrap_or("<missing-host>");
-    let mut redacted = format!("{}://", parsed.scheme());
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        redacted.push_str("<redacted>@");
-    }
-    redacted.push_str(host);
-    if let Some(port) = parsed.port() {
-        redacted.push(':');
-        redacted.push_str(&port.to_string());
-    }
-    if !parsed.path().is_empty() && parsed.path() != "/" {
-        redacted.push_str("/<redacted-path>");
-    }
-    if parsed.query().is_some() {
-        redacted.push_str("?<redacted-query>");
-    }
-    if parsed.fragment().is_some() {
-        redacted.push_str("#<redacted-fragment>");
-    }
-    redacted
 }
 
 #[cfg(test)]
@@ -203,16 +324,78 @@ mod tests {
     }
 
     #[test]
-    fn empty_specific_proxy_inherits_upstream_proxy() {
-        let resolved = effective_proxy(
-            Some("  "),
-            "CHAIN_PROXY_URL",
+    fn profiles_resolve_direct_and_configured_routes() {
+        let catalog = ProxyProfileCatalog::new(
             Some("socks5://proxy.example:1080"),
+            "system-default",
+            Some("socks5://ipv6.example:1080"),
+            "local-ipv6-only",
+            None,
+            "local-ipv6-only",
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(resolved.as_str(), "socks5://proxy.example:1080");
+        assert_eq!(
+            catalog
+                .resolve(Some("direct"), "TEST_PROXY_PROFILE")
+                .unwrap(),
+            Some(ProxyProfile::Direct)
+        );
+        let resolved = catalog
+            .resolve(Some("ipv6-us-west-1"), "TEST_PROXY_PROFILE")
+            .unwrap()
+            .unwrap();
+        let proxy = resolved.as_upstream_proxy().unwrap();
+
+        assert_eq!(proxy.as_str(), "socks5://ipv6.example:1080");
+        assert_eq!(proxy.dns_mode(), ProxyDnsMode::LocalIpv6Only);
+    }
+
+    #[test]
+    fn resolved_proxies_resolve_lookup_and_require() {
+        let catalog = ProxyProfileCatalog::new(
+            Some("socks5://proxy.example:1080"),
+            "system-default",
+            None,
+            "local-ipv6-only",
+            None,
+            "system-default",
+        )
+        .unwrap();
+
+        let proxies = ResolvedProxies::resolve(
+            &catalog,
+            [
+                (ProxyTarget::Across, Some("ipv4-us-west-1")),
+                (ProxyTarget::Velora, Some("direct")),
+                (ProxyTarget::Cctp, None),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            proxies.proxy_ref(ProxyTarget::Across).unwrap().as_str(),
+            "socks5://proxy.example:1080"
+        );
+        assert_eq!(
+            proxies.profile(ProxyTarget::Velora),
+            Some(&ProxyProfile::Direct)
+        );
+        assert!(proxies.proxy_ref(ProxyTarget::Velora).is_none());
+        assert!(proxies.profile(ProxyTarget::Cctp).is_none());
+
+        let mut errors = Vec::new();
+        proxies.require(
+            &mut errors,
+            [ProxyTarget::Across, ProxyTarget::Cctp, ProxyTarget::Esplora],
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "CCTP_PROXY_PROFILE is required for CCTP_API_URL".to_string(),
+                "ESPLORA_PROXY_PROFILE is required for ESPLORA_HTTP_SERVER_URL".to_string(),
+            ]
+        );
     }
 
     #[test]

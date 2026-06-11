@@ -15,7 +15,7 @@ use crate::{
         http_body::{read_limited_response_text, response_body_error_preview},
         hyperliquid_books::{HlBookCache, HttpL2BookSource, TieredBook, HL_BOOK_CACHE_TTL},
         pricing::checked_pow10,
-        upstream_proxy::ProxyUrl,
+        upstream_proxy::UpstreamProxy,
     },
     telemetry,
 };
@@ -41,6 +41,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitGenerateAddressResponse,
     UnitOperation, UnitOperationState, UnitOperationsRequest,
 };
+use proxy_transport::apply_reqwest_proxy;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -512,7 +513,7 @@ pub struct AcrossHttpProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub integrator_id: Option<String>,
-    pub proxy_url: Option<ProxyUrl>,
+    pub proxy_url: Option<UpstreamProxy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,14 +559,14 @@ pub struct CctpHttpProviderConfig {
     pub token_messenger_v2_address: String,
     pub message_transmitter_v2_address: String,
     pub transfer_mode: CctpTransferMode,
-    pub proxy_url: Option<ProxyUrl>,
+    pub proxy_url: Option<UpstreamProxy>,
 }
 
 #[derive(Clone)]
 pub struct VeloraHttpProviderConfig {
     pub base_url: String,
     pub partner: Option<String>,
-    pub proxy_url: Option<ProxyUrl>,
+    pub proxy_url: Option<UpstreamProxy>,
 }
 
 #[derive(Clone)]
@@ -573,9 +574,9 @@ pub struct ActionProviderHttpOptions {
     pub across: Option<AcrossHttpProviderConfig>,
     pub cctp: Option<CctpHttpProviderConfig>,
     pub hyperunit_base_url: Option<String>,
-    pub hyperunit_proxy_url: Option<ProxyUrl>,
+    pub hyperunit_proxy_url: Option<UpstreamProxy>,
     pub hyperliquid_base_url: Option<String>,
-    pub hyperliquid_proxy_url: Option<ProxyUrl>,
+    pub hyperliquid_proxy_url: Option<UpstreamProxy>,
     pub velora: Option<VeloraHttpProviderConfig>,
     pub hyperliquid_network: HyperliquidCallNetwork,
     pub hyperliquid_order_timeout_ms: u64,
@@ -674,7 +675,7 @@ impl VeloraHttpProviderConfig {
     }
 
     #[must_use]
-    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+    pub fn with_proxy_url(mut self, proxy_url: Option<UpstreamProxy>) -> Self {
         self.proxy_url = proxy_url;
         self
     }
@@ -699,7 +700,7 @@ impl AcrossHttpProviderConfig {
     }
 
     #[must_use]
-    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+    pub fn with_proxy_url(mut self, proxy_url: Option<UpstreamProxy>) -> Self {
         self.proxy_url = proxy_url;
         self
     }
@@ -749,7 +750,7 @@ impl CctpHttpProviderConfig {
     }
 
     #[must_use]
-    pub fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+    pub fn with_proxy_url(mut self, proxy_url: Option<UpstreamProxy>) -> Self {
         self.proxy_url = proxy_url;
         self
     }
@@ -813,15 +814,11 @@ impl ActionProviderRegistry {
         across: Option<AcrossHttpProviderConfig>,
         cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
-        hyperunit_proxy_url: Option<String>,
+        hyperunit_proxy_url: Option<UpstreamProxy>,
         hyperliquid_base_url: Option<String>,
         velora: Option<VeloraHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
-        let hyperunit_proxy_url = hyperunit_proxy_url
-            .map(|proxy_url| ProxyUrl::parse(proxy_url, "HYPERUNIT_PROXY_URL"))
-            .transpose()
-            .map_err(|err| err.to_string())?;
         Self::http_with_options(
             across,
             cctp,
@@ -837,7 +834,7 @@ impl ActionProviderRegistry {
         across: Option<AcrossHttpProviderConfig>,
         cctp: Option<CctpHttpProviderConfig>,
         hyperunit_base_url: Option<String>,
-        hyperunit_proxy_url: Option<ProxyUrl>,
+        hyperunit_proxy_url: Option<UpstreamProxy>,
         hyperliquid_base_url: Option<String>,
         velora: Option<VeloraHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
@@ -1009,7 +1006,7 @@ impl AcrossProvider {
     pub fn new_with_proxy_url(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> Result<Self, String> {
         let base_url = normalize_base_url(base_url)?;
         Ok(Self {
@@ -1669,20 +1666,19 @@ const HYPERLIQUID_CORE_ACTIVATION_FEE_RAW: u64 = 1_000_000;
 impl HyperUnitProvider {
     pub fn new(
         base_url: impl Into<String>,
-        proxy_url: Option<ProxyUrl>,
+        proxy_url: Option<UpstreamProxy>,
         asset_registry: Arc<AssetRegistry>,
         hyperliquid_base_url: impl Into<String>,
         hyperliquid_network: HyperliquidCallNetwork,
-        hyperliquid_proxy_url: Option<&ProxyUrl>,
+        hyperliquid_proxy_url: Option<&UpstreamProxy>,
     ) -> Result<Self, String> {
         let hyperliquid_base_url = normalize_base_url(hyperliquid_base_url)?;
         let hyperliquid_http = HyperliquidHttpClient::new(
             rustls_http_client(hyperliquid_proxy_url)?,
             hyperliquid_base_url.clone(),
         );
-        let client =
-            HyperUnitClient::new_with_proxy_url(base_url, proxy_url.map(ProxyUrl::into_string))
-                .map_err(|err| format!("hyperunit client configuration failed: {err}"))?;
+        let client = HyperUnitClient::new_with_proxy(base_url, proxy_url.as_ref())
+            .map_err(|err| format!("hyperunit client configuration failed: {err}"))?;
         Ok(Self {
             client,
             asset_registry,
@@ -2361,7 +2357,7 @@ impl HyperliquidBridgeProvider {
         base_url: impl Into<String>,
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> Result<Self, String> {
         let target_base_url = normalize_base_url(base_url)?;
         let http =
@@ -2894,7 +2890,7 @@ impl CctpProvider {
         token_messenger_v2_address: impl AsRef<str>,
         message_transmitter_v2_address: impl AsRef<str>,
         asset_registry: Arc<AssetRegistry>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> ProviderResult<Self> {
         Self::new_with_transfer_mode_and_proxy_url(
             base_url,
@@ -2912,7 +2908,7 @@ impl CctpProvider {
         message_transmitter_v2_address: impl AsRef<str>,
         transfer_mode: CctpTransferMode,
         asset_registry: Arc<AssetRegistry>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> ProviderResult<Self> {
         let token_messenger_v2_address = Address::from_str(token_messenger_v2_address.as_ref())
             .map_err(|err| format!("invalid CCTP TokenMessengerV2 address: {err}"))?;
@@ -4099,7 +4095,7 @@ impl HyperliquidProvider {
         network: HyperliquidCallNetwork,
         asset_registry: Arc<AssetRegistry>,
         order_timeout_ms: u64,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> Result<Self, String> {
         let target_base_url = normalize_base_url(base_url)?;
         let http =
@@ -4561,16 +4557,12 @@ impl HyperliquidProvider {
     }
 }
 
-fn rustls_http_client(proxy_url: Option<&ProxyUrl>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+fn rustls_http_client(proxy_url: Option<&UpstreamProxy>) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder()
         .use_rustls_tls()
         .timeout(PROVIDER_HTTP_TIMEOUT);
-    if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy_url.as_str())
-                .map_err(|err| format!("failed to configure SOCKS5 proxy: {err}"))?,
-        );
-    }
+    let builder = apply_reqwest_proxy(builder, proxy_url)
+        .map_err(|err| format!("failed to configure SOCKS5 proxy: {err}"))?;
     builder
         .build()
         .map_err(|err| format!("failed to construct reqwest client: {err}"))
@@ -4619,7 +4611,7 @@ impl VeloraProvider {
     pub fn new_with_proxy_url(
         base_url: impl Into<String>,
         partner: Option<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> Result<Self, String> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
@@ -7542,7 +7534,7 @@ mod hyperliquid_math_tests {
         VeloraHttpProviderConfig, VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
         HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW, VELORA_DEFAULT_SLIPPAGE_BPS,
     };
-    use crate::services::upstream_proxy::ProxyUrl;
+    use crate::services::upstream_proxy::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
     use crate::{
         models::{ProviderOperationStatus, ProviderOperationType, ProviderOrderKind},
         protocol::{AssetId, ChainId, DepositAsset},
@@ -7947,13 +7939,14 @@ mod hyperliquid_math_tests {
                 "https://cctp.example/cctp-path-secret",
             )),
             hyperunit_base_url: Some("https://unit.example/unit-path-secret".to_string()),
-            hyperunit_proxy_url: Some(
+            hyperunit_proxy_url: Some(UpstreamProxy::new(
                 ProxyUrl::parse(
                     "socks5://user:proxy-secret@proxy.example:1080",
                     "HYPERUNIT_PROXY_URL",
                 )
                 .expect("proxy URL"),
-            ),
+                ProxyDnsMode::SystemDefault,
+            )),
             hyperliquid_base_url: Some("https://hyperliquid.example/hyper-path-secret".to_string()),
             hyperliquid_proxy_url: None,
             velora: Some(VeloraHttpProviderConfig::new(

@@ -20,6 +20,7 @@ use hyperunit_client::{
     HyperUnitClient, UnitAsset, UnitChain, UnitGenerateAddressRequest, UnitOperation,
     UnitOperationState, UnitOperationsRequest,
 };
+use proxy_transport::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -277,7 +278,14 @@ fn derive_probe_destination(source_private_key: &str) -> CliResult<PrivateKeySig
 }
 
 fn live_unit_client(base_url: &str, proxy_url: Option<String>) -> CliResult<HyperUnitClient> {
-    HyperUnitClient::new_with_proxy_url(base_url, proxy_url).map_err(|err| err.into())
+    let proxy = proxy_url
+        .as_deref()
+        .map(|value| {
+            ProxyUrl::parse(value, HYPERUNIT_PROXY_URL)
+                .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+        })
+        .transpose()?;
+    HyperUnitClient::new_with_proxy(base_url, proxy.as_ref()).map_err(|err| err.into())
 }
 
 async fn hyperliquid_info(

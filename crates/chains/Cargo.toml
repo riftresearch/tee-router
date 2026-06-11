@@ -34,6 +34,7 @@ sha2 = { workspace = true }
 hkdf = { workspace = true }
 getrandom = { workspace = true }
 reqwest = {workspace=true, features=["socks"]}
+proxy-transport = { workspace = true }
 
 # Metrics
 metrics = { workspace = true }

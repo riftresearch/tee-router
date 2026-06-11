@@ -7,11 +7,12 @@ use crate::{
             VenueAsset, VenueAssetMap, CHAINFLIP_ASSET_MAP_SPEC, GARDEN_ASSET_MAP_SPEC,
             MAYAN_ASSET_MAP_SPEC, NEAR_INTENTS_ASSET_MAP_SPEC, RELAY_ASSET_MAP_SPEC,
         },
-        upstream_proxy::ProxyUrl,
+        upstream_proxy::UpstreamProxy,
     },
     telemetry,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use proxy_transport::apply_reqwest_proxy;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
@@ -99,7 +100,7 @@ impl RelayQuoteProvider {
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> SingleHopQuoteResult<Self> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
@@ -198,7 +199,7 @@ impl NearIntentsQuoteProvider {
         base_url: impl Into<String>,
         api_key: Option<String>,
         bearer_token: Option<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> SingleHopQuoteResult<Self> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
@@ -302,7 +303,7 @@ impl MayanQuoteProvider {
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> SingleHopQuoteResult<Self> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
@@ -420,7 +421,7 @@ pub struct ChainflipQuoteProvider {
 impl ChainflipQuoteProvider {
     pub fn new(
         base_url: impl Into<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> SingleHopQuoteResult<Self> {
         Ok(Self {
             base_url: normalize_base_url(base_url)?,
@@ -525,7 +526,7 @@ impl GardenQuoteProvider {
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
-        proxy_url: Option<&ProxyUrl>,
+        proxy_url: Option<&UpstreamProxy>,
     ) -> SingleHopQuoteResult<Self> {
         let api_key = api_key.into().trim().to_string();
         if api_key.is_empty() {
@@ -708,14 +709,10 @@ fn normalize_base_url(base_url: impl Into<String>) -> Result<String, String> {
     Ok(base_url)
 }
 
-fn rustls_http_client(proxy_url: Option<&ProxyUrl>) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder().use_rustls_tls();
-    if let Some(proxy_url) = proxy_url {
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy_url.as_str())
-                .map_err(|err| format!("failed to configure SOCKS5 proxy: {err}"))?,
-        );
-    }
+fn rustls_http_client(proxy_url: Option<&UpstreamProxy>) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder().use_rustls_tls();
+    let builder = apply_reqwest_proxy(builder, proxy_url)
+        .map_err(|err| format!("failed to configure SOCKS5 proxy: {err}"))?;
     builder
         .build()
         .map_err(|err| format!("failed to construct reqwest client: {err}"))

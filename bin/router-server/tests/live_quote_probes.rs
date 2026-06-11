@@ -15,6 +15,7 @@ use router_core::{
         },
         asset_registry::AssetRegistry,
         custody_action_executor::HyperliquidCallNetwork,
+        upstream_proxy::{ProxyDnsMode, ProxyUrl, UpstreamProxy},
     },
 };
 use router_primitives::ChainType;
@@ -1080,7 +1081,13 @@ fn live_action_provider_registry() -> TestResult<ActionProviderRegistry> {
     .ok_or("missing ROUTER_LIVE_ACROSS_API_URL, ACROSS_API_URL, or ACROSS_LIVE_BASE_URL")?;
     let hyperunit_api_url = env_var_any(&["ROUTER_LIVE_UNIT_API_URL", "HYPERUNIT_API_URL"])
         .ok_or("missing ROUTER_LIVE_UNIT_API_URL or HYPERUNIT_API_URL")?;
-    let hyperunit_proxy_url = env_var_any(&["HYPERUNIT_PROXY_URL"]);
+    let hyperunit_proxy = env_var_any(&["HYPERUNIT_PROXY_URL"])
+        .as_deref()
+        .map(|value| {
+            ProxyUrl::parse(value, "HYPERUNIT_PROXY_URL")
+                .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+        })
+        .transpose()?;
     let hyperliquid_api_url =
         env_var_any(&["ROUTER_LIVE_HYPERLIQUID_API_URL", HYPERLIQUID_API_URL_ENV])
             .ok_or("missing ROUTER_LIVE_HYPERLIQUID_API_URL or HYPERLIQUID_API_URL")?;
@@ -1101,7 +1108,7 @@ fn live_action_provider_registry() -> TestResult<ActionProviderRegistry> {
         ),
         Some(CctpHttpProviderConfig::new(cctp_api_url)),
         Some(hyperunit_api_url),
-        hyperunit_proxy_url,
+        hyperunit_proxy,
         Some(hyperliquid_api_url),
         Some(VeloraHttpProviderConfig::new(velora_api_url).with_partner(velora_partner)),
         HyperliquidCallNetwork::Mainnet,

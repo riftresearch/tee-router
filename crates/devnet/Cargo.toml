@@ -30,6 +30,7 @@ eip7702-delegator-contract = { workspace = true }
 eip7702-paymaster = { workspace = true }
 hyperliquid-client = {workspace=true}
 hyperunit-client = {workspace=true}
+proxy-transport = { workspace = true }
 libc = {workspace=true} 
 utc = {workspace=true}
 eyre = {workspace=true}

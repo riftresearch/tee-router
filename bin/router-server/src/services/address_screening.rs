@@ -1,7 +1,7 @@
 use chainalysis_address_screener::{
     ChainalysisAddressScreener, Error as ChainalysisError, RiskLevel,
 };
-use router_core::protocol::ChainId;
+use router_core::{protocol::ChainId, services::upstream_proxy::UpstreamProxy};
 use snafu::Snafu;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,16 +56,16 @@ impl AddressScreeningService {
         host: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, ChainalysisError> {
-        Self::new_with_proxy_url(host, token, None)
+        Self::new_with_proxy(host, token, None)
     }
 
-    pub fn new_with_proxy_url(
+    pub fn new_with_proxy(
         host: impl Into<String>,
         token: impl Into<String>,
-        proxy_url: Option<&str>,
+        proxy: Option<&UpstreamProxy>,
     ) -> Result<Self, ChainalysisError> {
         Ok(Self {
-            chainalysis: ChainalysisAddressScreener::new_with_proxy_url(host, token, proxy_url)?,
+            chainalysis: ChainalysisAddressScreener::new_with_proxy(host, token, proxy)?,
         })
     }
 

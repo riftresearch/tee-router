@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use proxy_transport::{apply_reqwest_proxy, UpstreamProxy};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -152,16 +153,16 @@ pub struct MarketPricingOracle {
 
 impl MarketPricingOracle {
     pub fn new(config: MarketPricingOracleConfig) -> MarketPricingResult<Self> {
-        Self::new_with_proxy_urls(config, None, None, None, None, None)
+        Self::new_with_proxies(config, None, None, None, None, None)
     }
 
-    pub fn new_with_proxy_urls(
+    pub fn new_with_proxies(
         config: MarketPricingOracleConfig,
-        coinbase_proxy_url: Option<&str>,
-        ethereum_rpc_proxy_url: Option<&str>,
-        arbitrum_rpc_proxy_url: Option<&str>,
-        base_rpc_proxy_url: Option<&str>,
-        hyperliquid_proxy_url: Option<&str>,
+        coinbase_proxy_url: Option<&UpstreamProxy>,
+        ethereum_rpc_proxy_url: Option<&UpstreamProxy>,
+        arbitrum_rpc_proxy_url: Option<&UpstreamProxy>,
+        base_rpc_proxy_url: Option<&UpstreamProxy>,
+        hyperliquid_proxy_url: Option<&UpstreamProxy>,
     ) -> MarketPricingResult<Self> {
         let coinbase_http = pricing_http_client(config.timeout, coinbase_proxy_url)?;
         let ethereum_http = pricing_http_client(config.timeout, ethereum_rpc_proxy_url)?;
@@ -391,56 +392,16 @@ impl MarketPricingOracle {
 
 fn pricing_http_client(
     timeout: Duration,
-    proxy_url: Option<&str>,
+    proxy_url: Option<&UpstreamProxy>,
 ) -> MarketPricingResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent("tee-router-market-pricing/1.0");
-    if let Some(proxy_url) = proxy_url {
-        validate_proxy_url(proxy_url)?;
-        builder = builder.proxy(
-            reqwest::Proxy::all(proxy_url.trim())
-                .map_err(|source| MarketPricingError::Http { source })?,
-        );
-    }
+    let builder = apply_reqwest_proxy(builder, proxy_url)
+        .map_err(|source| MarketPricingError::Http { source })?;
     builder
         .build()
         .map_err(|source| MarketPricingError::Http { source })
-}
-
-fn validate_proxy_url(proxy_url: &str) -> MarketPricingResult<()> {
-    let url = Url::parse(proxy_url.trim()).map_err(|source| MarketPricingError::InvalidUrl {
-        url: sanitize_url_for_error(proxy_url),
-        source,
-    })?;
-    if url.scheme() != "socks5" {
-        return Err(MarketPricingError::InvalidUrlFormat {
-            url: sanitized_parsed_url_for_error(&url),
-            reason: format!("expected socks5 proxy scheme, got {:?}", url.scheme()),
-        });
-    }
-    if url.host_str().is_none() {
-        return Err(MarketPricingError::InvalidUrlFormat {
-            url: sanitized_parsed_url_for_error(&url),
-            reason: "proxy URL must include a host".to_string(),
-        });
-    }
-    if url.port().is_none() {
-        return Err(MarketPricingError::InvalidUrlFormat {
-            url: sanitized_parsed_url_for_error(&url),
-            reason: "proxy URL must include a port".to_string(),
-        });
-    }
-    if (!url.path().is_empty() && url.path() != "/")
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(MarketPricingError::InvalidUrlFormat {
-            url: sanitized_parsed_url_for_error(&url),
-            reason: "proxy URL must not include a path, query string, or fragment".to_string(),
-        });
-    }
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

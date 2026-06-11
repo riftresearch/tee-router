@@ -1,3 +1,4 @@
+use proxy_transport::{apply_reqwest_proxy, UpstreamProxy};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::Snafu;
@@ -32,17 +33,6 @@ pub enum HyperUnitClientError {
     UnsupportedBaseUrl { base_url: String, reason: String },
     #[snafu(display("invalid HyperUnit path segment {field}={value:?}"))]
     InvalidPathSegment { field: &'static str, value: String },
-    #[snafu(display("invalid HyperUnit proxy URL {proxy_url}: {source}"))]
-    InvalidProxyUrl {
-        proxy_url: String,
-        source: url::ParseError,
-    },
-    #[snafu(display(
-        "unsupported HyperUnit proxy scheme {scheme:?} for {proxy_url}; expected socks5"
-    ))]
-    UnsupportedProxyScheme { proxy_url: String, scheme: String },
-    #[snafu(display("unsupported HyperUnit proxy URL {proxy_url}: {reason}"))]
-    UnsupportedProxyUrl { proxy_url: String, reason: String },
     #[snafu(display("failed to configure HyperUnit proxy {proxy_url}: {source}"))]
     ProxyConfiguration {
         proxy_url: String,
@@ -413,17 +403,17 @@ impl fmt::Debug for HyperUnitClient {
 
 impl HyperUnitClient {
     pub fn new(base_url: impl Into<String>) -> HyperUnitResult<Self> {
-        Self::new_with_proxy_url(base_url, None)
+        Self::new_with_proxy(base_url, None)
     }
 
-    pub fn new_with_proxy_url(
+    pub fn new_with_proxy(
         base_url: impl Into<String>,
-        proxy_url: Option<String>,
+        proxy: Option<&UpstreamProxy>,
     ) -> HyperUnitResult<Self> {
         let base_url = normalize_base_url(base_url);
         validate_base_url(&base_url)?;
         let network = GuardianNetwork::from_base_url(&base_url);
-        Self::build_with_network(base_url, proxy_url, network)
+        Self::build_with_network(base_url, proxy, network)
     }
 
     /// Construct a client with an explicit guardian network. Use this when
@@ -441,24 +431,23 @@ impl HyperUnitClient {
 
     fn build_with_network(
         base_url: String,
-        proxy_url: Option<String>,
+        proxy: Option<&UpstreamProxy>,
         network: GuardianNetwork,
     ) -> HyperUnitResult<Self> {
         // Pin this client to Rustls + the vendored Mozilla root set from
         // `webpki-roots` so proxy and direct connections share one
         // deterministic trust boundary instead of inheriting host OS CAs.
-        let mut builder = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .use_rustls_tls()
             .timeout(HYPERUNIT_HTTP_TIMEOUT);
-        if let Some(proxy_url) = normalize_proxy_url(proxy_url)? {
-            let proxy = reqwest::Proxy::all(&proxy_url).map_err(|source| {
-                HyperUnitClientError::ProxyConfiguration {
-                    proxy_url: sanitize_url_for_error(&proxy_url),
-                    source,
-                }
-            })?;
-            builder = builder.proxy(proxy);
-        }
+        let builder = apply_reqwest_proxy(builder, proxy).map_err(|source| {
+            HyperUnitClientError::ProxyConfiguration {
+                proxy_url: proxy
+                    .map(UpstreamProxy::redacted)
+                    .unwrap_or_else(|| "<direct>".to_string()),
+                source,
+            }
+        })?;
         let http = builder
             .build()
             .map_err(|source| HyperUnitClientError::HttpClientBuild { source })?;
@@ -683,48 +672,6 @@ fn redacted_url_for_debug(value: &str) -> String {
         redacted.push_str("#<redacted-fragment>");
     }
     redacted
-}
-
-fn normalize_proxy_url(proxy_url: Option<String>) -> HyperUnitResult<Option<String>> {
-    let Some(proxy_url) = proxy_url else {
-        return Ok(None);
-    };
-    let trimmed = proxy_url.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let parsed = Url::parse(trimmed).map_err(|source| HyperUnitClientError::InvalidProxyUrl {
-        proxy_url: sanitize_url_for_error(trimmed),
-        source,
-    })?;
-    if parsed.scheme() != "socks5" {
-        return Err(HyperUnitClientError::UnsupportedProxyScheme {
-            proxy_url: sanitize_url_for_error(trimmed),
-            scheme: parsed.scheme().to_string(),
-        });
-    }
-    if parsed.host_str().is_none() {
-        return Err(HyperUnitClientError::UnsupportedProxyUrl {
-            proxy_url: sanitize_url_for_error(trimmed),
-            reason: "missing host".to_string(),
-        });
-    }
-    if parsed.port().is_none() {
-        return Err(HyperUnitClientError::UnsupportedProxyUrl {
-            proxy_url: sanitize_url_for_error(trimmed),
-            reason: "missing port".to_string(),
-        });
-    }
-    if (!parsed.path().is_empty() && parsed.path() != "/")
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(HyperUnitClientError::UnsupportedProxyUrl {
-            proxy_url: sanitize_url_for_error(trimmed),
-            reason: "paths, query strings, and fragments are not allowed".to_string(),
-        });
-    }
-    Ok(Some(trimmed.to_string()))
 }
 
 fn build_endpoint(base_url: &str, path: &str) -> HyperUnitResult<Url> {
@@ -1110,11 +1057,13 @@ mod tests {
 
     #[test]
     fn client_with_proxy_normalizes_trailing_slash() {
-        let client = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz///",
-            Some("socks5://127.0.0.1:1080".to_string()),
-        )
-        .expect("proxy client");
+        let proxy = UpstreamProxy::new(
+            proxy_transport::ProxyUrl::parse("socks5://127.0.0.1:1080", "TEST_PROXY_PROFILE")
+                .expect("proxy URL"),
+            proxy_transport::ProxyDnsMode::SystemDefault,
+        );
+        let client = HyperUnitClient::new_with_proxy("https://api.hyperunit.xyz///", Some(&proxy))
+            .expect("proxy client");
         assert_eq!(client.base_url(), "https://api.hyperunit.xyz");
     }
 
@@ -1170,65 +1119,6 @@ mod tests {
             assert!(!rendered.contains("token"));
             assert!(!rendered.contains("secret"));
         }
-    }
-
-    #[test]
-    fn client_with_proxy_rejects_invalid_proxy_url() {
-        let error = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz",
-            Some("not a url".to_string()),
-        )
-        .expect_err("invalid proxy must fail");
-        assert!(matches!(
-            error,
-            HyperUnitClientError::InvalidProxyUrl { .. }
-        ));
-    }
-
-    #[test]
-    fn client_with_proxy_errors_redact_proxy_credentials() {
-        let error = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz",
-            Some("http://user:proxy-secret@127.0.0.1:8080?token=secret".to_string()),
-        )
-        .expect_err("unsupported proxy scheme must fail");
-        let rendered = error.to_string();
-
-        assert!(matches!(
-            error,
-            HyperUnitClientError::UnsupportedProxyScheme { .. }
-        ));
-        assert!(!rendered.contains("user"));
-        assert!(!rendered.contains("proxy-secret"));
-        assert!(!rendered.contains("token"));
-        assert!(!rendered.contains("secret"));
-        assert!(rendered.contains("redacted"));
-    }
-
-    #[test]
-    fn client_with_proxy_rejects_non_socks_schemes() {
-        let error = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz",
-            Some("http://127.0.0.1:8080".to_string()),
-        )
-        .expect_err("non-socks proxy must fail");
-        assert!(matches!(
-            error,
-            HyperUnitClientError::UnsupportedProxyScheme { .. }
-        ));
-    }
-
-    #[test]
-    fn client_with_proxy_rejects_socks5h_scheme() {
-        let error = HyperUnitClient::new_with_proxy_url(
-            "https://api.hyperunit.xyz",
-            Some("socks5h://127.0.0.1:1080".to_string()),
-        )
-        .expect_err("socks5h proxy must fail");
-        assert!(matches!(
-            error,
-            HyperUnitClientError::UnsupportedProxyScheme { .. }
-        ));
     }
 
     #[test]

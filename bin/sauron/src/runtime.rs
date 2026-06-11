@@ -13,6 +13,7 @@ use pgwire_replication::ReplicationEvent;
 use router_core::models::{
     ProviderOperationHintKind, ProviderOperationType, PROVIDER_OPERATION_OBSERVATION_HINT_SOURCE,
 };
+use router_core::services::upstream_proxy::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
 use router_server::api::{ProviderOperationHintRequest, MAX_HINT_IDEMPOTENCY_KEY_LEN};
 use sha2::{Digest, Sha256};
 use snafu::ResultExt;
@@ -479,11 +480,20 @@ fn build_hyperunit_observer_task(
             "HyperUnit observer started without EVM receipt watcher clients; EVM-source deposits and EVM-destination withdrawals will only emit preliminary hints."
         );
     }
-    let unit_client = hyperunit_client::HyperUnitClient::new_with_proxy_url(
-        hyperunit_url,
-        args.hyperunit_proxy_url.clone(),
-    )
-    .map_err(|source| Error::HyperUnit { source })?;
+    let unit_proxy = args
+        .hyperunit_proxy_url
+        .as_deref()
+        .map(|value| {
+            ProxyUrl::parse(value, "HYPERUNIT_PROXY_URL")
+                .map(|url| UpstreamProxy::new(url, ProxyDnsMode::SystemDefault))
+                .map_err(|source| Error::InvalidConfiguration {
+                    message: source.to_string(),
+                })
+        })
+        .transpose()?;
+    let unit_client =
+        hyperunit_client::HyperUnitClient::new_with_proxy(hyperunit_url, unit_proxy.as_ref())
+            .map_err(|source| Error::HyperUnit { source })?;
     let hl_client = HlShimClient::new(hl_url).map_err(|source| Error::HlShim { source })?;
     Ok(Box::pin(run_hyperunit_observer_loop(
         provider_operation_store,

@@ -81,9 +81,41 @@ pub struct RouterServerArgs {
     )]
     pub production: bool,
 
-    /// Global SOCKS5 proxy URL used for upstream services without a specific proxy override
-    #[arg(long, env = "UPSTREAM_PROXY_URL")]
-    pub upstream_proxy_url: Option<String>,
+    /// URL for the ipv4-us-west-1 proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV4_US_WEST_1_URL")]
+    pub proxy_profile_ipv4_us_west_1_url: Option<String>,
+
+    /// DNS mode for the ipv4-us-west-1 proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV4_US_WEST_1_DNS_MODE",
+        default_value = "system-default"
+    )]
+    pub proxy_profile_ipv4_us_west_1_dns_mode: String,
+
+    /// URL for the ipv6-us-west-1 proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV6_US_WEST_1_URL")]
+    pub proxy_profile_ipv6_us_west_1_url: Option<String>,
+
+    /// DNS mode for the ipv6-us-west-1 proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV6_US_WEST_1_DNS_MODE",
+        default_value = "local-ipv6-only"
+    )]
+    pub proxy_profile_ipv6_us_west_1_dns_mode: String,
+
+    /// URL for the ipv4-eu proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV4_EU_URL")]
+    pub proxy_profile_ipv4_eu_url: Option<String>,
+
+    /// DNS mode for the ipv4-eu proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV4_EU_DNS_MODE",
+        default_value = "system-default"
+    )]
+    pub proxy_profile_ipv4_eu_dns_mode: String,
 
     /// File path to the router master key hex file
     #[arg(long, env = "ROUTER_MASTER_KEY_PATH")]
@@ -93,9 +125,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ETH_RPC_URL")]
     pub ethereum_mainnet_rpc_url: String,
 
-    /// Optional Ethereum Mainnet RPC SOCKS5 proxy URL
-    #[arg(long, env = "ETH_RPC_PROXY_URL")]
-    pub ethereum_mainnet_rpc_proxy_url: Option<String>,
+    /// Ethereum Mainnet RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ETH_RPC_PROXY_PROFILE")]
+    pub ethereum_mainnet_rpc_proxy_profile: Option<String>,
 
     /// Flashbots Ethereum RPC URL used for FlashbotsIfEthereum broadcasts
     #[arg(long, env = "FLASHBOTS_RPC_URL")]
@@ -109,9 +141,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
 
-    /// Optional Base RPC SOCKS5 proxy URL
-    #[arg(long, env = "BASE_RPC_PROXY_URL")]
-    pub base_rpc_proxy_url: Option<String>,
+    /// Base RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "BASE_RPC_PROXY_PROFILE")]
+    pub base_rpc_proxy_profile: Option<String>,
 
     /// Base paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "BASE_PAYMASTER_PRIVATE_KEY")]
@@ -121,9 +153,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     pub arbitrum_rpc_url: String,
 
-    /// Optional Arbitrum RPC SOCKS5 proxy URL
-    #[arg(long, env = "ARBITRUM_RPC_PROXY_URL")]
-    pub arbitrum_rpc_proxy_url: Option<String>,
+    /// Arbitrum RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ARBITRUM_RPC_PROXY_PROFILE")]
+    pub arbitrum_rpc_proxy_profile: Option<String>,
 
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
@@ -133,9 +165,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
 
-    /// Optional Bitcoin RPC SOCKS5 proxy URL
-    #[arg(long, env = "BITCOIN_RPC_PROXY_URL")]
-    pub bitcoin_rpc_proxy_url: Option<String>,
+    /// Bitcoin RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "BITCOIN_RPC_PROXY_PROFILE")]
+    pub bitcoin_rpc_proxy_profile: Option<String>,
 
     /// Bitcoin RPC Auth
     #[arg(long, env = "BITCOIN_RPC_AUTH", default_value = "none", value_parser = parse_auth)]
@@ -145,9 +177,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ESPLORA_HTTP_SERVER_URL")]
     pub untrusted_esplora_http_server_url: String,
 
-    /// Optional Esplora SOCKS5 proxy URL
-    #[arg(long, env = "ESPLORA_PROXY_URL")]
-    pub esplora_proxy_url: Option<String>,
+    /// Esplora proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ESPLORA_PROXY_PROFILE")]
+    pub esplora_proxy_profile: Option<String>,
 
     /// Bitcoin Network
     #[arg(long, env = "BITCOIN_NETWORK", default_value = "bitcoin")]
@@ -161,9 +193,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "CHAINALYSIS_TOKEN")]
     pub chainalysis_token: Option<String>,
 
-    /// Optional Chainalysis SOCKS5 proxy URL
-    #[arg(long, env = "CHAINALYSIS_PROXY_URL")]
-    pub chainalysis_proxy_url: Option<String>,
+    /// Chainalysis proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "CHAINALYSIS_PROXY_PROFILE")]
+    pub chainalysis_proxy_profile: Option<String>,
 
     /// Loki logging URL (if provided, logs will be shipped to Loki)
     #[arg(long, env = "LOKI_URL")]
@@ -177,9 +209,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "ACROSS_API_KEY")]
     pub across_api_key: Option<String>,
 
-    /// Optional Across SOCKS5 proxy URL
-    #[arg(long, env = "ACROSS_PROXY_URL")]
-    pub across_proxy_url: Option<String>,
+    /// Across proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ACROSS_PROXY_PROFILE")]
+    pub across_proxy_profile: Option<String>,
 
     /// Across integrator id sent on swap approval requests
     #[arg(long, env = "ACROSS_INTEGRATOR_ID")]
@@ -189,9 +221,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "CCTP_API_URL")]
     pub cctp_api_url: Option<String>,
 
-    /// Optional CCTP SOCKS5 proxy URL
-    #[arg(long, env = "CCTP_PROXY_URL")]
-    pub cctp_proxy_url: Option<String>,
+    /// CCTP proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "CCTP_PROXY_PROFILE")]
+    pub cctp_proxy_profile: Option<String>,
 
     /// CCTP TokenMessengerV2 contract address override
     #[arg(long, env = "CCTP_TOKEN_MESSENGER_V2_ADDRESS")]
@@ -208,25 +240,25 @@ pub struct RouterServerArgs {
     #[arg(long, env = "HYPERUNIT_API_URL")]
     pub hyperunit_api_url: Option<String>,
 
-    /// Optional HyperUnit SOCKS5 proxy URL
-    #[arg(long, env = "HYPERUNIT_PROXY_URL")]
-    pub hyperunit_proxy_url: Option<String>,
+    /// HyperUnit proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "HYPERUNIT_PROXY_PROFILE")]
+    pub hyperunit_proxy_profile: Option<String>,
 
     /// Hyperliquid API base URL
     #[arg(long, env = "HYPERLIQUID_API_URL")]
     pub hyperliquid_api_url: Option<String>,
 
-    /// Optional Hyperliquid SOCKS5 proxy URL
-    #[arg(long, env = "HYPERLIQUID_PROXY_URL")]
-    pub hyperliquid_proxy_url: Option<String>,
+    /// Hyperliquid proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "HYPERLIQUID_PROXY_PROFILE")]
+    pub hyperliquid_proxy_profile: Option<String>,
 
     /// Velora/ParaSwap Market API base URL
     #[arg(long, env = "VELORA_API_URL")]
     pub velora_api_url: Option<String>,
 
-    /// Optional Velora SOCKS5 proxy URL
-    #[arg(long, env = "VELORA_PROXY_URL")]
-    pub velora_proxy_url: Option<String>,
+    /// Velora proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "VELORA_PROXY_PROFILE")]
+    pub velora_proxy_profile: Option<String>,
 
     /// Partner string sent to Velora for route analytics
     #[arg(long, env = "VELORA_PARTNER")]
@@ -240,9 +272,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "RELAY_API_KEY")]
     pub relay_api_key: Option<String>,
 
-    /// Optional Relay SOCKS5 proxy URL
-    #[arg(long, env = "RELAY_PROXY_URL")]
-    pub relay_proxy_url: Option<String>,
+    /// Relay proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "RELAY_PROXY_PROFILE")]
+    pub relay_proxy_profile: Option<String>,
 
     /// NEAR Intents 1Click API base URL
     #[arg(long, env = "NEAR_INTENTS_API_URL")]
@@ -256,9 +288,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "NEAR_INTENTS_BEARER_TOKEN")]
     pub near_intents_bearer_token: Option<String>,
 
-    /// Optional NEAR Intents SOCKS5 proxy URL
-    #[arg(long, env = "NEAR_INTENTS_PROXY_URL")]
-    pub near_intents_proxy_url: Option<String>,
+    /// NEAR Intents proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "NEAR_INTENTS_PROXY_PROFILE")]
+    pub near_intents_proxy_profile: Option<String>,
 
     /// Mayan quote API base URL
     #[arg(long, env = "MAYAN_API_URL")]
@@ -268,17 +300,17 @@ pub struct RouterServerArgs {
     #[arg(long, env = "MAYAN_API_KEY")]
     pub mayan_api_key: Option<String>,
 
-    /// Optional Mayan SOCKS5 proxy URL
-    #[arg(long, env = "MAYAN_PROXY_URL")]
-    pub mayan_proxy_url: Option<String>,
+    /// Mayan proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "MAYAN_PROXY_PROFILE")]
+    pub mayan_proxy_profile: Option<String>,
 
     /// Chainflip swap API base URL
     #[arg(long, env = "CHAINFLIP_API_URL")]
     pub chainflip_api_url: Option<String>,
 
-    /// Optional Chainflip SOCKS5 proxy URL
-    #[arg(long, env = "CHAINFLIP_PROXY_URL")]
-    pub chainflip_proxy_url: Option<String>,
+    /// Chainflip proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "CHAINFLIP_PROXY_PROFILE")]
+    pub chainflip_proxy_profile: Option<String>,
 
     /// Garden quote API base URL
     #[arg(long, env = "GARDEN_API_URL")]
@@ -288,9 +320,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "GARDEN_API_KEY")]
     pub garden_api_key: Option<String>,
 
-    /// Optional Garden SOCKS5 proxy URL
-    #[arg(long, env = "GARDEN_PROXY_URL")]
-    pub garden_proxy_url: Option<String>,
+    /// Garden proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "GARDEN_PROXY_PROFILE")]
+    pub garden_proxy_profile: Option<String>,
 
     /// Hyperliquid paymaster private key used as the recovery/sweep destination
     /// for released internal Hyperliquid custody
@@ -463,9 +495,9 @@ pub struct RouterServerArgs {
     #[arg(long, env = "COINBASE_PRICE_API_BASE_URL")]
     pub coinbase_price_api_base_url: Option<String>,
 
-    /// Optional Coinbase SOCKS5 proxy URL
-    #[arg(long, env = "COINBASE_PROXY_URL")]
-    pub coinbase_proxy_url: Option<String>,
+    /// Coinbase proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "COINBASE_PROXY_PROFILE")]
+    pub coinbase_proxy_profile: Option<String>,
 }
 
 impl RouterServerArgs {

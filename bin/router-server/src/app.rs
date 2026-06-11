@@ -30,7 +30,8 @@ use router_core::{
             SingleHopVenueRegistry,
         },
         upstream_proxy::{
-            effective_proxy, normalize_optional_string as normalize_proxy_string, ProxyUrl,
+            normalize_optional_string as normalize_proxy_string, ProxyProfileCatalog, ProxyTarget,
+            ResolvedProxies,
         },
     },
 };
@@ -165,123 +166,70 @@ pub async fn initialize_components_with_action_providers(
     })
 }
 
-#[derive(Debug, Clone, Default)]
-struct ResolvedUpstreamProxies {
-    across: Option<ProxyUrl>,
-    cctp: Option<ProxyUrl>,
-    hyperunit: Option<ProxyUrl>,
-    hyperliquid: Option<ProxyUrl>,
-    velora: Option<ProxyUrl>,
-    relay: Option<ProxyUrl>,
-    near_intents: Option<ProxyUrl>,
-    mayan: Option<ProxyUrl>,
-    chainflip: Option<ProxyUrl>,
-    garden: Option<ProxyUrl>,
-    chainalysis: Option<ProxyUrl>,
-    coinbase: Option<ProxyUrl>,
-    ethereum_rpc: Option<ProxyUrl>,
-    base_rpc: Option<ProxyUrl>,
-    arbitrum_rpc: Option<ProxyUrl>,
-
-    bitcoin_rpc: Option<ProxyUrl>,
-    esplora: Option<ProxyUrl>,
+fn proxy_profile_catalog(args: &RouterServerArgs) -> Result<ProxyProfileCatalog> {
+    ProxyProfileCatalog::new(
+        args.proxy_profile_ipv4_us_west_1_url.as_deref(),
+        &args.proxy_profile_ipv4_us_west_1_dns_mode,
+        args.proxy_profile_ipv6_us_west_1_url.as_deref(),
+        &args.proxy_profile_ipv6_us_west_1_dns_mode,
+        args.proxy_profile_ipv4_eu_url.as_deref(),
+        &args.proxy_profile_ipv4_eu_dns_mode,
+    )
+    .map_err(invalid_proxy_config)
 }
 
-fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedUpstreamProxies> {
-    let upstream = args.upstream_proxy_url.as_deref();
-    Ok(ResolvedUpstreamProxies {
-        across: effective_proxy(
-            args.across_proxy_url.as_deref(),
-            "ACROSS_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        cctp: effective_proxy(args.cctp_proxy_url.as_deref(), "CCTP_PROXY_URL", upstream)
-            .map_err(invalid_proxy_config)?,
-        hyperunit: effective_proxy(
-            args.hyperunit_proxy_url.as_deref(),
-            "HYPERUNIT_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        hyperliquid: effective_proxy(
-            args.hyperliquid_proxy_url.as_deref(),
-            "HYPERLIQUID_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        velora: effective_proxy(
-            args.velora_proxy_url.as_deref(),
-            "VELORA_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        relay: effective_proxy(args.relay_proxy_url.as_deref(), "RELAY_PROXY_URL", upstream)
-            .map_err(invalid_proxy_config)?,
-        near_intents: effective_proxy(
-            args.near_intents_proxy_url.as_deref(),
-            "NEAR_INTENTS_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        mayan: effective_proxy(args.mayan_proxy_url.as_deref(), "MAYAN_PROXY_URL", upstream)
-            .map_err(invalid_proxy_config)?,
-        chainflip: effective_proxy(
-            args.chainflip_proxy_url.as_deref(),
-            "CHAINFLIP_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        garden: effective_proxy(
-            args.garden_proxy_url.as_deref(),
-            "GARDEN_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        chainalysis: effective_proxy(
-            args.chainalysis_proxy_url.as_deref(),
-            "CHAINALYSIS_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        coinbase: effective_proxy(
-            args.coinbase_proxy_url.as_deref(),
-            "COINBASE_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        ethereum_rpc: effective_proxy(
-            args.ethereum_mainnet_rpc_proxy_url.as_deref(),
-            "ETH_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        base_rpc: effective_proxy(
-            args.base_rpc_proxy_url.as_deref(),
-            "BASE_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        arbitrum_rpc: effective_proxy(
-            args.arbitrum_rpc_proxy_url.as_deref(),
-            "ARBITRUM_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-
-        bitcoin_rpc: effective_proxy(
-            args.bitcoin_rpc_proxy_url.as_deref(),
-            "BITCOIN_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-        esplora: effective_proxy(
-            args.esplora_proxy_url.as_deref(),
-            "ESPLORA_PROXY_URL",
-            upstream,
-        )
-        .map_err(invalid_proxy_config)?,
-    })
+fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedProxies> {
+    let catalog = proxy_profile_catalog(args)?;
+    ResolvedProxies::resolve(
+        &catalog,
+        [
+            (ProxyTarget::Across, args.across_proxy_profile.as_deref()),
+            (ProxyTarget::Cctp, args.cctp_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Hyperunit,
+                args.hyperunit_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::Hyperliquid,
+                args.hyperliquid_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Velora, args.velora_proxy_profile.as_deref()),
+            (ProxyTarget::Relay, args.relay_proxy_profile.as_deref()),
+            (
+                ProxyTarget::NearIntents,
+                args.near_intents_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Mayan, args.mayan_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Chainflip,
+                args.chainflip_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Garden, args.garden_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Chainalysis,
+                args.chainalysis_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::Coinbase,
+                args.coinbase_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::EthereumRpc,
+                args.ethereum_mainnet_rpc_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::BaseRpc, args.base_rpc_proxy_profile.as_deref()),
+            (
+                ProxyTarget::ArbitrumRpc,
+                args.arbitrum_rpc_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::BitcoinRpc,
+                args.bitcoin_rpc_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Esplora, args.esplora_proxy_profile.as_deref()),
+        ],
+    )
+    .map_err(invalid_proxy_config)
 }
 
 fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
@@ -472,114 +420,36 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             args.flashbots_rpc_url.as_deref(),
         );
 
-        require_proxy(
-            &mut errors,
-            "ETH_RPC_URL",
-            "ETH_RPC_PROXY_URL",
-            &proxies.ethereum_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "BASE_RPC_URL",
-            "BASE_RPC_PROXY_URL",
-            &proxies.base_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "ARBITRUM_RPC_URL",
-            "ARBITRUM_RPC_PROXY_URL",
-            &proxies.arbitrum_rpc,
-        );
+        let mut required_proxies = vec![
+            ProxyTarget::EthereumRpc,
+            ProxyTarget::BaseRpc,
+            ProxyTarget::ArbitrumRpc,
+            ProxyTarget::BitcoinRpc,
+            ProxyTarget::Esplora,
+            ProxyTarget::Across,
+            ProxyTarget::Cctp,
+            ProxyTarget::Hyperunit,
+            ProxyTarget::Hyperliquid,
+            ProxyTarget::Velora,
+            ProxyTarget::Chainalysis,
+            ProxyTarget::Coinbase,
+        ];
         if args.relay_api_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "RELAY_API_URL",
-                "RELAY_PROXY_URL",
-                &proxies.relay,
-            );
+            required_proxies.push(ProxyTarget::Relay);
         }
         if args.near_intents_api_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "NEAR_INTENTS_API_URL",
-                "NEAR_INTENTS_PROXY_URL",
-                &proxies.near_intents,
-            );
+            required_proxies.push(ProxyTarget::NearIntents);
         }
         if args.mayan_api_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "MAYAN_API_URL",
-                "MAYAN_PROXY_URL",
-                &proxies.mayan,
-            );
+            required_proxies.push(ProxyTarget::Mayan);
         }
         if args.chainflip_api_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "CHAINFLIP_API_URL",
-                "CHAINFLIP_PROXY_URL",
-                &proxies.chainflip,
-            );
+            required_proxies.push(ProxyTarget::Chainflip);
         }
         if args.garden_api_url.is_some() {
-            require_proxy(
-                &mut errors,
-                "GARDEN_API_URL",
-                "GARDEN_PROXY_URL",
-                &proxies.garden,
-            );
+            required_proxies.push(ProxyTarget::Garden);
         }
-
-        require_proxy(
-            &mut errors,
-            "BITCOIN_RPC_URL",
-            "BITCOIN_RPC_PROXY_URL",
-            &proxies.bitcoin_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "ESPLORA_HTTP_SERVER_URL",
-            "ESPLORA_PROXY_URL",
-            &proxies.esplora,
-        );
-        require_proxy(
-            &mut errors,
-            "ACROSS_API_URL",
-            "ACROSS_PROXY_URL",
-            &proxies.across,
-        );
-        require_proxy(&mut errors, "CCTP_API_URL", "CCTP_PROXY_URL", &proxies.cctp);
-        require_proxy(
-            &mut errors,
-            "HYPERUNIT_API_URL",
-            "HYPERUNIT_PROXY_URL",
-            &proxies.hyperunit,
-        );
-        require_proxy(
-            &mut errors,
-            "HYPERLIQUID_API_URL",
-            "HYPERLIQUID_PROXY_URL",
-            &proxies.hyperliquid,
-        );
-        require_proxy(
-            &mut errors,
-            "VELORA_API_URL",
-            "VELORA_PROXY_URL",
-            &proxies.velora,
-        );
-        require_proxy(
-            &mut errors,
-            "CHAINALYSIS_HOST",
-            "CHAINALYSIS_PROXY_URL",
-            &proxies.chainalysis,
-        );
-        require_proxy(
-            &mut errors,
-            "COINBASE_PRICE_API_BASE_URL",
-            "COINBASE_PROXY_URL",
-            &proxies.coinbase,
-        );
+        proxies.require(&mut errors, required_proxies);
     }
 
     if errors.is_empty() {
@@ -612,19 +482,6 @@ fn require_present(errors: &mut Vec<String>, env_name: &str, name: &str, value: 
     }
 }
 
-fn require_proxy(
-    errors: &mut Vec<String>,
-    upstream_env_name: &str,
-    proxy_env_name: &str,
-    proxy_url: &Option<ProxyUrl>,
-) {
-    if proxy_url.is_none() {
-        errors.push(format!(
-            "{proxy_env_name} or UPSTREAM_PROXY_URL is required for {upstream_env_name}"
-        ));
-    }
-}
-
 fn initialize_provider_health_poller(
     args: &RouterServerArgs,
     provider_health: Arc<ProviderHealthService>,
@@ -651,7 +508,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
             synthetic_provider_status_url(&base_url),
         )
         .with_bearer_token(required_across_api_key(args.across_api_key.as_deref())?)
-        .with_proxy_url(proxy_string(proxies.across.as_ref()));
+        .with_proxy(proxies.proxy_owned(ProxyTarget::Across));
         probes.push(probe);
     }
 
@@ -663,7 +520,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
                 ProviderId::Cctp.as_str(),
                 synthetic_provider_status_url(&cctp_base_url),
             )
-            .with_proxy_url(proxy_string(proxies.cctp.as_ref())),
+            .with_proxy(proxies.proxy_owned(ProxyTarget::Cctp)),
         );
     }
 
@@ -675,7 +532,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
                 ProviderId::Unit.as_str(),
                 synthetic_provider_status_url(&base_url),
             )
-            .with_proxy_url(proxy_string(proxies.hyperunit.as_ref())),
+            .with_proxy(proxies.proxy_owned(ProxyTarget::Hyperunit)),
         );
     }
 
@@ -687,14 +544,14 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
                 ProviderId::HyperliquidSpot.as_str(),
                 synthetic_provider_status_url(&base_url),
             )
-            .with_proxy_url(proxy_string(proxies.hyperliquid.as_ref())),
+            .with_proxy(proxies.proxy_owned(ProxyTarget::Hyperliquid)),
         );
         probes.push(
             ProviderHealthProbe::get(
                 ProviderId::HyperliquidBridge.as_str(),
                 synthetic_provider_status_url(&base_url),
             )
-            .with_proxy_url(proxy_string(proxies.hyperliquid.as_ref())),
+            .with_proxy(proxies.proxy_owned(ProxyTarget::Hyperliquid)),
         );
     }
 
@@ -706,7 +563,7 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
                 ProviderId::Velora.as_str(),
                 synthetic_provider_status_url(&base_url),
             )
-            .with_proxy_url(proxy_string(proxies.velora.as_ref())),
+            .with_proxy(proxies.proxy_owned(ProxyTarget::Velora)),
         );
     }
 
@@ -715,10 +572,6 @@ fn provider_health_probes(args: &RouterServerArgs) -> Result<Vec<ProviderHealthP
 
 fn synthetic_provider_status_url(base_url: &str) -> String {
     format!("{base_url}/status")
-}
-
-fn proxy_string(proxy_url: Option<&ProxyUrl>) -> Option<String> {
-    proxy_url.map(|proxy_url| proxy_url.as_str().to_string())
 }
 
 fn initialize_route_costs(
@@ -748,13 +601,13 @@ fn initialize_route_costs(
         },
     })?;
     let pricing_oracle = Arc::new(
-        MarketPricingOracle::new_with_proxy_urls(
+        MarketPricingOracle::new_with_proxies(
             oracle_config,
-            proxies.coinbase.as_ref().map(ProxyUrl::as_str),
-            proxies.ethereum_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.hyperliquid.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::Coinbase),
+            proxies.proxy_ref(ProxyTarget::EthereumRpc),
+            proxies.proxy_ref(ProxyTarget::ArbitrumRpc),
+            proxies.proxy_ref(ProxyTarget::BaseRpc),
+            proxies.proxy_ref(ProxyTarget::Hyperliquid),
         )
         .map_err(|err| crate::Error::DatabaseInit {
             source: RouterServerError::InvalidData {
@@ -774,12 +627,12 @@ async fn initialize_chain_registry(
     let flashbots_rpc_url =
         normalize_optional_url(args.flashbots_rpc_url.as_deref(), "Flashbots RPC URL")?;
 
-    let bitcoin_chain = BitcoinChain::new_with_proxy_urls(
+    let bitcoin_chain = BitcoinChain::new_with_proxies(
         &args.bitcoin_rpc_url,
         args.bitcoin_rpc_auth.clone(),
-        proxies.bitcoin_rpc.as_ref().map(ProxyUrl::as_str),
+        proxies.proxy_ref(ProxyTarget::BitcoinRpc),
         &args.untrusted_esplora_http_server_url,
-        proxies.esplora.as_ref().map(ProxyUrl::as_str),
+        proxies.proxy_ref(ProxyTarget::Esplora),
         args.bitcoin_network,
     )
     .map_err(|err| crate::Error::DatabaseInit {
@@ -790,14 +643,14 @@ async fn initialize_chain_registry(
     chain_registry.register_bitcoin(ChainType::Bitcoin, Arc::new(bitcoin_chain));
 
     let ethereum_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.ethereum_mainnet_rpc_url,
             ChainType::Ethereum,
             b"router-ethereum-wallet",
             4,
             Duration::from_secs(12),
             gas_sponsor_config(args.ethereum_paymaster_private_key.as_ref(), paymaster_mode),
-            proxies.ethereum_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::EthereumRpc),
             flashbots_rpc_url.as_deref(),
         )
         .await
@@ -810,14 +663,14 @@ async fn initialize_chain_registry(
     chain_registry.register_evm(ChainType::Ethereum, ethereum_chain);
 
     let base_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.base_rpc_url,
             ChainType::Base,
             b"router-base-wallet",
             2,
             Duration::from_secs(2),
             gas_sponsor_config(args.base_paymaster_private_key.as_ref(), paymaster_mode),
-            proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::BaseRpc),
             None,
         )
         .await
@@ -830,14 +683,14 @@ async fn initialize_chain_registry(
     chain_registry.register_evm(ChainType::Base, base_chain);
 
     let arbitrum_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.arbitrum_rpc_url,
             ChainType::Arbitrum,
             b"router-arbitrum-wallet",
             2,
             Duration::from_secs(2),
             gas_sponsor_config(args.arbitrum_paymaster_private_key.as_ref(), paymaster_mode),
-            proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::ArbitrumRpc),
             None,
         )
         .await
@@ -869,7 +722,7 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
             RelayQuoteProvider::new(
                 base_url,
                 normalize_proxy_string(args.relay_api_key.as_deref()),
-                proxies.relay.as_ref(),
+                proxies.proxy_ref(ProxyTarget::Relay),
             )
             .map_err(invalid_config)?,
         ));
@@ -883,7 +736,7 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
                 base_url,
                 normalize_proxy_string(args.near_intents_api_key.as_deref()),
                 normalize_proxy_string(args.near_intents_bearer_token.as_deref()),
-                proxies.near_intents.as_ref(),
+                proxies.proxy_ref(ProxyTarget::NearIntents),
             )
             .map_err(invalid_config)?,
         ));
@@ -895,7 +748,7 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
             MayanQuoteProvider::new(
                 base_url,
                 normalize_proxy_string(args.mayan_api_key.as_deref()),
-                proxies.mayan.as_ref(),
+                proxies.proxy_ref(ProxyTarget::Mayan),
             )
             .map_err(invalid_config)?,
         ));
@@ -905,7 +758,7 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
         normalize_optional_url(args.chainflip_api_url.as_deref(), "Chainflip API URL")?
     {
         providers.push(Arc::new(
-            ChainflipQuoteProvider::new(base_url, proxies.chainflip.as_ref())
+            ChainflipQuoteProvider::new(base_url, proxies.proxy_ref(ProxyTarget::Chainflip))
                 .map_err(invalid_config)?,
         ));
     }
@@ -917,7 +770,7 @@ fn initialize_single_hop_venues(args: &RouterServerArgs) -> Result<SingleHopVenu
             invalid_config("GARDEN_API_KEY is required when GARDEN_API_URL is configured")
         })?;
         providers.push(Arc::new(
-            GardenQuoteProvider::new(base_url, api_key, proxies.garden.as_ref())
+            GardenQuoteProvider::new(base_url, api_key, proxies.proxy_ref(ProxyTarget::Garden))
                 .map_err(invalid_config)?,
         ));
     }
@@ -934,7 +787,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
                 required_across_api_key(args.across_api_key.as_deref())?,
             )
             .with_integrator_id(args.across_integrator_id.clone())
-            .with_proxy_url(proxies.across.clone()),
+            .with_proxy_url(proxies.proxy_owned(ProxyTarget::Across)),
         )
     } else {
         None
@@ -943,7 +796,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
         normalize_optional_url(args.velora_api_url.as_deref(), "Velora API URL")?.map(|base_url| {
             VeloraHttpProviderConfig::new(base_url)
                 .with_partner(normalize_optional_string(args.velora_partner.as_deref()))
-                .with_proxy_url(proxies.velora.clone())
+                .with_proxy_url(proxies.proxy_owned(ProxyTarget::Velora))
         });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
@@ -955,7 +808,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
                 normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
             )
             .with_transfer_mode(cctp_transfer_mode)
-            .with_proxy_url(proxies.cctp.clone()),
+            .with_proxy_url(proxies.proxy_owned(ProxyTarget::Cctp)),
     );
 
     let registry = ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
@@ -965,12 +818,12 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
             args.hyperunit_api_url.as_deref(),
             "HyperUnit API URL",
         )?,
-        hyperunit_proxy_url: proxies.hyperunit.clone(),
+        hyperunit_proxy_url: proxies.proxy_owned(ProxyTarget::Hyperunit),
         hyperliquid_base_url: normalize_optional_url(
             args.hyperliquid_api_url.as_deref(),
             "Hyperliquid API URL",
         )?,
-        hyperliquid_proxy_url: proxies.hyperliquid.clone(),
+        hyperliquid_proxy_url: proxies.proxy_owned(ProxyTarget::Hyperliquid),
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -1060,10 +913,10 @@ fn initialize_address_screener(
     let token = normalize_optional_string(args.chainalysis_token.as_deref());
 
     match (host, token) {
-        (Some(host), Some(token)) => AddressScreeningService::new_with_proxy_url(
+        (Some(host), Some(token)) => AddressScreeningService::new_with_proxy(
             host,
             token,
-            proxies.chainalysis.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::Chainalysis),
         )
         .map(Arc::new)
         .map(Some)
@@ -1133,6 +986,7 @@ fn gas_sponsor_config(
 mod tests {
     use super::*;
     use bitcoincore_rpc_async::Auth;
+    use router_core::services::upstream_proxy::{ProxyDnsMode, ProxyProfile};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn base_args() -> RouterServerArgs {
@@ -1145,60 +999,65 @@ mod tests {
             db_min_connections: 4,
             log_level: "info".to_string(),
             production: false,
-            upstream_proxy_url: None,
+            proxy_profile_ipv4_us_west_1_url: None,
+            proxy_profile_ipv4_us_west_1_dns_mode: "system-default".to_string(),
+            proxy_profile_ipv6_us_west_1_url: None,
+            proxy_profile_ipv6_us_west_1_dns_mode: "local-ipv6-only".to_string(),
+            proxy_profile_ipv4_eu_url: None,
+            proxy_profile_ipv4_eu_dns_mode: "system-default".to_string(),
             master_key_path: "/tmp/router-server-master-key.hex".to_string(),
             ethereum_mainnet_rpc_url: "https://eth.example".to_string(),
-            ethereum_mainnet_rpc_proxy_url: None,
+            ethereum_mainnet_rpc_proxy_profile: None,
             flashbots_rpc_url: None,
             ethereum_paymaster_private_key: None,
             base_rpc_url: "https://base.example".to_string(),
-            base_rpc_proxy_url: None,
+            base_rpc_proxy_profile: None,
             base_paymaster_private_key: None,
             arbitrum_rpc_url: "https://arb.example".to_string(),
-            arbitrum_rpc_proxy_url: None,
+            arbitrum_rpc_proxy_profile: None,
             arbitrum_paymaster_private_key: None,
             bitcoin_rpc_url: "http://btc.example".to_string(),
-            bitcoin_rpc_proxy_url: None,
+            bitcoin_rpc_proxy_profile: None,
             bitcoin_rpc_auth: Auth::None,
             untrusted_esplora_http_server_url: "https://esplora.example".to_string(),
-            esplora_proxy_url: None,
+            esplora_proxy_profile: None,
             bitcoin_network: bitcoin::Network::Bitcoin,
             cors_domain: None,
             chainalysis_host: None,
             chainalysis_token: None,
-            chainalysis_proxy_url: None,
+            chainalysis_proxy_profile: None,
             loki_url: None,
             across_api_url: None,
             across_api_key: None,
-            across_proxy_url: None,
+            across_proxy_profile: None,
             across_integrator_id: None,
             cctp_api_url: None,
-            cctp_proxy_url: None,
+            cctp_proxy_profile: None,
             cctp_token_messenger_v2_address: None,
             cctp_message_transmitter_v2_address: None,
             cctp_transfer_mode: None,
             hyperunit_api_url: None,
-            hyperunit_proxy_url: None,
+            hyperunit_proxy_profile: None,
             hyperliquid_api_url: None,
-            hyperliquid_proxy_url: None,
+            hyperliquid_proxy_profile: None,
             velora_api_url: None,
-            velora_proxy_url: None,
+            velora_proxy_profile: None,
             velora_partner: None,
             relay_api_url: None,
             relay_api_key: None,
-            relay_proxy_url: None,
+            relay_proxy_profile: None,
             near_intents_api_url: None,
             near_intents_api_key: None,
             near_intents_bearer_token: None,
-            near_intents_proxy_url: None,
+            near_intents_proxy_profile: None,
             mayan_api_url: None,
             mayan_api_key: None,
-            mayan_proxy_url: None,
+            mayan_proxy_profile: None,
             chainflip_api_url: None,
-            chainflip_proxy_url: None,
+            chainflip_proxy_profile: None,
             garden_api_url: None,
             garden_api_key: None,
-            garden_proxy_url: None,
+            garden_proxy_profile: None,
             hyperliquid_paymaster_private_key: None,
             temporal_address: "http://127.0.0.1:7233".to_string(),
             temporal_namespace: "default".to_string(),
@@ -1224,7 +1083,7 @@ mod tests {
             worker_order_execution_concurrency: 64,
             worker_vault_funding_hint_pass_limit: 100,
             coinbase_price_api_base_url: None,
-            coinbase_proxy_url: None,
+            coinbase_proxy_profile: None,
         }
     }
 
@@ -1240,6 +1099,20 @@ mod tests {
         args.chainalysis_token = Some("chainalysis-token".to_string());
         args.coinbase_price_api_base_url = Some("https://coinbase.example".to_string());
         args.flashbots_rpc_url = Some("https://flashbots.example".to_string());
+    }
+    fn configure_required_proxy_profiles(args: &mut RouterServerArgs, profile: &str) {
+        args.ethereum_mainnet_rpc_proxy_profile = Some(profile.to_string());
+        args.base_rpc_proxy_profile = Some(profile.to_string());
+        args.arbitrum_rpc_proxy_profile = Some(profile.to_string());
+        args.bitcoin_rpc_proxy_profile = Some(profile.to_string());
+        args.esplora_proxy_profile = Some(profile.to_string());
+        args.across_proxy_profile = Some(profile.to_string());
+        args.cctp_proxy_profile = Some(profile.to_string());
+        args.hyperunit_proxy_profile = Some(profile.to_string());
+        args.hyperliquid_proxy_profile = Some(profile.to_string());
+        args.velora_proxy_profile = Some(profile.to_string());
+        args.chainalysis_proxy_profile = Some(profile.to_string());
+        args.coinbase_proxy_profile = Some(profile.to_string());
     }
 
     #[test]
@@ -1259,13 +1132,19 @@ mod tests {
     #[test]
     fn provider_health_probes_use_synthetic_status_paths() {
         let mut args = base_args();
+        args.proxy_profile_ipv4_eu_url =
+            Some("socks5://router:secret@proxy.example:1080".to_string());
         args.across_api_url = Some("https://across.example".to_string());
         args.across_api_key = Some("across-key".to_string());
+        args.across_proxy_profile = Some("direct".to_string());
         args.cctp_api_url = Some("https://iris.example".to_string());
+        args.cctp_proxy_profile = Some("direct".to_string());
         args.hyperunit_api_url = Some("https://unit.example".to_string());
-        args.hyperunit_proxy_url = Some("socks5://router:secret@proxy.example:1080".to_string());
+        args.hyperunit_proxy_profile = Some("ipv4-eu".to_string());
         args.hyperliquid_api_url = Some("https://hyperliquid.example".to_string());
+        args.hyperliquid_proxy_profile = Some("direct".to_string());
         args.velora_api_url = Some("https://velora.example".to_string());
+        args.velora_proxy_profile = Some("direct".to_string());
 
         let probes = provider_health_probes(&args).unwrap();
         let urls: Vec<(&str, &str)> = probes
@@ -1287,14 +1166,48 @@ mod tests {
     }
 
     #[test]
-    fn production_upstream_proxy_satisfies_all_required_upstreams() {
+    fn production_proxy_profiles_satisfy_all_required_upstreams() {
         let mut args = base_args();
         configure_required_production_upstreams(&mut args);
-        args.upstream_proxy_url = Some("socks5://proxy.example:1080".to_string());
+        args.proxy_profile_ipv6_us_west_1_url = Some("socks5://proxy.example:1080".to_string());
+        configure_required_proxy_profiles(&mut args, "ipv6-us-west-1");
 
         validate_upstream_config(&args).unwrap();
     }
 
+    #[test]
+    fn named_proxy_profiles_resolve_with_dns_mode() {
+        let mut args = base_args();
+        args.proxy_profile_ipv6_us_west_1_url =
+            Some("socks5://proxy:secret@ipv6-us-west-1.example:1080".to_string());
+        args.across_proxy_profile = Some("ipv6-us-west-1".to_string());
+
+        let proxies = resolve_upstream_proxies(&args).unwrap();
+        let proxy_profile = proxies
+            .profile(ProxyTarget::Across)
+            .expect("across proxy profile");
+        let proxy = proxy_profile.as_upstream_proxy().unwrap();
+
+        assert_eq!(
+            proxy.as_str(),
+            "socks5://proxy:secret@ipv6-us-west-1.example:1080"
+        );
+        assert_eq!(proxy.dns_mode(), ProxyDnsMode::LocalIpv6Only);
+    }
+
+    #[test]
+    fn direct_profile_is_explicitly_configured_no_proxy() {
+        let mut args = base_args();
+        args.velora_proxy_profile = Some("direct".to_string());
+
+        let proxies = resolve_upstream_proxies(&args).unwrap();
+
+        assert_eq!(
+            proxies.profile(ProxyTarget::Velora),
+            Some(&ProxyProfile::Direct)
+        );
+        assert!(proxies.profile(ProxyTarget::Across).is_none());
+    }
     #[test]
     fn production_rejects_missing_proxy_configuration() {
         let mut args = base_args();
@@ -1302,8 +1215,8 @@ mod tests {
 
         let error = validate_upstream_config(&args).unwrap_err().to_string();
 
-        assert!(error.contains("ETH_RPC_PROXY_URL or UPSTREAM_PROXY_URL"));
-        assert!(error.contains("COINBASE_PROXY_URL or UPSTREAM_PROXY_URL"));
+        assert!(error.contains("ETH_RPC_PROXY_PROFILE is required"));
+        assert!(error.contains("COINBASE_PROXY_PROFILE is required"));
     }
 
     #[test]

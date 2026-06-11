@@ -12,6 +12,7 @@ hyperliquid-client = { workspace = true }
 hyperunit-client = { workspace = true }
 market-pricing = { workspace = true }
 observability = { workspace = true }
+proxy-transport = { workspace = true }
 router-primitives = { workspace = true }
 
 alloy = { workspace = true }

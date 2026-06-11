@@ -1,0 +1,11 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "proxy-transport"
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+reqwest = { workspace = true, features = ["socks"] }
+tokio = { workspace = true }
+url = { workspace = true }

@@ -2282,6 +2282,7 @@ version = "0.2.35"
 dependencies = [
  "metrics",
  "observability",
+ "proxy-transport",
  "reqwest",
  "serde",
  "serde_json",
@@ -2309,6 +2310,7 @@ dependencies = [
  "getrandom 0.2.16",
  "hkdf",
  "metrics",
+ "proxy-transport",
  "reqwest",
  "router-primitives",
  "serde",
@@ -2945,6 +2947,7 @@ dependencies = [
  "hyperliquid-client",
  "hyperunit-client",
  "libc",
+ "proxy-transport",
  "reqwest",
  "serde",
  "serde_json",
@@ -4184,6 +4187,7 @@ dependencies = [
  "metrics",
  "observability",
  "p256",
+ "proxy-transport",
  "reqwest",
  "serde",
  "serde_json",
@@ -4714,6 +4718,7 @@ dependencies = [
  "chrono",
  "metrics",
  "observability",
+ "proxy-transport",
  "reqwest",
  "serde",
  "serde_json",
@@ -5886,6 +5891,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "proxy-transport"
+version = "0.2.35"
+dependencies = [
+ "reqwest",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6349,6 +6363,7 @@ dependencies = [
  "market-pricing",
  "metrics",
  "observability",
+ "proxy-transport",
  "reqwest",
  "router-primitives",
  "secrecy",
@@ -6487,6 +6502,7 @@ dependencies = [
  "market-pricing",
  "metrics",
  "observability",
+ "proxy-transport",
  "reqwest",
  "router-core",
  "router-primitives",

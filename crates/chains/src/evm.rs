@@ -12,6 +12,7 @@ use blockchain_utils::create_transfer_with_authorization_execution;
 use eip3009_erc20_contract::GenericEIP3009ERC20::GenericEIP3009ERC20Instance;
 use eip7702_paymaster::{Paymaster, PaymasterError, PaymasterFundingRequest, PaymasterHandle};
 use metrics::{counter, gauge, histogram};
+use proxy_transport::{apply_reqwest_proxy, UpstreamProxy};
 use router_primitives::{
     ChainType, ConfirmedTxStatus, Currency, Lot, PendingTxStatus, TokenIdentifier, TxStatus, Wallet,
 };
@@ -60,7 +61,7 @@ pub enum EvmBroadcastPolicy {
 pub struct EvmChain {
     provider: DynProvider,
     rpc_url: String,
-    rpc_proxy_url: Option<String>,
+    rpc_proxy_url: Option<UpstreamProxy>,
     flashbots_rpc_url: Option<String>,
     chain_type: ChainType,
     wallet_seed_tag: Vec<u8>,
@@ -157,7 +158,7 @@ impl EvmChain {
         est_block_time: Duration,
         gas_sponsor: Option<EvmGasSponsorConfig>,
     ) -> Result<Self> {
-        Self::new_with_gas_sponsor_and_proxy_urls(
+        Self::new_with_gas_sponsor_and_proxy(
             rpc_url,
             chain_type,
             wallet_seed_tag,
@@ -170,14 +171,14 @@ impl EvmChain {
         .await
     }
 
-    pub async fn new_with_gas_sponsor_and_proxy_urls(
+    pub async fn new_with_gas_sponsor_and_proxy(
         rpc_url: &str,
         chain_type: ChainType,
         wallet_seed_tag: &[u8],
         min_confirmations: u32,
         est_block_time: Duration,
         gas_sponsor: Option<EvmGasSponsorConfig>,
-        rpc_proxy_url: Option<&str>,
+        rpc_proxy_url: Option<&UpstreamProxy>,
         flashbots_rpc_url: Option<&str>,
     ) -> Result<Self> {
         let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
@@ -198,7 +199,7 @@ impl EvmChain {
                     config,
                     provider.clone(),
                     rpc_url.to_string(),
-                    rpc_proxy_url.map(str::to_string),
+                    rpc_proxy_url.cloned(),
                     chain_type,
                 )
             })
@@ -207,7 +208,7 @@ impl EvmChain {
         Ok(Self {
             provider,
             rpc_url: rpc_url.to_string(),
-            rpc_proxy_url: rpc_proxy_url.map(str::to_string),
+            rpc_proxy_url: rpc_proxy_url.cloned(),
             flashbots_rpc_url: flashbots_rpc_url.map(str::to_string),
             chain_type,
             wallet_seed_tag: wallet_seed_tag.to_vec(),
@@ -729,11 +730,8 @@ impl EvmChain {
                 message: "Invalid recipient address".to_string(),
             })?;
 
-        let wallet_provider = wallet_provider_with_signer(
-            sender_signer,
-            &self.rpc_url,
-            self.rpc_proxy_url.as_deref(),
-        )?;
+        let wallet_provider =
+            wallet_provider_with_signer(sender_signer, &self.rpc_url, self.rpc_proxy_url.as_ref())?;
 
         match token {
             TokenIdentifier::Native => {
@@ -923,11 +921,8 @@ impl EvmChain {
             native_balance
         };
 
-        let wallet_provider = wallet_provider_with_signer(
-            sender_signer,
-            &self.rpc_url,
-            self.rpc_proxy_url.as_deref(),
-        )?;
+        let wallet_provider =
+            wallet_provider_with_signer(sender_signer, &self.rpc_url, self.rpc_proxy_url.as_ref())?;
 
         let (tx_hash, _) = self
             .send_transaction_with_nonce_retry(
@@ -1017,11 +1012,8 @@ impl EvmChain {
                 message: "Invalid recipient address".to_string(),
             })?;
 
-        let wallet_provider = wallet_provider_with_signer(
-            sender_signer,
-            &self.rpc_url,
-            self.rpc_proxy_url.as_deref(),
-        )?;
+        let wallet_provider =
+            wallet_provider_with_signer(sender_signer, &self.rpc_url, self.rpc_proxy_url.as_ref())?;
         let token_balance = self
             .read_erc20_balance_with_provider(&wallet_provider, token_address, sender_address)
             .await
@@ -1169,7 +1161,10 @@ impl EvmChain {
         })
     }
 
-    fn broadcast_rpc_endpoint(&self, broadcast_policy: EvmBroadcastPolicy) -> (&str, Option<&str>) {
+    fn broadcast_rpc_endpoint(
+        &self,
+        broadcast_policy: EvmBroadcastPolicy,
+    ) -> (&str, Option<&UpstreamProxy>) {
         (
             select_broadcast_rpc_url(
                 &self.rpc_url,
@@ -1177,7 +1172,7 @@ impl EvmChain {
                 self.chain_type,
                 broadcast_policy,
             ),
-            self.rpc_proxy_url.as_deref(),
+            self.rpc_proxy_url.as_ref(),
         )
     }
 }
@@ -1201,7 +1196,7 @@ fn select_broadcast_rpc_url<'a>(
 fn wallet_provider_with_signer(
     signer: PrivateKeySigner,
     rpc_url: &str,
-    proxy_url: Option<&str>,
+    proxy_url: Option<&UpstreamProxy>,
 ) -> Result<DynProvider> {
     let url = rpc_url.parse().map_err(|_| crate::Error::Serialization {
         message: "Invalid RPC URL".to_string(),
@@ -1213,50 +1208,15 @@ fn wallet_provider_with_signer(
         .erased())
 }
 
-fn evm_reqwest_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().use_rustls_tls();
-    if let Some(proxy_url) = proxy_url {
-        validate_socks5_proxy_url(proxy_url)?;
-        builder = builder.proxy(reqwest::Proxy::all(proxy_url.trim()).map_err(|err| {
-            crate::Error::Serialization {
-                message: format!("invalid EVM RPC proxy URL: {err}"),
-            }
-        })?);
-    }
+fn evm_reqwest_client(proxy_url: Option<&UpstreamProxy>) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder().use_rustls_tls();
+    let builder =
+        apply_reqwest_proxy(builder, proxy_url).map_err(|err| crate::Error::Serialization {
+            message: format!("invalid EVM RPC proxy URL: {err}"),
+        })?;
     builder.build().map_err(|err| crate::Error::Serialization {
         message: format!("failed to construct EVM reqwest client: {err}"),
     })
-}
-
-fn validate_socks5_proxy_url(proxy_url: &str) -> Result<()> {
-    let parsed =
-        reqwest::Url::parse(proxy_url.trim()).map_err(|err| crate::Error::Serialization {
-            message: format!("invalid proxy URL: {err}"),
-        })?;
-    if parsed.scheme() != "socks5" {
-        return Err(crate::Error::Serialization {
-            message: format!("proxy URL must use socks5 scheme, got {}", parsed.scheme()),
-        });
-    }
-    if parsed.host_str().is_none() {
-        return Err(crate::Error::Serialization {
-            message: "proxy URL must include a host".to_string(),
-        });
-    }
-    if parsed.port().is_none() {
-        return Err(crate::Error::Serialization {
-            message: "proxy URL must include a port".to_string(),
-        });
-    }
-    if (!parsed.path().is_empty() && parsed.path() != "/")
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(crate::Error::Serialization {
-            message: "proxy URL must not include a path, query string, or fragment".to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn is_local_evm_rpc_url(rpc_url: &str) -> bool {
@@ -1289,7 +1249,7 @@ impl EvmGasSponsor {
         config: EvmGasSponsorConfig,
         provider: DynProvider,
         rpc_url: String,
-        rpc_proxy_url: Option<String>,
+        rpc_proxy_url: Option<UpstreamProxy>,
         chain_type: ChainType,
     ) -> Result<Self> {
         let signer = PrivateKeySigner::from_str(&config.private_key).map_err(|_| {
@@ -1298,7 +1258,7 @@ impl EvmGasSponsor {
             }
         })?;
         let wallet_provider =
-            wallet_provider_with_signer(signer.clone(), &rpc_url, rpc_proxy_url.as_deref())?;
+            wallet_provider_with_signer(signer.clone(), &rpc_url, rpc_proxy_url.as_ref())?;
         let batch_config = EvmPaymasterBatchConfig::from_env();
         let (command_tx, command_rx) = mpsc::channel(EVM_PAYMASTER_COMMAND_BUFFER);
         let mut actor_tasks = JoinSet::new();

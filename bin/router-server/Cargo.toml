@@ -52,6 +52,7 @@ getrandom = { workspace = true }
 bitcoin = { workspace = true }
 bitcoincore-rpc-async = { workspace = true }
 reqwest = { workspace = true, features = ["socks"] }
+proxy-transport = { workspace = true }
 async-trait = { workspace = true }
 arc-swap = { workspace = true }
 futures-util = "0.3"

@@ -22,7 +22,8 @@ use router_core::{
             HyperliquidRuntimeConfig, PaymasterRegistry,
         },
         upstream_proxy::{
-            effective_proxy, normalize_optional_string as normalize_proxy_string, ProxyUrl,
+            normalize_optional_string as normalize_proxy_string, ProxyProfileCatalog, ProxyTarget,
+            ResolvedProxies,
         },
         PricingSnapshotProvider, RouteCostService,
     },
@@ -68,9 +69,41 @@ pub struct OrderWorkerRuntimeArgs {
     )]
     pub production: bool,
 
-    /// Global SOCKS5 proxy URL used for upstream services without a specific proxy override
-    #[arg(long, env = "UPSTREAM_PROXY_URL")]
-    pub upstream_proxy_url: Option<String>,
+    /// URL for the ipv4-us-west-1 proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV4_US_WEST_1_URL")]
+    pub proxy_profile_ipv4_us_west_1_url: Option<String>,
+
+    /// DNS mode for the ipv4-us-west-1 proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV4_US_WEST_1_DNS_MODE",
+        default_value = "system-default"
+    )]
+    pub proxy_profile_ipv4_us_west_1_dns_mode: String,
+
+    /// URL for the ipv6-us-west-1 proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV6_US_WEST_1_URL")]
+    pub proxy_profile_ipv6_us_west_1_url: Option<String>,
+
+    /// DNS mode for the ipv6-us-west-1 proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV6_US_WEST_1_DNS_MODE",
+        default_value = "local-ipv6-only"
+    )]
+    pub proxy_profile_ipv6_us_west_1_dns_mode: String,
+
+    /// URL for the ipv4-eu proxy profile.
+    #[arg(long, env = "PROXY_PROFILE_IPV4_EU_URL")]
+    pub proxy_profile_ipv4_eu_url: Option<String>,
+
+    /// DNS mode for the ipv4-eu proxy profile.
+    #[arg(
+        long,
+        env = "PROXY_PROFILE_IPV4_EU_DNS_MODE",
+        default_value = "system-default"
+    )]
+    pub proxy_profile_ipv4_eu_dns_mode: String,
 
     /// File path to the router master key hex file
     #[arg(long, env = "ROUTER_MASTER_KEY_PATH")]
@@ -80,9 +113,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "ETH_RPC_URL")]
     pub ethereum_mainnet_rpc_url: String,
 
-    /// Optional Ethereum Mainnet RPC SOCKS5 proxy URL
-    #[arg(long, env = "ETH_RPC_PROXY_URL")]
-    pub ethereum_mainnet_rpc_proxy_url: Option<String>,
+    /// Ethereum Mainnet RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ETH_RPC_PROXY_PROFILE")]
+    pub ethereum_mainnet_rpc_proxy_profile: Option<String>,
 
     /// Flashbots Ethereum RPC URL used for FlashbotsIfEthereum broadcasts
     #[arg(long, env = "FLASHBOTS_RPC_URL")]
@@ -96,9 +129,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "BASE_RPC_URL")]
     pub base_rpc_url: String,
 
-    /// Optional Base RPC SOCKS5 proxy URL
-    #[arg(long, env = "BASE_RPC_PROXY_URL")]
-    pub base_rpc_proxy_url: Option<String>,
+    /// Base RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "BASE_RPC_PROXY_PROFILE")]
+    pub base_rpc_proxy_profile: Option<String>,
 
     /// Base paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "BASE_PAYMASTER_PRIVATE_KEY")]
@@ -108,9 +141,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "ARBITRUM_RPC_URL")]
     pub arbitrum_rpc_url: String,
 
-    /// Optional Arbitrum RPC SOCKS5 proxy URL
-    #[arg(long, env = "ARBITRUM_RPC_PROXY_URL")]
-    pub arbitrum_rpc_proxy_url: Option<String>,
+    /// Arbitrum RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ARBITRUM_RPC_PROXY_PROFILE")]
+    pub arbitrum_rpc_proxy_profile: Option<String>,
 
     /// Arbitrum paymaster private key used to top up EVM token vault gas
     #[arg(long, env = "ARBITRUM_PAYMASTER_PRIVATE_KEY")]
@@ -120,9 +153,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "BITCOIN_RPC_URL")]
     pub bitcoin_rpc_url: String,
 
-    /// Optional Bitcoin RPC SOCKS5 proxy URL
-    #[arg(long, env = "BITCOIN_RPC_PROXY_URL")]
-    pub bitcoin_rpc_proxy_url: Option<String>,
+    /// Bitcoin RPC proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "BITCOIN_RPC_PROXY_PROFILE")]
+    pub bitcoin_rpc_proxy_profile: Option<String>,
 
     /// Bitcoin RPC Auth
     #[arg(long, env = "BITCOIN_RPC_AUTH", default_value = "none", value_parser = parse_auth)]
@@ -132,9 +165,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "ESPLORA_HTTP_SERVER_URL")]
     pub untrusted_esplora_http_server_url: String,
 
-    /// Optional Esplora SOCKS5 proxy URL
-    #[arg(long, env = "ESPLORA_PROXY_URL")]
-    pub esplora_proxy_url: Option<String>,
+    /// Esplora proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ESPLORA_PROXY_PROFILE")]
+    pub esplora_proxy_profile: Option<String>,
 
     /// Bitcoin Network
     #[arg(long, env = "BITCOIN_NETWORK", default_value = "bitcoin")]
@@ -148,9 +181,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "ACROSS_API_KEY")]
     pub across_api_key: Option<String>,
 
-    /// Optional Across SOCKS5 proxy URL
-    #[arg(long, env = "ACROSS_PROXY_URL")]
-    pub across_proxy_url: Option<String>,
+    /// Across proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "ACROSS_PROXY_PROFILE")]
+    pub across_proxy_profile: Option<String>,
 
     /// Across integrator id sent on swap approval requests
     #[arg(long, env = "ACROSS_INTEGRATOR_ID")]
@@ -160,9 +193,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "CCTP_API_URL")]
     pub cctp_api_url: Option<String>,
 
-    /// Optional CCTP SOCKS5 proxy URL
-    #[arg(long, env = "CCTP_PROXY_URL")]
-    pub cctp_proxy_url: Option<String>,
+    /// CCTP proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "CCTP_PROXY_PROFILE")]
+    pub cctp_proxy_profile: Option<String>,
 
     /// CCTP TokenMessengerV2 contract address override
     #[arg(long, env = "CCTP_TOKEN_MESSENGER_V2_ADDRESS")]
@@ -180,25 +213,25 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "HYPERUNIT_API_URL")]
     pub hyperunit_api_url: Option<String>,
 
-    /// Optional HyperUnit SOCKS5 proxy URL
-    #[arg(long, env = "HYPERUNIT_PROXY_URL")]
-    pub hyperunit_proxy_url: Option<String>,
+    /// HyperUnit proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "HYPERUNIT_PROXY_PROFILE")]
+    pub hyperunit_proxy_profile: Option<String>,
 
     /// Hyperliquid API base URL
     #[arg(long, env = "HYPERLIQUID_API_URL")]
     pub hyperliquid_api_url: Option<String>,
 
-    /// Optional Hyperliquid SOCKS5 proxy URL
-    #[arg(long, env = "HYPERLIQUID_PROXY_URL")]
-    pub hyperliquid_proxy_url: Option<String>,
+    /// Hyperliquid proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "HYPERLIQUID_PROXY_PROFILE")]
+    pub hyperliquid_proxy_profile: Option<String>,
 
     /// Velora/ParaSwap Market API base URL
     #[arg(long, env = "VELORA_API_URL")]
     pub velora_api_url: Option<String>,
 
-    /// Optional Velora SOCKS5 proxy URL
-    #[arg(long, env = "VELORA_PROXY_URL")]
-    pub velora_proxy_url: Option<String>,
+    /// Velora proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "VELORA_PROXY_PROFILE")]
+    pub velora_proxy_profile: Option<String>,
 
     /// Partner string sent to Velora for route analytics
     #[arg(long, env = "VELORA_PARTNER")]
@@ -225,9 +258,9 @@ pub struct OrderWorkerRuntimeArgs {
     #[arg(long, env = "COINBASE_PRICE_API_BASE_URL")]
     pub coinbase_price_api_base_url: Option<String>,
 
-    /// Optional Coinbase SOCKS5 proxy URL
-    #[arg(long, env = "COINBASE_PROXY_URL")]
-    pub coinbase_proxy_url: Option<String>,
+    /// Coinbase proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "COINBASE_PROXY_PROFILE")]
+    pub coinbase_proxy_profile: Option<String>,
 }
 
 impl OrderWorkerRuntimeArgs {
@@ -263,91 +296,55 @@ impl OrderWorkerRuntimeArgs {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct ResolvedUpstreamProxies {
-    across: Option<ProxyUrl>,
-    cctp: Option<ProxyUrl>,
-    hyperunit: Option<ProxyUrl>,
-    hyperliquid: Option<ProxyUrl>,
-    velora: Option<ProxyUrl>,
-    coinbase: Option<ProxyUrl>,
-    ethereum_rpc: Option<ProxyUrl>,
-    base_rpc: Option<ProxyUrl>,
-    arbitrum_rpc: Option<ProxyUrl>,
-
-    bitcoin_rpc: Option<ProxyUrl>,
-    esplora: Option<ProxyUrl>,
+fn proxy_profile_catalog(args: &OrderWorkerRuntimeArgs) -> WorkerResult<ProxyProfileCatalog> {
+    ProxyProfileCatalog::new(
+        args.proxy_profile_ipv4_us_west_1_url.as_deref(),
+        &args.proxy_profile_ipv4_us_west_1_dns_mode,
+        args.proxy_profile_ipv6_us_west_1_url.as_deref(),
+        &args.proxy_profile_ipv6_us_west_1_dns_mode,
+        args.proxy_profile_ipv4_eu_url.as_deref(),
+        &args.proxy_profile_ipv4_eu_dns_mode,
+    )
+    .map_err(|source| config_error(source.to_string()))
 }
 
-fn resolve_upstream_proxies(
-    args: &OrderWorkerRuntimeArgs,
-) -> WorkerResult<ResolvedUpstreamProxies> {
-    let upstream = args.upstream_proxy_url.as_deref();
-    Ok(ResolvedUpstreamProxies {
-        across: effective_proxy(
-            args.across_proxy_url.as_deref(),
-            "ACROSS_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        cctp: effective_proxy(args.cctp_proxy_url.as_deref(), "CCTP_PROXY_URL", upstream)
-            .map_err(|source| config_error(source.to_string()))?,
-        hyperunit: effective_proxy(
-            args.hyperunit_proxy_url.as_deref(),
-            "HYPERUNIT_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        hyperliquid: effective_proxy(
-            args.hyperliquid_proxy_url.as_deref(),
-            "HYPERLIQUID_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        velora: effective_proxy(
-            args.velora_proxy_url.as_deref(),
-            "VELORA_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        coinbase: effective_proxy(
-            args.coinbase_proxy_url.as_deref(),
-            "COINBASE_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        ethereum_rpc: effective_proxy(
-            args.ethereum_mainnet_rpc_proxy_url.as_deref(),
-            "ETH_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        base_rpc: effective_proxy(
-            args.base_rpc_proxy_url.as_deref(),
-            "BASE_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        arbitrum_rpc: effective_proxy(
-            args.arbitrum_rpc_proxy_url.as_deref(),
-            "ARBITRUM_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-
-        bitcoin_rpc: effective_proxy(
-            args.bitcoin_rpc_proxy_url.as_deref(),
-            "BITCOIN_RPC_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-        esplora: effective_proxy(
-            args.esplora_proxy_url.as_deref(),
-            "ESPLORA_PROXY_URL",
-            upstream,
-        )
-        .map_err(|source| config_error(source.to_string()))?,
-    })
+fn resolve_upstream_proxies(args: &OrderWorkerRuntimeArgs) -> WorkerResult<ResolvedProxies> {
+    let catalog = proxy_profile_catalog(args)?;
+    ResolvedProxies::resolve(
+        &catalog,
+        [
+            (ProxyTarget::Across, args.across_proxy_profile.as_deref()),
+            (ProxyTarget::Cctp, args.cctp_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Hyperunit,
+                args.hyperunit_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::Hyperliquid,
+                args.hyperliquid_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Velora, args.velora_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Coinbase,
+                args.coinbase_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::EthereumRpc,
+                args.ethereum_mainnet_rpc_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::BaseRpc, args.base_rpc_proxy_profile.as_deref()),
+            (
+                ProxyTarget::ArbitrumRpc,
+                args.arbitrum_rpc_proxy_profile.as_deref(),
+            ),
+            (
+                ProxyTarget::BitcoinRpc,
+                args.bitcoin_rpc_proxy_profile.as_deref(),
+            ),
+            (ProxyTarget::Esplora, args.esplora_proxy_profile.as_deref()),
+        ],
+    )
+    .map_err(|source| config_error(source.to_string()))
 }
 
 fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
@@ -478,67 +475,21 @@ fn validate_upstream_config(args: &OrderWorkerRuntimeArgs) -> WorkerResult<()> {
             args.flashbots_rpc_url.as_deref(),
         );
 
-        require_proxy(
+        proxies.require(
             &mut errors,
-            "ETH_RPC_URL",
-            "ETH_RPC_PROXY_URL",
-            &proxies.ethereum_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "BASE_RPC_URL",
-            "BASE_RPC_PROXY_URL",
-            &proxies.base_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "ARBITRUM_RPC_URL",
-            "ARBITRUM_RPC_PROXY_URL",
-            &proxies.arbitrum_rpc,
-        );
-
-        require_proxy(
-            &mut errors,
-            "BITCOIN_RPC_URL",
-            "BITCOIN_RPC_PROXY_URL",
-            &proxies.bitcoin_rpc,
-        );
-        require_proxy(
-            &mut errors,
-            "ESPLORA_HTTP_SERVER_URL",
-            "ESPLORA_PROXY_URL",
-            &proxies.esplora,
-        );
-        require_proxy(
-            &mut errors,
-            "ACROSS_API_URL",
-            "ACROSS_PROXY_URL",
-            &proxies.across,
-        );
-        require_proxy(&mut errors, "CCTP_API_URL", "CCTP_PROXY_URL", &proxies.cctp);
-        require_proxy(
-            &mut errors,
-            "HYPERUNIT_API_URL",
-            "HYPERUNIT_PROXY_URL",
-            &proxies.hyperunit,
-        );
-        require_proxy(
-            &mut errors,
-            "HYPERLIQUID_API_URL",
-            "HYPERLIQUID_PROXY_URL",
-            &proxies.hyperliquid,
-        );
-        require_proxy(
-            &mut errors,
-            "VELORA_API_URL",
-            "VELORA_PROXY_URL",
-            &proxies.velora,
-        );
-        require_proxy(
-            &mut errors,
-            "COINBASE_PRICE_API_BASE_URL",
-            "COINBASE_PROXY_URL",
-            &proxies.coinbase,
+            [
+                ProxyTarget::EthereumRpc,
+                ProxyTarget::BaseRpc,
+                ProxyTarget::ArbitrumRpc,
+                ProxyTarget::BitcoinRpc,
+                ProxyTarget::Esplora,
+                ProxyTarget::Across,
+                ProxyTarget::Cctp,
+                ProxyTarget::Hyperunit,
+                ProxyTarget::Hyperliquid,
+                ProxyTarget::Velora,
+                ProxyTarget::Coinbase,
+            ],
         );
     }
 
@@ -572,19 +523,6 @@ fn require_present(errors: &mut Vec<String>, env_name: &str, name: &str, value: 
     }
 }
 
-fn require_proxy(
-    errors: &mut Vec<String>,
-    upstream_env_name: &str,
-    proxy_env_name: &str,
-    proxy_url: &Option<ProxyUrl>,
-) {
-    if proxy_url.is_none() {
-        errors.push(format!(
-            "{proxy_env_name} or UPSTREAM_PROXY_URL is required for {upstream_env_name}"
-        ));
-    }
-}
-
 fn initialize_pricing_provider(
     args: &OrderWorkerRuntimeArgs,
     db: Database,
@@ -607,13 +545,13 @@ fn initialize_pricing_provider(
     )
     .map_err(|source| config_error(format!("invalid USD pricing oracle config: {source}")))?;
     let pricing_oracle = Arc::new(
-        MarketPricingOracle::new_with_proxy_urls(
+        MarketPricingOracle::new_with_proxies(
             oracle_config,
-            proxies.coinbase.as_ref().map(ProxyUrl::as_str),
-            proxies.ethereum_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
-            proxies.hyperliquid.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::Coinbase),
+            proxies.proxy_ref(ProxyTarget::EthereumRpc),
+            proxies.proxy_ref(ProxyTarget::ArbitrumRpc),
+            proxies.proxy_ref(ProxyTarget::BaseRpc),
+            proxies.proxy_ref(ProxyTarget::Hyperliquid),
         )
         .map_err(|source| {
             config_error(format!("failed to initialize USD pricing oracle: {source}"))
@@ -641,26 +579,26 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     let flashbots_rpc_url =
         normalize_optional_url(args.flashbots_rpc_url.as_deref(), "Flashbots RPC URL")?;
 
-    let bitcoin_chain = BitcoinChain::new_with_proxy_urls(
+    let bitcoin_chain = BitcoinChain::new_with_proxies(
         &args.bitcoin_rpc_url,
         args.bitcoin_rpc_auth.clone(),
-        proxies.bitcoin_rpc.as_ref().map(ProxyUrl::as_str),
+        proxies.proxy_ref(ProxyTarget::BitcoinRpc),
         &args.untrusted_esplora_http_server_url,
-        proxies.esplora.as_ref().map(ProxyUrl::as_str),
+        proxies.proxy_ref(ProxyTarget::Esplora),
         args.bitcoin_network,
     )
     .map_err(|source| config_error(format!("failed to initialize bitcoin chain: {source}")))?;
     chain_registry.register_bitcoin(ChainType::Bitcoin, Arc::new(bitcoin_chain));
 
     let ethereum_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.ethereum_mainnet_rpc_url,
             ChainType::Ethereum,
             b"router-ethereum-wallet",
             4,
             Duration::from_secs(12),
             gas_sponsor_config(args.ethereum_paymaster_private_key.as_ref()),
-            proxies.ethereum_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::EthereumRpc),
             flashbots_rpc_url.as_deref(),
         )
         .await
@@ -669,14 +607,14 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     chain_registry.register_evm(ChainType::Ethereum, ethereum_chain);
 
     let base_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.base_rpc_url,
             ChainType::Base,
             b"router-base-wallet",
             2,
             Duration::from_secs(2),
             gas_sponsor_config(args.base_paymaster_private_key.as_ref()),
-            proxies.base_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::BaseRpc),
             None,
         )
         .await
@@ -685,14 +623,14 @@ async fn initialize_chain_registry(args: &OrderWorkerRuntimeArgs) -> WorkerResul
     chain_registry.register_evm(ChainType::Base, base_chain);
 
     let arbitrum_chain = Arc::new(
-        EvmChain::new_with_gas_sponsor_and_proxy_urls(
+        EvmChain::new_with_gas_sponsor_and_proxy(
             &args.arbitrum_rpc_url,
             ChainType::Arbitrum,
             b"router-arbitrum-wallet",
             2,
             Duration::from_secs(2),
             gas_sponsor_config(args.arbitrum_paymaster_private_key.as_ref()),
-            proxies.arbitrum_rpc.as_ref().map(ProxyUrl::as_str),
+            proxies.proxy_ref(ProxyTarget::ArbitrumRpc),
             None,
         )
         .await
@@ -721,7 +659,7 @@ fn initialize_action_providers(
                 required_across_api_key(args.across_api_key.as_deref())?,
             )
             .with_integrator_id(args.across_integrator_id.clone())
-            .with_proxy_url(proxies.across.clone()),
+            .with_proxy_url(proxies.proxy_owned(ProxyTarget::Across)),
         ),
         None => None,
     };
@@ -729,7 +667,7 @@ fn initialize_action_providers(
         normalize_optional_url(args.velora_api_url.as_deref(), "Velora API URL")?.map(|base_url| {
             VeloraHttpProviderConfig::new(base_url)
                 .with_partner(normalize_optional_string(args.velora_partner.as_deref()))
-                .with_proxy_url(proxies.velora.clone())
+                .with_proxy_url(proxies.proxy_owned(ProxyTarget::Velora))
         });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
@@ -741,7 +679,7 @@ fn initialize_action_providers(
                 normalize_optional_string(args.cctp_message_transmitter_v2_address.as_deref()),
             )
             .with_transfer_mode(cctp_transfer_mode)
-            .with_proxy_url(proxies.cctp.clone()),
+            .with_proxy_url(proxies.proxy_owned(ProxyTarget::Cctp)),
     );
 
     ActionProviderRegistry::http_from_options(ActionProviderHttpOptions {
@@ -751,12 +689,12 @@ fn initialize_action_providers(
             args.hyperunit_api_url.as_deref(),
             "HyperUnit API URL",
         )?,
-        hyperunit_proxy_url: proxies.hyperunit.clone(),
+        hyperunit_proxy_url: proxies.proxy_owned(ProxyTarget::Hyperunit),
         hyperliquid_base_url: normalize_optional_url(
             args.hyperliquid_api_url.as_deref(),
             "Hyperliquid API URL",
         )?,
-        hyperliquid_proxy_url: proxies.hyperliquid.clone(),
+        hyperliquid_proxy_url: proxies.proxy_owned(ProxyTarget::Hyperliquid),
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -771,8 +709,11 @@ fn hyperliquid_runtime_config(
     Ok(
         normalize_optional_url(args.hyperliquid_api_url.as_deref(), "Hyperliquid API URL")?.map(
             |base_url| {
+                let proxy_url = proxies
+                    .proxy_ref(ProxyTarget::Hyperliquid)
+                    .map(|proxy| proxy.url().clone());
                 HyperliquidRuntimeConfig::new(base_url, args.hyperliquid_network)
-                    .with_proxy_url(proxies.hyperliquid.clone())
+                    .with_proxy_url(proxy_url)
             },
         ),
     )

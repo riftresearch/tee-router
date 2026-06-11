@@ -115,8 +115,8 @@ Railway runs every observer, indexer, watcher, and operator-facing service:
 - `grafana-v3` — observability UI (VictoriaMetrics + Loki datasources)
 - `upstream-socks5-proxy-v3` — **managed** general SOCKS5 egress proxy, image
   `serjs/go-socks5-proxy`, auth-required, port 1080, normal Railway region.
-  Phala uses this service's public TCP proxy as `UPSTREAM_PROXY_URL`; provider-
-  specific `*_PROXY_URL` values override it when needed.
+  Phala references this service through the `ipv6-us-west-1` or
+  `ipv4-us-west-1` proxy profile URL.
 - `hyperunit-socks5-proxy-v3` — **managed** dedicated SOCKS5 egress proxy for
   HyperUnit only, image `serjs/go-socks5-proxy`, auth-required, port 1080,
   **pinned to Railway Europe** (EU-West Metal / Amsterdam).
@@ -172,7 +172,7 @@ Sauron Bitcoin rathole broker are managed v3 services:
 | victoriametrics-v3 | Railway | `victoriametrics/victoria-metrics` | Metrics TSDB |
 | loki-v3 | Railway | `grafana/loki` | Log store |
 | grafana-v3 | Railway | `grafana/grafana` | Observability UI |
-| upstream-socks5-proxy-v3 | Railway | image `serjs/go-socks5-proxy` | General SOCKS5 egress fallback for router upstreams (`UPSTREAM_PROXY_URL`) |
+| upstream-socks5-proxy-v3 | Railway | image `serjs/go-socks5-proxy` | General SOCKS5 egress for `ipv4-us-west-1` / `ipv6-us-west-1` proxy profiles |
 | hyperunit-socks5-proxy-v3 | Railway (Europe) | image `serjs/go-socks5-proxy` | Dedicated HyperUnit SOCKS5 egress only |
 | sauron-bitcoin-rathole-broker-v3 | Railway | repo `etc/Dockerfile.rathole-broker` | Managed rathole broker — Bitcoin RPC/ZMQ transport for Sauron |
 
@@ -697,16 +697,19 @@ There are two managed Railway SOCKS5 proxy services:
 - `hyperunit-socks5-proxy-v3`: the dedicated HyperUnit proxy. Keep this pinned
   to Europe and use it only for HyperUnit traffic.
 
-Router API and router-worker resolve proxies in this order:
+Router API and router-worker resolve proxies exclusively through provider
+profiles:
 
-1. Provider/chain-specific override, e.g. `CCTP_PROXY_URL`,
-   `BASE_RPC_PROXY_URL`, or `COINBASE_PROXY_URL`.
-2. Shared fallback `UPSTREAM_PROXY_URL`.
-3. No proxy.
+1. Each upstream selects one `*_PROXY_PROFILE` value.
+2. `direct` means intentionally no proxy.
+3. `ipv4-us-west-1`, `ipv6-us-west-1`, and `ipv4-eu` map to the
+   corresponding `PROXY_PROFILE_*_URL` secret.
 
-With `PRODUCTION=true`, startup rejects any configured upstream that has neither
-a specific proxy nor `UPSTREAM_PROXY_URL`. This includes RPCs, Esplora, provider
-APIs, Chainalysis, and Coinbase pricing.
+There is no shared fallback proxy and no provider-specific raw proxy URL path.
+
+With `PRODUCTION=true`, startup rejects any configured upstream that has no
+explicit profile. This includes RPCs, Esplora, provider APIs, Chainalysis, and
+Coinbase pricing. Use `direct` when no proxy is intentional.
 
 Requirements:
 
@@ -723,43 +726,60 @@ Requirements:
 Primary Phala secrets:
 
 ```text
-UPSTREAM_PROXY_URL=socks5://<user>:<password>@<upstream-public-proxy-host>:<port>
-HYPERUNIT_PROXY_URL=socks5://<user>:<password>@<hyperunit-eu-public-proxy-host>:<port>
+PROXY_PROFILE_IPV4_US_WEST_1_URL=socks5://<user>:<password>@<ipv4-us-west-1-host>:<port>
+PROXY_PROFILE_IPV4_US_WEST_1_DNS_MODE=system-default
+PROXY_PROFILE_IPV6_US_WEST_1_URL=socks5://<user>:<password>@<ipv6-us-west-1-host>:<port>
+PROXY_PROFILE_IPV6_US_WEST_1_DNS_MODE=local-ipv6-only
+PROXY_PROFILE_IPV4_EU_URL=socks5://<user>:<password>@<ipv4-eu-host>:<port>
+PROXY_PROFILE_IPV4_EU_DNS_MODE=system-default
 ```
 
-Supported router-specific overrides:
+Default router profile selectors:
+
+QuickNode RPC endpoints and Esplora are intentionally direct from the router
+machine; they do not need egress-IP isolation.
 
 ```text
-ETH_RPC_PROXY_URL
-BASE_RPC_PROXY_URL
-ARBITRUM_RPC_PROXY_URL
-
-BITCOIN_RPC_PROXY_URL
-ESPLORA_PROXY_URL
-ACROSS_PROXY_URL
-CCTP_PROXY_URL
-HYPERUNIT_PROXY_URL
-HYPERLIQUID_PROXY_URL
-VELORA_PROXY_URL
-RELAY_PROXY_URL
-NEAR_INTENTS_PROXY_URL
-MAYAN_PROXY_URL
-CHAINFLIP_PROXY_URL
-GARDEN_PROXY_URL
-CHAINALYSIS_PROXY_URL
-COINBASE_PROXY_URL
+ETH_RPC_PROXY_PROFILE=direct
+BASE_RPC_PROXY_PROFILE=direct
+ARBITRUM_RPC_PROXY_PROFILE=direct
+BITCOIN_RPC_PROXY_PROFILE=direct
+ESPLORA_PROXY_PROFILE=direct
+ACROSS_PROXY_PROFILE=ipv6-us-west-1
+CCTP_PROXY_PROFILE=ipv6-us-west-1
+HYPERUNIT_PROXY_PROFILE=ipv4-eu
+HYPERLIQUID_PROXY_PROFILE=ipv6-us-west-1
+VELORA_PROXY_PROFILE=ipv6-us-west-1
+RELAY_PROXY_PROFILE=ipv6-us-west-1
+NEAR_INTENTS_PROXY_PROFILE=ipv6-us-west-1
+MAYAN_PROXY_PROFILE=ipv6-us-west-1
+CHAINFLIP_PROXY_PROFILE=ipv6-us-west-1
+GARDEN_PROXY_PROFILE=ipv6-us-west-1
+CHAINALYSIS_PROXY_PROFILE=ipv6-us-west-1
+COINBASE_PROXY_PROFILE=ipv6-us-west-1
 ```
 
-Set an override only when that upstream needs a different egress path from the
-shared fallback. `HYPERUNIT_PROXY_URL` is the required intentional override for
-HyperUnit; it must point at `hyperunit-socks5-proxy-v3`, not
-`upstream-socks5-proxy-v3`. The router expects `socks5://`, not `socks5h://`;
-proxy URLs must include host and port and must not include path, query, or
-fragment components.
+Supported router profile selector variables:
+```text
+ETH_RPC_PROXY_PROFILE
+BASE_RPC_PROXY_PROFILE
+ARBITRUM_RPC_PROXY_PROFILE
 
-Sauron's HyperUnit observer only calls read/status endpoints (`/operations/{address}`)
-and does not require `HYPERUNIT_PROXY_URL`; `sauron-worker-v3` should use
-`HYPERUNIT_API_URL=https://api.hyperunit.xyz` directly.
+BITCOIN_RPC_PROXY_PROFILE
+ESPLORA_PROXY_PROFILE
+ACROSS_PROXY_PROFILE
+CCTP_PROXY_PROFILE
+HYPERUNIT_PROXY_PROFILE
+HYPERLIQUID_PROXY_PROFILE
+VELORA_PROXY_PROFILE
+RELAY_PROXY_PROFILE
+NEAR_INTENTS_PROXY_PROFILE
+MAYAN_PROXY_PROFILE
+CHAINFLIP_PROXY_PROFILE
+GARDEN_PROXY_PROFILE
+CHAINALYSIS_PROXY_PROFILE
+COINBASE_PROXY_PROFILE
+```
 
 ## Bitcoin RPC/ZMQ Transport
 
@@ -810,14 +830,10 @@ Router API and worker need the same core config:
 - `ACROSS_API_URL`, `ACROSS_API_KEY`, `ACROSS_INTEGRATOR_ID`
 - `CCTP_API_URL` if overriding Circle Iris default,
   `CCTP_TOKEN_MESSENGER_V2_ADDRESS`, `CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS`
-- `UPSTREAM_PROXY_URL` general SOCKS5 fallback, `HYPERUNIT_PROXY_URL` dedicated
-  Europe-pinned HyperUnit proxy, plus optional per-upstream overrides:
-  `ETH_RPC_PROXY_URL`, `BASE_RPC_PROXY_URL`, `ARBITRUM_RPC_PROXY_URL`,
-  `BITCOIN_RPC_PROXY_URL`, `ESPLORA_PROXY_URL`,
-  `ACROSS_PROXY_URL`, `CCTP_PROXY_URL`, `HYPERLIQUID_PROXY_URL`,
-  `VELORA_PROXY_URL`, `RELAY_PROXY_URL`, `NEAR_INTENTS_PROXY_URL`,
-  `MAYAN_PROXY_URL`, `CHAINFLIP_PROXY_URL`, `GARDEN_PROXY_URL`,
-  `CHAINALYSIS_PROXY_URL`, `COINBASE_PROXY_URL`
+- `PROXY_PROFILE_IPV4_US_WEST_1_URL`, `PROXY_PROFILE_IPV6_US_WEST_1_URL`,
+  `PROXY_PROFILE_IPV4_EU_URL`, and corresponding `*_DNS_MODE` values.
+  Every upstream uses an explicit `*_PROXY_PROFILE` selector; use `direct` for
+  intentionally unproxied upstreams.
 - `HYPERUNIT_API_URL`
 - `HYPERLIQUID_API_URL`, `HYPERLIQUID_NETWORK`,
   `HYPERLIQUID_ORDER_TIMEOUT_MS`
@@ -1218,10 +1234,12 @@ Still to do:
       `alloy-v3` URL; verify Railway scrapes and Phala OTLP push.
 - [ ] Set `upstream-socks5-proxy-v3` `PROXY_USER`/`PROXY_PASSWORD`
       (railway/env), confirm auth-only access boundary, and wire Phala
-      `UPSTREAM_PROXY_URL` from its public TCP proxy.
+      `PROXY_PROFILE_IPV4_US_WEST_1_URL` / `PROXY_PROFILE_IPV6_US_WEST_1_URL`
+      from its public TCP proxy.
 - [ ] Set `hyperunit-socks5-proxy-v3` `PROXY_USER`/`PROXY_PASSWORD`
       (railway/env), confirm Europe region pin + auth-only access boundary,
-      and wire Phala router `HYPERUNIT_PROXY_URL` from this dedicated service.
+      and wire Phala router `PROXY_PROFILE_IPV4_EU_URL` from this
+      dedicated service.
 - [ ] Deploy `sauron-bitcoin-rathole-broker-v3`; set its 4 `RATHOLE_*`
       tokens (railway/env) and run the matching rathole client on the
       isolated Bitcoin host with identical tokens.
