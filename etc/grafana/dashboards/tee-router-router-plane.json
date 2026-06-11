@@ -306,7 +306,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (service) (rate(tee_router_upstream_requests_total[1m]))",
-          "legendFormat": "{{venue}}",
+          "legendFormat": "{{service}}",
           "range": true,
           "refId": "A"
         }
@@ -399,7 +399,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (service) (increase(tee_router_upstream_requests_total[1m]))",
-          "legendFormat": "{{venue}}",
+          "legendFormat": "{{service}}",
           "range": true,
           "refId": "A"
         }
@@ -493,7 +493,7 @@
           },
           "editorMode": "code",
           "expr": "100 * sum by (service, method, endpoint) (rate(tee_router_upstream_requests_total{status_class=\"2xx\"}[5m])) / sum by (service, method, endpoint) (rate(tee_router_upstream_requests_total[5m]))",
-          "legendFormat": "{{venue}} {{method}} {{endpoint}}",
+          "legendFormat": "{{service}} {{method}} {{endpoint}}",
           "range": true,
           "refId": "A"
         }
@@ -587,7 +587,7 @@
           },
           "editorMode": "code",
           "expr": "sum by (service, method, endpoint, status_class) (increase(tee_router_upstream_requests_total{status_class!=\"2xx\"}[5m]))",
-          "legendFormat": "{{venue}} {{method}} {{endpoint}} {{status_class}}",
+          "legendFormat": "{{service}} {{method}} {{endpoint}} {{status_class}}",
           "range": true,
           "refId": "A"
         }
@@ -681,7 +681,7 @@
           },
           "editorMode": "code",
           "expr": "tee_router_upstream_request_duration_seconds{quantile=\"0.95\"}",
-          "legendFormat": "{{venue}} {{method}} {{endpoint}} {{status_class}}",
+          "legendFormat": "{{service}} {{method}} {{endpoint}} {{status_class}}",
           "range": true,
           "refId": "A"
         }
