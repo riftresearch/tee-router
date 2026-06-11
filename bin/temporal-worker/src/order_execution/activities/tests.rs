@@ -286,7 +286,9 @@ impl UnitProvider for CountingUnitWithdrawalProvider {
 
 struct TestHyperliquidExchangeProvider;
 
-struct TestVeloraExchangeProvider;
+struct TestUniversalRouterExchangeProvider {
+    provider_id: ProviderId,
+}
 
 struct TestHyperliquidBridgeProvider;
 
@@ -434,9 +436,9 @@ impl ExchangeProvider for TestHyperliquidExchangeProvider {
     }
 }
 
-impl ExchangeProvider for TestVeloraExchangeProvider {
+impl ExchangeProvider for TestUniversalRouterExchangeProvider {
     fn id(&self) -> &str {
-        ProviderId::Velora.as_str()
+        self.provider_id.as_str()
     }
 
     fn quote_trade<'a>(
@@ -475,7 +477,7 @@ impl ExchangeProvider for TestVeloraExchangeProvider {
                     "src_decimals": request.input_decimals.unwrap_or(18),
                     "dest_decimals": request.output_decimals.unwrap_or(6),
                     "price_route": {
-                        "kind": "test_velora_route",
+                        "kind": "test_universal_router_route",
                     },
                 }),
                 expires_at: Utc::now() + chrono::Duration::minutes(10),
@@ -489,7 +491,7 @@ impl ExchangeProvider for TestVeloraExchangeProvider {
     ) -> ProviderFuture<'a, ProviderExecutionIntent> {
         Box::pin(async {
             Ok(ProviderExecutionIntent::ProviderOnly {
-                response: json!({ "kind": "test_velora_swap" }),
+                response: json!({ "kind": "test_universal_router_swap" }),
                 state: ProviderExecutionState::default(),
             })
         })
@@ -1659,13 +1661,13 @@ async fn run_hint_verify_settles_step_to_completed_on_accept() {
                 order_id: seeded.order_id.into(),
                 provider_operation_id: Some(provider_operation_id.into()),
                 execution_step_id: seeded.step_id.into(),
-                hint_kind: ProviderHintKind::VeloraSwapSettled,
+                hint_kind: ProviderHintKind::UniversalRouterSwapSettled,
                 provider: ProviderKind::Exchange,
                 provider_ref: Some("0xfeed".to_string()),
                 evidence: None,
             },
         },
-        ExpectedHintKinds::Single(ProviderHintKind::VeloraSwapSettled),
+        ExpectedHintKinds::Single(ProviderHintKind::UniversalRouterSwapSettled),
         stub_accept_verifier,
     )
     .await
@@ -1695,6 +1697,7 @@ async fn hyperliquid_bridge_quotes_build_refund_quote_leg_shapes() {
         hyperunit_proxy_url: None,
         hyperliquid_base_url: Some("http://127.0.0.1:1".to_string()),
         hyperliquid_proxy_url: None,
+        kyberswap: None,
         velora: None,
         hyperliquid_network: HyperliquidCallNetwork::Testnet,
         hyperliquid_order_timeout_ms: 30_000,
@@ -2281,7 +2284,9 @@ async fn hyperliquid_spot_refund_plan_hydrates_nonfinal_unit_withdrawal_recipien
         vec![Arc::new(unit_provider) as Arc<dyn UnitProvider>],
         vec![
             Arc::new(TestHyperliquidExchangeProvider) as Arc<dyn ExchangeProvider>,
-            Arc::new(TestVeloraExchangeProvider) as Arc<dyn ExchangeProvider>,
+            Arc::new(TestUniversalRouterExchangeProvider {
+                provider_id: ProviderId::Kyberswap,
+            }) as Arc<dyn ExchangeProvider>,
         ],
     ));
     let deps = test_deps_with_action_providers(
@@ -4719,6 +4724,7 @@ fn test_deps(db: Database) -> OrderActivityDeps {
             hyperunit_proxy_url: None,
             hyperliquid_base_url: None,
             hyperliquid_proxy_url: None,
+            kyberswap: None,
             velora: None,
             hyperliquid_network: HyperliquidCallNetwork::Testnet,
             hyperliquid_order_timeout_ms: 30_000,

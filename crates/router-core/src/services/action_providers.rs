@@ -65,6 +65,11 @@ const VELORA_NATIVE_TOKEN: &str = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const VELORA_API_VERSION: &str = "6.2";
 const VELORA_DEFAULT_SLIPPAGE_BPS: u64 = 100;
 const VELORA_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const KYBERSWAP_NATIVE_TOKEN: &str = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+const KYBERSWAP_DEFAULT_SLIPPAGE_BPS: u64 = 100;
+const KYBERSWAP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
+const KYBERSWAP_ACCEPT: &str = "application/json";
+const KYBERSWAP_USER_AGENT: &str = "Mozilla/5.0";
 const CCTP_MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024;
 const PROVIDER_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const CCTP_TOKEN_MESSENGER_V2_ADDRESS: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
@@ -570,6 +575,12 @@ pub struct VeloraHttpProviderConfig {
 }
 
 #[derive(Clone)]
+pub struct KyberswapHttpProviderConfig {
+    pub base_url: String,
+    pub proxy_url: Option<UpstreamProxy>,
+}
+
+#[derive(Clone)]
 pub struct ActionProviderHttpOptions {
     pub across: Option<AcrossHttpProviderConfig>,
     pub cctp: Option<CctpHttpProviderConfig>,
@@ -577,6 +588,7 @@ pub struct ActionProviderHttpOptions {
     pub hyperunit_proxy_url: Option<UpstreamProxy>,
     pub hyperliquid_base_url: Option<String>,
     pub hyperliquid_proxy_url: Option<UpstreamProxy>,
+    pub kyberswap: Option<KyberswapHttpProviderConfig>,
     pub velora: Option<VeloraHttpProviderConfig>,
     pub hyperliquid_network: HyperliquidCallNetwork,
     pub hyperliquid_order_timeout_ms: u64,
@@ -621,6 +633,15 @@ impl fmt::Debug for VeloraHttpProviderConfig {
     }
 }
 
+impl fmt::Debug for KyberswapHttpProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KyberswapHttpProviderConfig")
+            .field("base_url", &sanitize_url_for_error(&self.base_url))
+            .field("proxy_url", &self.proxy_url.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 impl fmt::Debug for ActionProviderHttpOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ActionProviderHttpOptions")
@@ -648,6 +669,7 @@ impl fmt::Debug for ActionProviderHttpOptions {
                 "hyperliquid_proxy_url",
                 &self.hyperliquid_proxy_url.as_ref().map(|_| "<redacted>"),
             )
+            .field("kyberswap", &self.kyberswap)
             .field("velora", &self.velora)
             .field("hyperliquid_network", &self.hyperliquid_network)
             .field(
@@ -672,6 +694,22 @@ impl VeloraHttpProviderConfig {
     pub fn with_partner(mut self, partner: Option<String>) -> Self {
         self.partner = partner;
         self
+    }
+
+    #[must_use]
+    pub fn with_proxy_url(mut self, proxy_url: Option<UpstreamProxy>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+}
+
+impl KyberswapHttpProviderConfig {
+    #[must_use]
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            proxy_url: None,
+        }
     }
 
     #[must_use]
@@ -792,21 +830,24 @@ impl ActionProviderRegistry {
         reason = "mock_http is an integration-test fixture constructor; invalid mock URLs should fail the test immediately"
     )]
     pub fn mock_http(base_url: impl Into<String>) -> Self {
-        // The mock integrator server mounts each venue under its own path prefix,
-        // so fan the single base URL out to per-venue URLs here.
         let base_url = base_url.into();
-        Self::http_with_options(
-            Some(AcrossHttpProviderConfig::new(
+        Self::http_from_options(ActionProviderHttpOptions {
+            across: Some(AcrossHttpProviderConfig::new(
                 format!("{base_url}/across"),
                 MOCK_ACROSS_API_KEY,
             )),
-            Some(CctpHttpProviderConfig::mock(format!("{base_url}/cctp"))),
-            Some(format!("{base_url}/hyperunit")),
-            None,
-            Some(format!("{base_url}/hyperliquid")),
-            None,
-            HyperliquidCallNetwork::Mainnet,
-        )
+            cctp: Some(CctpHttpProviderConfig::mock(format!("{base_url}/cctp"))),
+            hyperunit_base_url: Some(format!("{base_url}/hyperunit")),
+            hyperunit_proxy_url: None,
+            hyperliquid_base_url: Some(format!("{base_url}/hyperliquid")),
+            hyperliquid_proxy_url: None,
+            kyberswap: Some(KyberswapHttpProviderConfig::new(format!(
+                "{base_url}/kyberswap"
+            ))),
+            velora: Some(VeloraHttpProviderConfig::new(format!("{base_url}/velora"))),
+            hyperliquid_network: HyperliquidCallNetwork::Mainnet,
+            hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
+        })
         .expect("mock HTTP providers should always build")
     }
 
@@ -817,6 +858,7 @@ impl ActionProviderRegistry {
         hyperunit_proxy_url: Option<UpstreamProxy>,
         hyperliquid_base_url: Option<String>,
         velora: Option<VeloraHttpProviderConfig>,
+        kyberswap: Option<KyberswapHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
         Self::http_with_options(
@@ -826,6 +868,7 @@ impl ActionProviderRegistry {
             hyperunit_proxy_url,
             hyperliquid_base_url,
             velora,
+            kyberswap,
             hyperliquid_network,
         )
     }
@@ -837,6 +880,7 @@ impl ActionProviderRegistry {
         hyperunit_proxy_url: Option<UpstreamProxy>,
         hyperliquid_base_url: Option<String>,
         velora: Option<VeloraHttpProviderConfig>,
+        kyberswap: Option<KyberswapHttpProviderConfig>,
         hyperliquid_network: HyperliquidCallNetwork,
     ) -> Result<Self, String> {
         Self::http_from_options(ActionProviderHttpOptions {
@@ -846,6 +890,7 @@ impl ActionProviderRegistry {
             hyperunit_proxy_url,
             hyperliquid_base_url,
             hyperliquid_proxy_url: None,
+            kyberswap,
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms: DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
@@ -860,6 +905,7 @@ impl ActionProviderRegistry {
             hyperunit_proxy_url,
             hyperliquid_base_url,
             hyperliquid_proxy_url,
+            kyberswap,
             velora,
             hyperliquid_network,
             hyperliquid_order_timeout_ms,
@@ -930,6 +976,12 @@ impl ActionProviderRegistry {
             })
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(config) = kyberswap {
+            exchanges.push(Arc::new(KyberswapProvider::new_with_proxy_url(
+                config.base_url,
+                config.proxy_url.as_ref(),
+            )?));
+        }
         if let Some(config) = velora {
             exchanges.push(Arc::new(VeloraProvider::new_with_proxy_url(
                 config.base_url,
@@ -1586,6 +1638,407 @@ mod velora_price_route_tests {
             error.contains("unexpected native value"),
             "unexpected error: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod kyberswap_provider_tests {
+    use super::*;
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::Arc,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex as TokioMutex,
+    };
+
+    #[derive(Debug, Clone)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: BTreeMap<String, String>,
+        body: String,
+    }
+
+    fn base_usdc() -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::reference("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+        }
+    }
+
+    fn base_native() -> DepositAsset {
+        DepositAsset {
+            chain: ChainId::parse("evm:8453").unwrap(),
+            asset: AssetId::Native,
+        }
+    }
+
+    fn route_summary(token_in: &str, token_out: &str) -> Value {
+        json!({
+            "tokenIn": token_in,
+            "amountIn": "1000000",
+            "amountInUsd": "1",
+            "tokenOut": token_out,
+            "amountOut": "500000000000000",
+            "amountOutUsd": "1",
+            "gas": "360000",
+            "gasPrice": "1",
+            "gasUsd": "0.01",
+            "l1FeeUsd": "0",
+            "route": [],
+            "routeID": "mock-route",
+            "checksum": "mock",
+        })
+    }
+
+    fn route_response() -> Value {
+        json!({
+            "code": 0,
+            "message": "successfully",
+            "data": {
+                "routeSummary": route_summary(
+                    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                    KYBERSWAP_NATIVE_TOKEN,
+                ),
+                "routerAddress": "0x1111111111111111111111111111111111111111",
+            },
+            "requestId": "mock-request",
+        })
+    }
+
+    async fn serve_responses(
+        responses: Vec<(u16, Value)>,
+    ) -> (String, Arc<TokioMutex<Vec<CapturedRequest>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let responses = Arc::new(TokioMutex::new(VecDeque::from(responses)));
+        let captured = Arc::new(TokioMutex::new(Vec::new()));
+        let captured_task = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buffer = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if request_complete(&buffer) {
+                        break;
+                    }
+                }
+                let request = parse_request(&buffer);
+                captured_task.lock().await.push(request);
+                let (status, body) = responses
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or_else(|| (500, json!({"error":"missing response"})));
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    429 => "Too Many Requests",
+                    _ => "Error",
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base_url, captured)
+    }
+
+    fn request_complete(buffer: &[u8]) -> bool {
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        buffer.len() >= header_end + 4 + content_length
+    }
+
+    fn parse_request(buffer: &[u8]) -> CapturedRequest {
+        let header_end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+        let mut lines = header_text.lines();
+        let request_line = lines.next().unwrap();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap().to_string();
+        let path = request_parts.next().unwrap().to_string();
+        let mut headers = BTreeMap::new();
+        for line in lines {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let body = String::from_utf8_lossy(&buffer[header_end + 4..]).to_string();
+        CapturedRequest {
+            method,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    fn quote_request(order_kind: ProviderOrderKind) -> ExchangeQuoteRequest {
+        ExchangeQuoteRequest {
+            input_asset: base_usdc(),
+            output_asset: base_native(),
+            input_decimals: Some(6),
+            output_decimals: Some(18),
+            order_kind,
+            sender_address: None,
+            recipient_address: "0x2222222222222222222222222222222222222222".to_string(),
+        }
+    }
+
+    fn provider(base_url: String) -> KyberswapProvider {
+        KyberswapProvider::new(base_url).unwrap()
+    }
+
+    #[tokio::test]
+    async fn kyberswap_get_requests_generate_distinct_client_ids() {
+        let (base_url, captured) =
+            serve_responses(vec![(200, route_response()), (200, route_response())]).await;
+        let provider = provider(base_url);
+        let request = quote_request(ProviderOrderKind::ExactIn {
+            amount_in: "1000000".to_string(),
+            min_amount_out: None,
+        });
+
+        provider
+            .quote_trade(request.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        provider.quote_trade(request).await.unwrap().unwrap();
+
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 2);
+        let first = captured[0].headers.get("x-client-id").unwrap();
+        assert_eq!(
+            captured[0].headers.get("accept").map(String::as_str),
+            Some(KYBERSWAP_ACCEPT)
+        );
+        assert_eq!(
+            captured[0].headers.get("user-agent").map(String::as_str),
+            Some(KYBERSWAP_USER_AGENT)
+        );
+        let second = captured[1].headers.get("x-client-id").unwrap();
+        Uuid::parse_str(first).expect("first x-client-id must be UUID");
+        Uuid::parse_str(second).expect("second x-client-id must be UUID");
+        assert_ne!(first, second);
+        assert!(captured[0].path.starts_with("/base/api/v1/routes?"));
+    }
+
+    #[tokio::test]
+    async fn kyberswap_exact_out_quote_returns_none_without_request() {
+        let (base_url, captured) = serve_responses(vec![]).await;
+        let quote = provider(base_url)
+            .quote_trade(quote_request(ProviderOrderKind::ExactOut {
+                amount_out: "500000000000000".to_string(),
+                max_amount_in: None,
+            }))
+            .await
+            .unwrap();
+
+        assert!(quote.is_none());
+        assert!(captured.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kyberswap_no_route_codes_return_none_and_429_errors() {
+        for code in [4008, 4009, 4010, 4011, 4221] {
+            let (base_url, _) =
+                serve_responses(vec![(400, json!({"code": code, "message": "no route"}))]).await;
+            let quote = provider(base_url)
+                .quote_trade(quote_request(ProviderOrderKind::ExactIn {
+                    amount_in: "1000000".to_string(),
+                    min_amount_out: None,
+                }))
+                .await
+                .unwrap();
+            assert!(quote.is_none(), "code {code} should be no-route");
+        }
+
+        let (base_url, _) =
+            serve_responses(vec![(429, json!({"code": 4008, "message": "rate limit"}))]).await;
+        let error = provider(base_url)
+            .quote_trade(quote_request(ProviderOrderKind::ExactIn {
+                amount_in: "1000000".to_string(),
+                min_amount_out: None,
+            }))
+            .await
+            .expect_err("429 must remain an error");
+        assert!(error.contains("429"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn kyberswap_route_build_body_omits_source_referral_and_client_id_fields() {
+        let (base_url, captured) = serve_responses(vec![(
+            200,
+            json!({
+                "code": 0,
+                "data": {
+                    "routerAddress": "0x1111111111111111111111111111111111111111",
+                    "data": "0xabcdef",
+                    "transactionValue": "0",
+                },
+                "requestId": "build-request",
+            }),
+        )])
+        .await;
+        let intent = provider(base_url)
+            .execute_trade(&ExchangeExecutionRequest::UniversalRouterSwap(
+                step_request(
+                    base_usdc(),
+                    base_native(),
+                    route_summary(
+                        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                        KYBERSWAP_NATIVE_TOKEN,
+                    ),
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let ProviderExecutionIntent::CustodyActions { actions, .. } = intent else {
+            panic!("kyberswap execution should emit custody actions");
+        };
+        assert_eq!(actions.len(), 2);
+        let CustodyAction::Call(ChainCall::Evm(approval)) = &actions[0] else {
+            panic!("first action should approve ERC-20 input");
+        };
+        assert_eq!(
+            approval.to_address,
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+        );
+        let CustodyAction::Call(ChainCall::Evm(swap)) = &actions[1] else {
+            panic!("second action should call Kyber router");
+        };
+        assert_eq!(
+            swap.to_address,
+            "0x1111111111111111111111111111111111111111"
+        );
+        assert_eq!(swap.value, "0");
+        let captured = captured.lock().await;
+        assert_eq!(captured[0].method, "POST");
+        assert_eq!(captured[0].path, "/base/api/v1/route/build");
+        assert!(captured[0].headers.contains_key("x-client-id"));
+        assert_eq!(
+            captured[0].headers.get("accept").map(String::as_str),
+            Some(KYBERSWAP_ACCEPT)
+        );
+        assert_eq!(
+            captured[0].headers.get("user-agent").map(String::as_str),
+            Some(KYBERSWAP_USER_AGENT)
+        );
+        let body: Value = serde_json::from_str(&captured[0].body).unwrap();
+        assert!(body.get("source").is_none());
+        assert!(body.get("referral").is_none());
+        assert!(body.get("client_id").is_none());
+        assert!(body.get("x-client-id").is_none());
+    }
+
+    #[test]
+    fn kyberswap_route_summary_validation_rejects_mismatched_token_or_amount() {
+        let mut summary = route_summary(
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            KYBERSWAP_NATIVE_TOKEN,
+        );
+        set_json_value(&mut summary, "amountIn", json!("1"));
+        let error = validate_kyberswap_route_summary(KyberswapRouteSummaryExpectations {
+            route_summary: &summary,
+            token_in: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            token_out: KYBERSWAP_NATIVE_TOKEN,
+            amount_in: "1000000",
+            amount_out: "500000000000000",
+        })
+        .expect_err("amount mismatch must fail");
+        assert!(error.contains("amountIn"), "{error}");
+    }
+
+    #[test]
+    fn kyberswap_transaction_value_requires_native_value_and_rejects_erc20_value() {
+        assert!(
+            kyberswap_transaction_value(&base_native(), &json!({"transactionValue": "0"}))
+                .unwrap_err()
+                .contains("zero")
+        );
+        assert_eq!(
+            kyberswap_transaction_value(
+                &base_native(),
+                &json!({"transactionValue": "1000000000000000"})
+            )
+            .unwrap(),
+            U256::from(1_000_000_000_000_000_u64)
+        );
+        assert_eq!(
+            kyberswap_transaction_value(&base_usdc(), &json!({})).unwrap(),
+            U256::ZERO
+        );
+        assert!(
+            kyberswap_transaction_value(&base_usdc(), &json!({"transactionValue": "1"}))
+                .unwrap_err()
+                .contains("unexpected native value")
+        );
+    }
+
+    fn step_request(
+        input_asset: DepositAsset,
+        output_asset: DepositAsset,
+        price_route: Value,
+    ) -> UniversalRouterSwapStepRequest {
+        UniversalRouterSwapStepRequest {
+            order_id: Uuid::now_v7(),
+            quote_id: Uuid::now_v7(),
+            order_kind: "exact_in".to_string(),
+            amount_in: "1000000".to_string(),
+            amount_out: "500000000000000".to_string(),
+            min_amount_out: None,
+            max_amount_in: None,
+            input_asset: UniversalRouterAssetRef {
+                chain_id: input_asset.chain.as_str().to_string(),
+                asset: input_asset.asset.as_str().to_string(),
+            },
+            output_asset: UniversalRouterAssetRef {
+                chain_id: output_asset.chain.as_str().to_string(),
+                asset: output_asset.asset.as_str().to_string(),
+            },
+            input_decimals: 6,
+            output_decimals: 18,
+            price_route,
+            slippage_bps: None,
+            source_custody_vault_id: Some(Uuid::now_v7()),
+            source_custody_vault_address: Some(
+                "0x3333333333333333333333333333333333333333".to_string(),
+            ),
+            recipient_address: "0x2222222222222222222222222222222222222222".to_string(),
+            recipient_custody_vault_id: None,
+        }
     }
 }
 
@@ -4569,6 +5022,428 @@ fn rustls_http_client(proxy_url: Option<&UpstreamProxy>) -> Result<reqwest::Clie
 }
 
 #[derive(Clone)]
+pub struct KyberswapProvider {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct KyberswapRouteQuote {
+    route_summary: Value,
+    router_address: String,
+    request_id: Option<String>,
+}
+
+impl KyberswapProvider {
+    pub fn new(base_url: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_proxy_url(base_url, None)
+    }
+
+    pub fn new_with_proxy_url(
+        base_url: impl Into<String>,
+        proxy_url: Option<&UpstreamProxy>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            base_url: normalize_base_url(base_url)?,
+            http: rustls_http_client(proxy_url)?,
+        })
+    }
+
+    async fn fetch_route(
+        &self,
+        chain_slug: &str,
+        token_in: &str,
+        token_out: &str,
+        amount_in: &str,
+    ) -> ProviderResult<Option<KyberswapRouteQuote>> {
+        let query = vec![
+            ("tokenIn", token_in.to_string()),
+            ("tokenOut", token_out.to_string()),
+            ("amountIn", amount_in.to_string()),
+            ("gasInclude", "true".to_string()),
+        ];
+        let path = format!("/{chain_slug}/api/v1/routes");
+        let url = format!("{}{}", self.base_url, path);
+        let started = Instant::now();
+        let response = match self
+            .http
+            .get(&url)
+            .query(&query)
+            .header(reqwest::header::ACCEPT, KYBERSWAP_ACCEPT)
+            .header(reqwest::header::USER_AGENT, KYBERSWAP_USER_AGENT)
+            .header("x-client-id", next_kyberswap_client_id())
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_trading_venue_transport_error(
+                    "kyberswap",
+                    "GET",
+                    "/:chain/api/v1/routes",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "kyberswap route request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
+        let status = response.status();
+        telemetry::record_trading_venue_http_status(
+            "kyberswap",
+            "GET",
+            "/:chain/api/v1/routes",
+            status.as_u16(),
+            started.elapsed(),
+        );
+        let response_body = read_limited_response_text(response, KYBERSWAP_MAX_RESPONSE_BODY_BYTES)
+            .await
+            .map_err(|err| format!("kyberswap route response body failed: {err}"))?;
+        if response_body.truncated {
+            return Err(format!(
+                "kyberswap route response body exceeded {KYBERSWAP_MAX_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+        let response_text = response_body.text;
+        let body: Value = serde_json::from_str(&response_text).map_err(|err| {
+            format!(
+                "kyberswap route response was not JSON: {err}: {}",
+                response_body_error_preview(&response_text)
+            )
+        })?;
+        if !status.is_success() {
+            if kyberswap_error_is_no_route(status, &body) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "kyberswap route request failed with {status}: {}",
+                response_body_error_preview(&response_text)
+            ));
+        }
+        let data = body
+            .get("data")
+            .ok_or_else(|| "kyberswap route response missing data".to_string())?;
+        let route_summary = data
+            .get("routeSummary")
+            .cloned()
+            .ok_or_else(|| "kyberswap route response missing data.routeSummary".to_string())?;
+        let router_address = kyberswap_value_string(data, "routerAddress")?;
+        let request_id = body
+            .get("requestId")
+            .or_else(|| body.get("request_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(Some(KyberswapRouteQuote {
+            route_summary,
+            router_address,
+            request_id,
+        }))
+    }
+
+    async fn build_transaction(
+        &self,
+        chain_slug: &str,
+        step: &UniversalRouterSwapStepRequest,
+        source_address: &str,
+    ) -> ProviderResult<Value> {
+        let body = json!({
+            "routeSummary": step.price_route,
+            "sender": source_address,
+            "recipient": step.recipient_address,
+            "origin": source_address,
+            "slippageTolerance": step.slippage_bps.unwrap_or(KYBERSWAP_DEFAULT_SLIPPAGE_BPS),
+        });
+        let path = format!("/{chain_slug}/api/v1/route/build");
+        let url = format!("{}{}", self.base_url, path);
+        let started = Instant::now();
+        let response = match self
+            .http
+            .post(&url)
+            .header(reqwest::header::ACCEPT, KYBERSWAP_ACCEPT)
+            .header(reqwest::header::USER_AGENT, KYBERSWAP_USER_AGENT)
+            .header("x-client-id", next_kyberswap_client_id())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                telemetry::record_trading_venue_transport_error(
+                    "kyberswap",
+                    "POST",
+                    "/:chain/api/v1/route/build",
+                    started.elapsed(),
+                );
+                return Err(format!(
+                    "kyberswap route build request failed: {}",
+                    err.without_url()
+                ));
+            }
+        };
+        let status = response.status();
+        telemetry::record_trading_venue_http_status(
+            "kyberswap",
+            "POST",
+            "/:chain/api/v1/route/build",
+            status.as_u16(),
+            started.elapsed(),
+        );
+        let response_body = read_limited_response_text(response, KYBERSWAP_MAX_RESPONSE_BODY_BYTES)
+            .await
+            .map_err(|err| format!("kyberswap route build response body failed: {err}"))?;
+        if response_body.truncated {
+            return Err(format!(
+                "kyberswap route build response body exceeded {KYBERSWAP_MAX_RESPONSE_BODY_BYTES} bytes"
+            ));
+        }
+        let response_text = response_body.text;
+        let body: Value = serde_json::from_str(&response_text).map_err(|err| {
+            format!(
+                "kyberswap route build response was not JSON: {err}: {}",
+                response_body_error_preview(&response_text)
+            )
+        })?;
+        if !status.is_success() {
+            return Err(format!(
+                "kyberswap route build request failed with {status}: {}",
+                response_body_error_preview(&response_text)
+            ));
+        }
+        Ok(body)
+    }
+}
+impl ExchangeProvider for KyberswapProvider {
+    fn id(&self) -> &str {
+        ProviderId::Kyberswap.as_str()
+    }
+
+    fn quote_trade<'a>(
+        &'a self,
+        request: ExchangeQuoteRequest,
+    ) -> ProviderFuture<'a, Option<ExchangeQuote>> {
+        Box::pin(async move {
+            if request.input_asset.chain != request.output_asset.chain {
+                return Ok(None);
+            }
+            if request.input_asset.asset == request.output_asset.asset {
+                return Ok(None);
+            }
+            let Some(network) = request.input_asset.chain.evm_chain_id() else {
+                return Ok(None);
+            };
+            let Some(chain_slug) = kyberswap_chain_slug(&request.input_asset.chain) else {
+                return Ok(None);
+            };
+            let Some(token_in) = kyberswap_token_address(&request.input_asset) else {
+                return Ok(None);
+            };
+            let Some(token_out) = kyberswap_token_address(&request.output_asset) else {
+                return Ok(None);
+            };
+            let Some(src_decimals) =
+                kyberswap_asset_decimals(&request.input_asset, request.input_decimals)
+            else {
+                return Ok(None);
+            };
+            let Some(dest_decimals) =
+                kyberswap_asset_decimals(&request.output_asset, request.output_decimals)
+            else {
+                return Ok(None);
+            };
+            let amount_in = match &request.order_kind {
+                ProviderOrderKind::ExactIn { amount_in, .. } => amount_in.clone(),
+                ProviderOrderKind::ExactOut { .. } => return Ok(None),
+            };
+            let Some(route) = self
+                .fetch_route(chain_slug, &token_in, &token_out, &amount_in)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let route_summary = route.route_summary.clone();
+            let amount_in = kyberswap_route_summary_string(&route_summary, "amountIn")?;
+            let amount_out = kyberswap_route_summary_string(&route_summary, "amountOut")?;
+            let min_amount_out = match &request.order_kind {
+                ProviderOrderKind::ExactIn { min_amount_out, .. } => min_amount_out.clone(),
+                ProviderOrderKind::ExactOut { .. } => None,
+            };
+            let slippage_bps = kyberswap_slippage_bps(&request.order_kind, &amount_out)?;
+
+            Ok(Some(ExchangeQuote {
+                provider_id: ProviderId::Kyberswap.as_str().to_string(),
+                amount_in: amount_in.clone(),
+                amount_out: amount_out.clone(),
+                min_amount_out,
+                max_amount_in: None,
+                provider_quote: kyberswap_quote_descriptor(
+                    &request,
+                    network,
+                    chain_slug,
+                    &token_in,
+                    &token_out,
+                    &amount_in,
+                    &amount_out,
+                    src_decimals,
+                    dest_decimals,
+                    slippage_bps,
+                    route,
+                ),
+                expires_at: Utc::now() + chrono::Duration::seconds(10),
+            }))
+        })
+    }
+
+    fn execute_trade<'a>(
+        &'a self,
+        request: &'a ExchangeExecutionRequest,
+    ) -> ProviderFuture<'a, ProviderExecutionIntent> {
+        Box::pin(async move {
+            let ExchangeExecutionRequest::UniversalRouterSwap(step) = request else {
+                return Err(format!(
+                    "kyberswap cannot execute exchange request kind {}",
+                    request.kind()
+                ));
+            };
+            if step.order_kind.as_str() != "exact_in" {
+                if step.order_kind.as_str() == "exact_out" {
+                    return Err("kyberswap does not support exact_out execution".to_string());
+                }
+                return Err(format!(
+                    "unsupported kyberswap order_kind {:?}",
+                    step.order_kind
+                ));
+            }
+            let input_asset = step.input_asset.deposit_asset()?;
+            let output_asset = step.output_asset.deposit_asset()?;
+            if input_asset.chain != output_asset.chain {
+                return Err("kyberswap swaps must stay on one EVM chain".to_string());
+            }
+            let network = input_asset
+                .chain
+                .evm_chain_id()
+                .ok_or_else(|| "kyberswap swaps require an EVM chain".to_string())?;
+            let chain_slug = kyberswap_chain_slug(&input_asset.chain)
+                .ok_or_else(|| "kyberswap swaps require a supported EVM chain".to_string())?;
+            let token_in = kyberswap_token_address(&input_asset).ok_or_else(|| {
+                "kyberswap swaps require native or ERC-20 input asset".to_string()
+            })?;
+            let token_out = kyberswap_token_address(&output_asset).ok_or_else(|| {
+                "kyberswap swaps require native or ERC-20 output asset".to_string()
+            })?;
+            validate_kyberswap_route_summary(KyberswapRouteSummaryExpectations {
+                route_summary: &step.price_route,
+                token_in: &token_in,
+                token_out: &token_out,
+                amount_in: &step.amount_in,
+                amount_out: &step.amount_out,
+            })?;
+            let source_vault_id = step.source_custody_vault_id.ok_or_else(|| {
+                "kyberswap universal router step missing source_custody_vault_id".to_string()
+            })?;
+            let source_address = step
+                .source_custody_vault_address
+                .as_deref()
+                .ok_or_else(|| {
+                    "kyberswap universal router step missing source_custody_vault_address"
+                        .to_string()
+                })?;
+            let response = self
+                .build_transaction(chain_slug, step, source_address)
+                .await?;
+            let data = response
+                .get("data")
+                .ok_or_else(|| "kyberswap route build response missing data".to_string())?;
+            let router_address = kyberswap_value_string(data, "routerAddress")?;
+            let swap_data = kyberswap_value_string(data, "data")?;
+            let swap_value = kyberswap_transaction_value(&input_asset, data)?.to_string();
+            let transaction = json!({
+                "to": router_address,
+                "data": swap_data,
+                "value": swap_value,
+                "kyberswap_response": response,
+            });
+            let swap_to = kyberswap_value_string(&transaction, "to")?;
+            let swap_data = kyberswap_value_string(&transaction, "data")?;
+            let swap_value = kyberswap_value_string(&transaction, "value")?;
+
+            let mut actions = Vec::new();
+            if let AssetId::Reference(token_address) = &input_asset.asset {
+                let approve_amount = step.max_amount_in.as_deref().unwrap_or(&step.amount_in);
+                actions.push(CustodyAction::Call(ChainCall::Evm(EvmCall {
+                    to_address: token_address.clone(),
+                    value: "0".to_string(),
+                    calldata: encode_erc20_approve(&swap_to, approve_amount)?,
+                    broadcast_policy: Default::default(),
+                })));
+            }
+            actions.push(CustodyAction::Call(ChainCall::Evm(EvmCall {
+                to_address: swap_to,
+                value: swap_value,
+                calldata: swap_data,
+                broadcast_policy: EvmBroadcastPolicy::FlashbotsIfEthereum,
+            })));
+
+            Ok(ProviderExecutionIntent::CustodyActions {
+                custody_vault_id: source_vault_id,
+                actions,
+                provider_context: json!({
+                    "kind": "kyberswap_universal_router_swap",
+                    "network": network,
+                    "chain_slug": chain_slug,
+                    "order_kind": step.order_kind,
+                }),
+                state: ProviderExecutionState {
+                    operation: Some(ProviderOperationIntent {
+                        operation_type: ProviderOperationType::UniversalRouterSwap,
+                        status: ProviderOperationStatus::Submitted,
+                        provider_ref: None,
+                        idempotency_key: None,
+                        request: Some(
+                            serde_json::to_value(step).map_err(|err| {
+                                format!("serialize kyberswap step request: {err}")
+                            })?,
+                        ),
+                        response: Some(transaction),
+                        observed_state: Some(json!({
+                            "kind": "kyberswap_universal_router_swap",
+                            "network": network,
+                            "chain_slug": chain_slug,
+                        })),
+                    }),
+                    addresses: vec![],
+                },
+            })
+        })
+    }
+
+    fn post_execute<'a>(
+        &'a self,
+        provider_context: &'a Value,
+        receipts: &'a [CustodyActionReceipt],
+    ) -> ProviderFuture<'a, ProviderExecutionStatePatch> {
+        Box::pin(async move {
+            let tx_hashes: Vec<String> = receipts
+                .iter()
+                .map(|receipt| receipt.tx_hash.clone())
+                .collect();
+            let tx_hash = tx_hashes.last().cloned();
+            Ok(ProviderExecutionStatePatch {
+                provider_ref: tx_hash.clone(),
+                observed_state: Some(json!({
+                    "kind": "kyberswap_universal_router_swap",
+                    "provider_context": provider_context,
+                    "tx_hash": tx_hash,
+                    "tx_hashes": tx_hashes,
+                })),
+                response: None,
+                status: Some(ProviderOperationStatus::WaitingExternal),
+            })
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct VeloraProvider {
     base_url: String,
     partner: Option<String>,
@@ -5774,6 +6649,257 @@ impl UniversalRouterAssetRef {
     }
 }
 
+fn next_kyberswap_client_id() -> String {
+    Uuid::now_v7().simple().to_string()
+}
+
+fn kyberswap_chain_slug(chain: &ChainId) -> Option<&'static str> {
+    match chain.evm_chain_id()? {
+        1 => Some("ethereum"),
+        10 => Some("optimism"),
+        56 => Some("bsc"),
+        130 => Some("unichain"),
+        137 => Some("polygon"),
+        143 => Some("monad"),
+        146 => Some("sonic"),
+        999 => Some("hyperevm"),
+        2020 => Some("ronin"),
+        4326 => Some("megaeth"),
+        5000 => Some("mantle"),
+        8453 => Some("base"),
+        9745 => Some("plasma"),
+        42161 => Some("arbitrum"),
+        42793 => Some("etherlink"),
+        43114 => Some("avalanche"),
+        59144 => Some("linea"),
+        80094 => Some("berachain"),
+        _ => None,
+    }
+}
+
+fn kyberswap_token_address(asset: &DepositAsset) -> Option<String> {
+    asset.chain.evm_chain_id()?;
+    match &asset.asset {
+        AssetId::Native => Some(KYBERSWAP_NATIVE_TOKEN.to_string()),
+        AssetId::Reference(address) => Address::from_str(address)
+            .ok()
+            .map(|address| format!("{address:#x}")),
+    }
+}
+
+fn kyberswap_asset_decimals(asset: &DepositAsset, hinted: Option<u8>) -> Option<u8> {
+    match asset.asset {
+        AssetId::Native => Some(18),
+        AssetId::Reference(_) => hinted,
+    }
+}
+
+fn kyberswap_error_code(value: &Value) -> Option<i64> {
+    value
+        .get("code")
+        .and_then(|code| code.as_i64().or_else(|| code.as_str()?.parse::<i64>().ok()))
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(|code| code.as_i64().or_else(|| code.as_str()?.parse::<i64>().ok()))
+        })
+}
+
+fn kyberswap_error_is_no_route(status: reqwest::StatusCode, body: &Value) -> bool {
+    status != reqwest::StatusCode::TOO_MANY_REQUESTS
+        && matches!(
+            kyberswap_error_code(body),
+            Some(4008 | 4009 | 4010 | 4011 | 4221)
+        )
+}
+
+fn kyberswap_value_string(value: &Value, field: &'static str) -> ProviderResult<String> {
+    match value.get(field) {
+        Some(Value::String(raw)) if !raw.trim().is_empty() => Ok(raw.clone()),
+        Some(Value::Number(number)) => Ok(number.to_string()),
+        Some(other) => Err(format!(
+            "kyberswap field {field} was not a string/number: {other}"
+        )),
+        None => Err(format!("kyberswap response missing field {field}")),
+    }
+}
+
+fn kyberswap_route_summary_string(
+    route_summary: &Value,
+    field: &'static str,
+) -> ProviderResult<String> {
+    kyberswap_value_string(route_summary, field)
+}
+
+fn kyberswap_response_optional_u256(
+    response: &Value,
+    field: &'static str,
+) -> ProviderResult<Option<U256>> {
+    match response.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => parse_u256_decimal_or_hex(field, raw).map(Some),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .map(U256::from)
+            .map(Some)
+            .ok_or_else(|| format!("kyberswap field {field} does not fit into u64")),
+        Some(other) => Err(format!(
+            "kyberswap field {field} was not a string/number: {other}"
+        )),
+    }
+}
+
+fn kyberswap_transaction_value(
+    input_asset: &DepositAsset,
+    transaction: &Value,
+) -> ProviderResult<U256> {
+    let value = kyberswap_response_optional_u256(transaction, "transactionValue")?;
+    if input_asset.asset.is_native() {
+        let Some(value) = value else {
+            return Err(
+                "kyberswap native-input transaction response missing transactionValue".to_string(),
+            );
+        };
+        if value.is_zero() {
+            return Err(
+                "kyberswap native-input transaction response had zero transactionValue".to_string(),
+            );
+        }
+        return Ok(value);
+    }
+
+    let value = value.unwrap_or(U256::ZERO);
+    if !value.is_zero() {
+        return Err(format!(
+            "kyberswap ERC-20-input transaction response requested unexpected native value {value}"
+        ));
+    }
+    Ok(value)
+}
+
+struct KyberswapRouteSummaryExpectations<'a> {
+    route_summary: &'a Value,
+    token_in: &'a str,
+    token_out: &'a str,
+    amount_in: &'a str,
+    amount_out: &'a str,
+}
+
+fn validate_kyberswap_route_summary(
+    expected: KyberswapRouteSummaryExpectations<'_>,
+) -> ProviderResult<()> {
+    let KyberswapRouteSummaryExpectations {
+        route_summary,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out,
+    } = expected;
+    let route_token_in = kyberswap_route_summary_string(route_summary, "tokenIn")?;
+    if !route_token_in.eq_ignore_ascii_case(token_in) {
+        return Err(format!(
+            "kyberswap routeSummary tokenIn {route_token_in:?} does not match execution tokenIn {token_in:?}"
+        ));
+    }
+    let route_token_out = kyberswap_route_summary_string(route_summary, "tokenOut")?;
+    if !route_token_out.eq_ignore_ascii_case(token_out) {
+        return Err(format!(
+            "kyberswap routeSummary tokenOut {route_token_out:?} does not match execution tokenOut {token_out:?}"
+        ));
+    }
+    let route_amount_in = parse_u256_decimal_or_hex(
+        "kyberswap routeSummary amountIn",
+        &kyberswap_route_summary_string(route_summary, "amountIn")?,
+    )?;
+    let expected_amount_in = parse_u256_decimal_or_hex("kyberswap execution amount_in", amount_in)?;
+    if route_amount_in != expected_amount_in {
+        return Err(format!(
+            "kyberswap routeSummary amountIn {route_amount_in} does not match execution amount_in {expected_amount_in}"
+        ));
+    }
+    let route_amount_out = parse_u256_decimal_or_hex(
+        "kyberswap routeSummary amountOut",
+        &kyberswap_route_summary_string(route_summary, "amountOut")?,
+    )?;
+    let expected_amount_out =
+        parse_u256_decimal_or_hex("kyberswap execution amount_out", amount_out)?;
+    if route_amount_out != expected_amount_out {
+        return Err(format!(
+            "kyberswap routeSummary amountOut {route_amount_out} does not match execution amount_out {expected_amount_out}"
+        ));
+    }
+    Ok(())
+}
+
+fn kyberswap_slippage_bps(
+    order_kind: &ProviderOrderKind,
+    amount_out: &str,
+) -> ProviderResult<Option<u64>> {
+    match order_kind {
+        ProviderOrderKind::ExactIn { min_amount_out, .. } => {
+            let Some(min_amount_out) = min_amount_out.as_deref() else {
+                return Ok(Some(KYBERSWAP_DEFAULT_SLIPPAGE_BPS));
+            };
+            let quoted_out = parse_u256_decimal_or_hex("kyberswap amount_out", amount_out)?;
+            if quoted_out.is_zero() {
+                return Err("kyberswap quote returned zero amount_out".to_string());
+            }
+            let min_out = parse_u256_decimal_or_hex("kyberswap min_amount_out", min_amount_out)?;
+            if min_out >= quoted_out {
+                return Ok(Some(0));
+            }
+            ratio_to_capped_bps(quoted_out - min_out, quoted_out).map(Some)
+        }
+        ProviderOrderKind::ExactOut { .. } => Ok(None),
+    }
+}
+
+fn kyberswap_quote_descriptor(
+    request: &ExchangeQuoteRequest,
+    network: u64,
+    chain_slug: &str,
+    token_in: &str,
+    token_out: &str,
+    amount_in: &str,
+    amount_out: &str,
+    src_decimals: u8,
+    dest_decimals: u8,
+    slippage_bps: Option<u64>,
+    route: KyberswapRouteQuote,
+) -> Value {
+    let min_amount_out = match &request.order_kind {
+        ProviderOrderKind::ExactIn { min_amount_out, .. } => min_amount_out.clone(),
+        ProviderOrderKind::ExactOut { .. } => None,
+    };
+    json!({
+        "schema_version": 1,
+        "kind": "universal_router_swap",
+        "order_kind": "exact_in",
+        "network": network,
+        "chain_slug": chain_slug,
+        "src_token": token_in,
+        "dest_token": token_out,
+        "src_decimals": src_decimals,
+        "dest_decimals": dest_decimals,
+        "input_asset": {
+            "chain_id": request.input_asset.chain.as_str(),
+            "asset": request.input_asset.asset.as_str(),
+        },
+        "output_asset": {
+            "chain_id": request.output_asset.chain.as_str(),
+            "asset": request.output_asset.asset.as_str(),
+        },
+        "amount_in": amount_in,
+        "amount_out": amount_out,
+        "min_amount_out": min_amount_out,
+        "max_amount_in": Value::Null,
+        "slippage_bps": slippage_bps,
+        "price_route": route.route_summary,
+        "router_address": route.router_address,
+        "request_id": route.request_id,
+    })
+}
 struct VeloraQuoteDescriptorSpec<'a> {
     request: &'a ExchangeQuoteRequest,
     network: u64,
@@ -7529,10 +8655,11 @@ mod hyperliquid_math_tests {
         BridgeQuoteRequest, CctpHttpProviderConfig, CctpMessagesResponse, CctpProvider,
         CctpQuoteAmounts, CctpTransferMode, ExchangeExecutionRequest, ExchangeProvider,
         ExchangeQuoteRequest, HyperliquidBridgeProvider, HyperliquidCallNetwork,
-        HyperliquidProvider, HyperliquidTradeAssetRef, HyperliquidTradeStepRequest, LimitPxInput,
-        ProviderExecutionIntent, ProviderOperationObservationRequest, UniversalRouterAssetRef,
-        VeloraHttpProviderConfig, VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS,
-        HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW, VELORA_DEFAULT_SLIPPAGE_BPS,
+        HyperliquidProvider, HyperliquidTradeAssetRef, HyperliquidTradeStepRequest,
+        KyberswapHttpProviderConfig, LimitPxInput, ProviderExecutionIntent,
+        ProviderOperationObservationRequest, UniversalRouterAssetRef, VeloraHttpProviderConfig,
+        VeloraProvider, DEFAULT_HYPERLIQUID_ORDER_TIMEOUT_MS, HYPERLIQUID_BRIDGE_WITHDRAW_FEE_RAW,
+        VELORA_DEFAULT_SLIPPAGE_BPS,
     };
     use crate::services::upstream_proxy::{ProxyDnsMode, ProxyUrl, UpstreamProxy};
     use crate::{
@@ -7949,6 +9076,9 @@ mod hyperliquid_math_tests {
             )),
             hyperliquid_base_url: Some("https://hyperliquid.example/hyper-path-secret".to_string()),
             hyperliquid_proxy_url: None,
+            kyberswap: Some(KyberswapHttpProviderConfig::new(
+                "https://kyberswap.example/kyber-path-secret",
+            )),
             velora: Some(VeloraHttpProviderConfig::new(
                 "not a url containing velora-secret",
             )),
@@ -7974,6 +9104,7 @@ mod hyperliquid_math_tests {
             None,
             None,
             Some("http://hyperunit.local".to_string()),
+            None,
             None,
             None,
             None,
@@ -8009,7 +9140,6 @@ mod hyperliquid_math_tests {
             sender_address: None,
             recipient_address: "0x1111111111111111111111111111111111111111".to_string(),
         };
-
         let quote = hyperliquid_spot_transfer_quote(&request, "hyperliquid_spot", "UBTC");
 
         assert_eq!(quote.amount_in, "50000");

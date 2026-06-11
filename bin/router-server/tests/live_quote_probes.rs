@@ -1111,6 +1111,7 @@ fn live_action_provider_registry() -> TestResult<ActionProviderRegistry> {
         hyperunit_proxy,
         Some(hyperliquid_api_url),
         Some(VeloraHttpProviderConfig::new(velora_api_url).with_partner(velora_partner)),
+        None,
         HyperliquidCallNetwork::Mainnet,
     )
     .map_err(|error| format!("build live action provider registry: {error}").into())

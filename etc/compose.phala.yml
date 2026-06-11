@@ -334,6 +334,7 @@ x-router-environment: &router-environment
   - HYPERUNIT_PROXY_PROFILE=${HYPERUNIT_PROXY_PROFILE:-ipv4-eu}
   - HYPERLIQUID_PROXY_PROFILE=${HYPERLIQUID_PROXY_PROFILE:-ipv6-us-west-1}
   - VELORA_PROXY_PROFILE=${VELORA_PROXY_PROFILE:-ipv6-us-west-1}
+  - KYBERSWAP_PROXY_PROFILE=${KYBERSWAP_PROXY_PROFILE:-ipv6-us-west-1}
   - RELAY_PROXY_PROFILE=${RELAY_PROXY_PROFILE:-ipv6-us-west-1}
   - NEAR_INTENTS_PROXY_PROFILE=${NEAR_INTENTS_PROXY_PROFILE:-ipv6-us-west-1}
   - MAYAN_PROXY_PROFILE=${MAYAN_PROXY_PROFILE:-ipv6-us-west-1}
@@ -344,7 +345,7 @@ x-router-environment: &router-environment
   - HYPERLIQUID_API_URL=https://api.hyperliquid.xyz
   - HYPERLIQUID_NETWORK=mainnet
   - HYPERLIQUID_ORDER_TIMEOUT_MS=${HYPERLIQUID_ORDER_TIMEOUT_MS:-30000}
-  - VELORA_API_URL=https://api.paraswap.io
+  - KYBERSWAP_API_URL=https://aggregator-api.kyberswap.com
   - RELAY_API_URL=${RELAY_API_URL:-https://api.relay.link}
   - RELAY_API_KEY
   - NEAR_INTENTS_API_URL=${NEAR_INTENTS_API_URL:-https://1click.chaindefuser.com}
@@ -364,7 +365,6 @@ x-router-environment: &router-environment
   - CCTP_MESSAGE_TRANSMITTER_V2_ADDRESS=0x81D40F21F12A8F0E3252Bccb954D722d4c464B64
   - CCTP_TRANSFER_MODE=${CCTP_TRANSFER_MODE:-standard}
   - CORS_DOMAIN
-  - VELORA_PARTNER
   - LOKI_URL
   - TEMPORAL_ADDRESS=http://temporal:7233
   - TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE:-default}

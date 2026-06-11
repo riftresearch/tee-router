@@ -19,7 +19,8 @@ use router_core::{
     services::{
         action_providers::{
             AcrossHttpProviderConfig, ActionProviderHttpOptions, ActionProviderRegistry,
-            CctpHttpProviderConfig, CctpTransferMode, VeloraHttpProviderConfig,
+            CctpHttpProviderConfig, CctpTransferMode, KyberswapHttpProviderConfig,
+            VeloraHttpProviderConfig,
         },
         asset_registry::ProviderId,
         custody_action_executor::{evm_address_from_private_key, PaymasterRegistry},
@@ -194,6 +195,10 @@ fn resolve_upstream_proxies(args: &RouterServerArgs) -> Result<ResolvedProxies> 
                 args.hyperliquid_proxy_profile.as_deref(),
             ),
             (ProxyTarget::Velora, args.velora_proxy_profile.as_deref()),
+            (
+                ProxyTarget::Kyberswap,
+                args.kyberswap_proxy_profile.as_deref(),
+            ),
             (ProxyTarget::Relay, args.relay_proxy_profile.as_deref()),
             (
                 ProxyTarget::NearIntents,
@@ -299,6 +304,12 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
     );
     optional_http_url(
         &mut errors,
+        "KYBERSWAP_API_URL",
+        "KyberSwap API URL",
+        args.kyberswap_api_url.as_deref(),
+    );
+    optional_http_url(
+        &mut errors,
         "RELAY_API_URL",
         "Relay API URL",
         args.relay_api_url.as_deref(),
@@ -397,6 +408,12 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
         );
         require_http_url(
             &mut errors,
+            "KYBERSWAP_API_URL",
+            "KyberSwap API URL",
+            args.kyberswap_api_url.as_deref(),
+        );
+        require_http_url(
+            &mut errors,
             "CHAINALYSIS_HOST",
             "Chainalysis host",
             args.chainalysis_host.as_deref(),
@@ -431,6 +448,7 @@ fn validate_upstream_config(args: &RouterServerArgs) -> Result<()> {
             ProxyTarget::Hyperunit,
             ProxyTarget::Hyperliquid,
             ProxyTarget::Velora,
+            ProxyTarget::Kyberswap,
             ProxyTarget::Chainalysis,
             ProxyTarget::Coinbase,
         ];
@@ -798,6 +816,11 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
                 .with_partner(normalize_optional_string(args.velora_partner.as_deref()))
                 .with_proxy_url(proxies.proxy_owned(ProxyTarget::Velora))
         });
+    let kyberswap = normalize_optional_url(args.kyberswap_api_url.as_deref(), "KyberSwap API URL")?
+        .map(|base_url| {
+            KyberswapHttpProviderConfig::new(base_url)
+                .with_proxy_url(proxies.proxy_owned(ProxyTarget::Kyberswap))
+        });
     let cctp_base_url = normalize_optional_url(args.cctp_api_url.as_deref(), "CCTP API URL")?
         .unwrap_or_else(|| CCTP_IRIS_DEFAULT_BASE_URL_FOR_CONFIG.to_string());
     let cctp_transfer_mode = cctp_transfer_mode_for_config(args.cctp_transfer_mode.as_deref())?;
@@ -824,6 +847,7 @@ fn initialize_action_providers(args: &RouterServerArgs) -> Result<ActionProvider
             "Hyperliquid API URL",
         )?,
         hyperliquid_proxy_url: proxies.proxy_owned(ProxyTarget::Hyperliquid),
+        kyberswap,
         velora,
         hyperliquid_network: args.hyperliquid_network,
         hyperliquid_order_timeout_ms: args.hyperliquid_order_timeout_ms,
@@ -1042,6 +1066,8 @@ mod tests {
             hyperliquid_proxy_profile: None,
             velora_api_url: None,
             velora_proxy_profile: None,
+            kyberswap_api_url: None,
+            kyberswap_proxy_profile: None,
             velora_partner: None,
             relay_api_url: None,
             relay_api_key: None,
@@ -1095,6 +1121,7 @@ mod tests {
         args.hyperunit_api_url = Some("https://unit.example".to_string());
         args.hyperliquid_api_url = Some("https://hyperliquid.example".to_string());
         args.velora_api_url = Some("https://velora.example".to_string());
+        args.kyberswap_api_url = Some("https://kyberswap.example".to_string());
         args.chainalysis_host = Some("https://chainalysis.example".to_string());
         args.chainalysis_token = Some("chainalysis-token".to_string());
         args.coinbase_price_api_base_url = Some("https://coinbase.example".to_string());
@@ -1111,6 +1138,7 @@ mod tests {
         args.hyperunit_proxy_profile = Some(profile.to_string());
         args.hyperliquid_proxy_profile = Some(profile.to_string());
         args.velora_proxy_profile = Some(profile.to_string());
+        args.kyberswap_proxy_profile = Some(profile.to_string());
         args.chainalysis_proxy_profile = Some(profile.to_string());
         args.coinbase_proxy_profile = Some(profile.to_string());
     }

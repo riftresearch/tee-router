@@ -1,5 +1,5 @@
 use super::*;
-use router_temporal::VeloraSwapSettledEvidence;
+use router_temporal::UniversalRouterSwapSettledEvidence;
 
 #[derive(Clone, Default)]
 pub struct ProviderObservationActivities {
@@ -210,18 +210,18 @@ impl ProviderObservationActivities {
     }
 
     #[activity]
-    pub async fn verify_velora_swap_settled_hint(
+    pub async fn verify_universal_router_swap_settled_hint(
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: VerifyProviderOperationHintInput,
     ) -> Result<ProviderOperationHintVerified, ActivityError> {
-        record_activity("verify_velora_swap_settled_hint", async move {
+        record_activity("verify_universal_router_swap_settled_hint", async move {
             let deps = self.deps()?;
             run_hint_verify(
                 &deps,
                 input,
-                ExpectedHintKinds::Single(ProviderHintKind::VeloraSwapSettled),
-                verify_velora_swap_settled_hint,
+                ExpectedHintKinds::Single(ProviderHintKind::UniversalRouterSwapSettled),
+                verify_universal_router_swap_settled_hint,
             )
             .await
         })
@@ -1471,9 +1471,9 @@ fn hyperunit_withdrawal_settled_response(
     }))
 }
 
-fn velora_swap_settled_response(
+fn universal_router_swap_settled_response(
     operation: &OrderProviderOperation,
-    evidence: &VeloraSwapSettledEvidence,
+    evidence: &UniversalRouterSwapSettledEvidence,
 ) -> Result<Value, OrderActivityError> {
     let amount_in = operation
         .request
@@ -1483,12 +1483,12 @@ fn velora_swap_settled_response(
         .map(ToString::to_string)
         .ok_or_else(|| {
             OrderActivityError::hint_verification(
-                "VeloraSwapSettled",
+                "UniversalRouterSwapSettled",
                 "operation request missing amount_in",
             )
         })?;
     Ok(json!({
-        "kind": "velora_swap_settled",
+        "kind": "universal_router_swap_settled",
         "amount_in": amount_in,
         "amount_out": &evidence.amount_out,
         "tx_hash": &evidence.tx_hash,
@@ -1500,31 +1500,31 @@ fn velora_swap_settled_response(
     }))
 }
 
-pub(super) async fn verify_velora_swap_settled_hint(
+pub(super) async fn verify_universal_router_swap_settled_hint(
     deps: &OrderActivityDeps,
     input: VerifyProviderOperationHintInput,
 ) -> Result<ProviderOperationHintVerified, OrderActivityError> {
-    let Some(ProviderOperationHintEvidence::VeloraSwapSettled(evidence)) =
+    let Some(ProviderOperationHintEvidence::UniversalRouterSwapSettled(evidence)) =
         input.signal.evidence.as_ref()
     else {
         return Ok(provider_hint_rejected(
             input.signal.provider_operation_id.map(|id| id.inner()),
-            "VeloraSwapSettled hint missing typed evidence",
+            "UniversalRouterSwapSettled hint missing typed evidence",
         ));
     };
     let operation = load_typed_hint_operation(
         deps,
         &input,
-        "VeloraSwapSettled",
+        "UniversalRouterSwapSettled",
         &[ProviderOperationType::UniversalRouterSwap],
     )
     .await?;
     if let Some(decision) = terminal_hint_decision(&operation) {
         return Ok(decision);
     }
-    validate_provider_ref_matches("VeloraSwapSettled", &operation, &evidence.tx_hash)?;
+    validate_provider_ref_matches("UniversalRouterSwapSettled", &operation, &evidence.tx_hash)?;
     validate_request_address_match(
-        "VeloraSwapSettled recipient",
+        "UniversalRouterSwapSettled recipient",
         operation
             .request
             .get("recipient_address")
@@ -1533,7 +1533,7 @@ pub(super) async fn verify_velora_swap_settled_hint(
     )?;
     if let Some(token_address) = evidence.token_address.as_deref() {
         validate_expected_asset_token(
-            "VeloraSwapSettled output token",
+            "UniversalRouterSwapSettled output token",
             operation
                 .request
                 .pointer("/output_asset/chain_id")
@@ -1552,12 +1552,12 @@ pub(super) async fn verify_velora_swap_settled_hint(
         .filter(|amount| !amount.is_empty());
     if let Some(min_amount_out) = min_amount_out {
         validate_decimal_gte(
-            "VeloraSwapSettled amount_out",
+            "UniversalRouterSwapSettled amount_out",
             &evidence.amount_out,
             min_amount_out,
         )?;
     }
-    let response = velora_swap_settled_response(&operation, evidence)?;
+    let response = universal_router_swap_settled_response(&operation, evidence)?;
 
     complete_provider_operation_from_typed_hint(
         deps,
@@ -1566,7 +1566,7 @@ pub(super) async fn verify_velora_swap_settled_hint(
         TypedProviderOperationUpdate {
             status: ProviderOperationStatus::Completed,
             provider_ref: Some(evidence.tx_hash.clone()),
-            observed_state: typed_evidence_state("velora_swap_settled", evidence)?,
+            observed_state: typed_evidence_state("universal_router_swap_settled", evidence)?,
             response: Some(response),
             tx_hash: Some(evidence.tx_hash.clone()),
         },
@@ -3775,7 +3775,7 @@ mod tests {
     }
 
     #[test]
-    fn velora_swap_settlement_response_records_actual_amount_out() {
+    fn universal_router_swap_settlement_response_records_actual_amount_out() {
         let operation = operation_with_request(
             ProviderOperationType::UniversalRouterSwap,
             json!({
@@ -3783,7 +3783,7 @@ mod tests {
                 "amount_out": "37025460",
             }),
         );
-        let evidence = VeloraSwapSettledEvidence {
+        let evidence = UniversalRouterSwapSettledEvidence {
             tx_hash: "0xswap".to_string(),
             log_index: 5,
             amount_out: "37025459".to_string(),
@@ -3793,7 +3793,7 @@ mod tests {
             block_number: Some(46_421_177),
         };
 
-        let response = velora_swap_settled_response(&operation, &evidence).unwrap();
+        let response = universal_router_swap_settled_response(&operation, &evidence).unwrap();
 
         assert_eq!(response["amount_in"], json!("17555765813104590"));
         assert_eq!(response["amount_out"], json!("37025459"));

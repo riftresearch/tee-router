@@ -1,5 +1,9 @@
 x-temporal-server-base: &temporal-server-base
   image: temporalio/server:1.31.0
+  # Safety net for the cold-boot cluster-metadata init race: a role that loses
+  # the `SaveClusterMetadata` CAS exits(1) and is restarted, by which point the
+  # record exists and it proceeds. Startup ordering below makes this rare.
+  restart: on-failure:5
   depends_on:
     temporal-schema:
       condition: service_completed_successfully
@@ -235,6 +239,13 @@ services:
 
   temporal-matching:
     <<: *temporal-server-base
+    # Start only after history has booted (and thus created the cluster-metadata
+    # record), so this role reads it instead of racing to create it.
+    depends_on:
+      temporal-schema:
+        condition: service_completed_successfully
+      temporal-history:
+        condition: service_healthy
     environment:
       <<: *temporal-server-env
       SERVICES: matching
@@ -252,6 +263,12 @@ services:
   # This is Temporal's internal worker service, distinct from the app's Rust temporal-worker.
   temporal-internal-worker:
     <<: *temporal-server-base
+    # See temporal-matching: gate behind history to avoid the metadata-init race.
+    depends_on:
+      temporal-schema:
+        condition: service_completed_successfully
+      temporal-history:
+        condition: service_healthy
     environment:
       <<: *temporal-server-env
       SERVICES: worker
@@ -268,6 +285,12 @@ services:
 
   temporal:
     <<: *temporal-server-base
+    # See temporal-matching: gate behind history to avoid the metadata-init race.
+    depends_on:
+      temporal-schema:
+        condition: service_completed_successfully
+      temporal-history:
+        condition: service_healthy
     environment:
       <<: *temporal-server-env
       SERVICES: frontend

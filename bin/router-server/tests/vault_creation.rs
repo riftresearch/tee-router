@@ -38,7 +38,8 @@ use router_core::{
     services::{
         action_providers::{
             AcrossHttpProviderConfig, BridgeQuoteRequest, CctpHttpProviderConfig,
-            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuoteRequest, VeloraProvider,
+            ExchangeExecutionRequest, ExchangeProvider, ExchangeQuoteRequest,
+            KyberswapHttpProviderConfig, VeloraProvider,
         },
         asset_registry::{AssetRegistry, ProviderId},
         custody_action_executor::{
@@ -48,7 +49,7 @@ use router_core::{
         market_order_planner::MarketOrderRoutePlanner,
         pricing::PricingSnapshot,
         route_costs::{RouteCostService, RouteCostSnapshot},
-        ActionProviderRegistry, ProviderExecutionIntent, VeloraHttpProviderConfig,
+        ActionProviderRegistry, ProviderExecutionIntent,
     },
 };
 use router_primitives::ChainType;
@@ -633,7 +634,7 @@ async fn create_failed_attempt_with_transient_legs(
         ),
         (
             OrderExecutionStepType::UniversalRouterSwap,
-            "velora",
+            "kyberswap",
             OrderExecutionStepStatus::Waiting,
         ),
     ];
@@ -739,7 +740,7 @@ fn refreshed_attempt_plan_for_order(
 ) -> RefreshedExecutionAttemptPlan {
     let specs = [
         (OrderExecutionStepType::UnitWithdrawal, "unit"),
-        (OrderExecutionStepType::UniversalRouterSwap, "velora"),
+        (OrderExecutionStepType::UniversalRouterSwap, "kyberswap"),
     ];
     let mut legs = Vec::with_capacity(specs.len());
     let mut steps = Vec::with_capacity(specs.len());
@@ -1049,6 +1050,8 @@ fn test_router_args(
         hyperliquid_proxy_profile: None,
         velora_api_url: None,
         velora_proxy_profile: None,
+        kyberswap_api_url: None,
+        kyberswap_proxy_profile: None,
         velora_partner: None,
         relay_api_url: None,
         relay_api_key: None,
@@ -1266,6 +1269,30 @@ async fn spawn_harness_mocks_with_unit_indexers(
             42161,
             h.with_devnet(|devnet| {
                 format!("{:#x}", devnet.arbitrum.mock_velora_swap_contract.address())
+            }),
+        )
+        .with_kyberswap_swap_contract_address(
+            1,
+            h.with_devnet(|devnet| {
+                format!(
+                    "{:#x}",
+                    devnet.ethereum.mock_kyberswap_swap_contract.address()
+                )
+            }),
+        )
+        .with_kyberswap_swap_contract_address(
+            8453,
+            h.with_devnet(|devnet| {
+                format!("{:#x}", devnet.base.mock_kyberswap_swap_contract.address())
+            }),
+        )
+        .with_kyberswap_swap_contract_address(
+            42161,
+            h.with_devnet(|devnet| {
+                format!(
+                    "{:#x}",
+                    devnet.arbitrum.mock_kyberswap_swap_contract.address()
+                )
             }),
         )
         .with_mainnet_hyperliquid(true);
@@ -2254,7 +2281,7 @@ async fn concurrent_create_limit_order_requests_resume_same_quote_idempotently()
 
 #[tokio::test]
 #[ignore = "integration: spawns devnet stack"]
-async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
+async fn quote_market_order_supports_kyberswap_arbitrary_evm_start_and_end() {
     let h = harness().await;
     let (mocks, _node) = spawn_harness_mocks(h, "evm:8453").await;
     let db = test_db().await;
@@ -2266,10 +2293,11 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
         None,
         None,
         None,
-        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
+        None,
+        Some(KyberswapHttpProviderConfig::new(mocks.kyberswap_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Mainnet,
     )
-    .expect("velora-only action providers");
+    .expect("kyberswap-only action providers");
     let order_manager = OrderManager::with_action_providers(
         db,
         settings,
@@ -2322,7 +2350,7 @@ async fn quote_market_order_supports_velora_arbitrary_evm_start_and_end() {
     assert!(transitions
         .iter()
         .all(|transition| transition["kind"] == json!("universal_router_swap")));
-    assert!(legs.iter().all(|leg| leg["provider"] == json!("velora")
+    assert!(legs.iter().all(|leg| leg["provider"] == json!("kyberswap")
         && leg["raw"]["kind"] == json!("universal_router_swap")));
     assert_eq!(
         transitions[0]["input"]["asset"]["asset"],
@@ -2374,7 +2402,8 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
         Some(mocks.hyperunit_url()),
         None,
         Some(node.url()),
-        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
+        None,
+        Some(KyberswapHttpProviderConfig::new(mocks.kyberswap_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
@@ -2405,7 +2434,7 @@ async fn quote_market_order_bitcoin_to_base_usdc_keeps_configured_provider_path_
         .expect("market order quote");
     assert_path_provider_id(
         &quote.provider_id,
-        &["unit_deposit:unit", "universal_router_swap:velora"],
+        &["unit_deposit:unit", "universal_router_swap:kyberswap"],
     );
 }
 
@@ -2426,7 +2455,8 @@ async fn quote_market_order_exact_in_reports_net_output_after_unit_withdrawal_re
         Some(mocks.hyperunit_url()),
         None,
         Some(node.url()),
-        Some(VeloraHttpProviderConfig::new(mocks.velora_url())),
+        None,
+        Some(KyberswapHttpProviderConfig::new(mocks.kyberswap_url())),
         router_core::services::custody_action_executor::HyperliquidCallNetwork::Testnet,
     )
     .expect("mock runtime providers");
@@ -4776,7 +4806,7 @@ async fn route_cost_refresh_samples_configured_bridge_providers() {
 async fn provider_health_upsert_preserves_newer_check_against_stale_write() {
     let db = test_db().await;
     let base = Utc::now();
-    let provider = "velora";
+    let provider = "kyberswap";
     let check = |status: ProviderHealthStatus,
                  checked_at: chrono::DateTime<Utc>,
                  updated_by: &str,
@@ -6632,7 +6662,7 @@ async fn completion_finalization_candidates_include_stale_execution_legs_for_rol
         execution_attempt_id: Some(attempt.id),
         step_index: 1,
         step_type: OrderExecutionStepType::UniversalRouterSwap,
-        provider: "velora",
+        provider: "kyberswap",
         input_asset: None,
         output_asset: None,
         amount_in: Some("1000"),
@@ -6645,10 +6675,10 @@ async fn completion_finalization_candidates_include_stale_execution_legs_for_rol
         order_id: order.id,
         execution_attempt_id: Some(attempt.id),
         execution_leg_id: Some(leg_id),
-        transition_decl_id: Some("test:velora:universal_router_swap".to_string()),
+        transition_decl_id: Some("test:kyberswap:universal_router_swap".to_string()),
         step_index: 1,
         step_type: OrderExecutionStepType::UniversalRouterSwap,
-        provider: "velora".to_string(),
+        provider: "kyberswap".to_string(),
         status: OrderExecutionStepStatus::Completed,
         input_asset: Some(order.source_asset.clone()),
         output_asset: Some(order.destination_asset.clone()),
@@ -6656,8 +6686,8 @@ async fn completion_finalization_candidates_include_stale_execution_legs_for_rol
         tx_hash: Some(
             "0x6666666666666666666666666666666666666666666666666666666666666666".to_string(),
         ),
-        provider_ref: Some("velora-step-ref".to_string()),
-        idempotency_key: Some("velora-step".to_string()),
+        provider_ref: Some("kyberswap-step-ref".to_string()),
+        idempotency_key: Some("kyberswap-step".to_string()),
         attempt_count: 1,
         next_attempt_at: None,
         started_at: Some(now),
@@ -6713,7 +6743,7 @@ async fn execution_leg_usd_valuation_update_returns_updated_leg() {
         execution_attempt_id: None,
         step_index: 1,
         step_type: OrderExecutionStepType::UniversalRouterSwap,
-        provider: "velora",
+        provider: "kyberswap",
         input_asset: None,
         output_asset: None,
         amount_in: Some("1000"),

@@ -32,6 +32,7 @@ use crate::{
             MockCctpMessageTransmitterV2::MockCctpMessageTransmitterV2Instance,
             MockCctpTokenMessengerV2::MockCctpTokenMessengerV2Instance,
         },
+        kyberswap::contract::MockKyberSwapRouter::MockKyberSwapRouterInstance,
         velora::contract::MockVeloraSwap::MockVeloraSwapInstance,
         MockService, MockServicePaymaster,
     },
@@ -71,6 +72,7 @@ pub struct EthDevnet {
     pub mock_cctp_message_transmitter_v2_contract:
         MockCctpMessageTransmitterV2Instance<DynProvider>,
     pub mock_velora_swap_contract: MockVeloraSwapInstance<DynProvider>,
+    pub mock_kyberswap_swap_contract: MockKyberSwapRouterInstance<DynProvider>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +137,7 @@ impl EthDevnet {
             mock_cctp_token_messenger_v2_contract,
             mock_cctp_message_transmitter_v2_contract,
             mock_velora_swap_contract,
+            mock_kyberswap_swap_contract,
         ) = deploy_contracts(funded_provider.clone(), devnet_cache.clone(), chain_id).await?;
 
         let token_indexer = if let Some(database_url) = token_indexer_database_url {
@@ -175,6 +178,7 @@ impl EthDevnet {
             mock_cctp_token_messenger_v2_contract,
             mock_cctp_message_transmitter_v2_contract,
             mock_velora_swap_contract,
+            mock_kyberswap_swap_contract,
         };
 
         Ok(devnet)
@@ -411,6 +415,7 @@ async fn deploy_contracts(
     MockCctpTokenMessengerV2Instance<DynProvider>,
     MockCctpMessageTransmitterV2Instance<DynProvider>,
     MockVeloraSwapInstance<DynProvider>,
+    MockKyberSwapRouterInstance<DynProvider>,
 )> {
     let mock_across_spoke_pool_address =
         parse_address(MOCK_ACROSS_SPOKE_POOL_ADDRESS, "mock Across spoke pool")?;
@@ -480,6 +485,14 @@ async fn deploy_contracts(
             U256::from(MOCK_VELORA_NATIVE_RESERVE_WEI),
         )
         .await?;
+    let mock_kyberswap_swap_contract =
+        MockKyberSwapRouterInstance::deploy(provider.clone()).await?;
+    provider
+        .anvil_set_balance(
+            *mock_kyberswap_swap_contract.address(),
+            U256::from(MOCK_VELORA_NATIVE_RESERVE_WEI),
+        )
+        .await?;
 
     if devnet_cache.is_some() {
         let mock_erc20_bytecode =
@@ -505,6 +518,7 @@ async fn deploy_contracts(
             mock_cctp_token_messenger_v2_contract,
             mock_cctp_message_transmitter_v2_contract,
             mock_velora_swap_contract,
+            mock_kyberswap_swap_contract,
         ));
     }
 
@@ -541,6 +555,7 @@ async fn deploy_contracts(
         mock_cctp_token_messenger_v2_contract,
         mock_cctp_message_transmitter_v2_contract,
         mock_velora_swap_contract,
+        mock_kyberswap_swap_contract,
     ))
 }
 

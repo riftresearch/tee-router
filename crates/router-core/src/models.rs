@@ -738,7 +738,7 @@ pub enum ProviderOperationHintKind {
     BtcDepositObserved,
     AcrossDestinationFilled,
     CctpReceiveObserved,
-    VeloraSwapSettled,
+    UniversalRouterSwapSettled,
     HyperUnitDepositCredited,
     HyperUnitWithdrawalAcknowledged,
     HyperUnitWithdrawalSettled,
@@ -758,7 +758,7 @@ impl ProviderOperationHintKind {
             Self::BtcDepositObserved => "btc_deposit_observed",
             Self::AcrossDestinationFilled => "across_destination_filled",
             Self::CctpReceiveObserved => "cctp_receive_observed",
-            Self::VeloraSwapSettled => "velora_swap_settled",
+            Self::UniversalRouterSwapSettled => "universal_router_swap_settled",
             Self::HyperUnitDepositCredited => "hyperunit_deposit_credited",
             Self::HyperUnitWithdrawalAcknowledged => "hyperunit_withdrawal_acknowledged",
             Self::HyperUnitWithdrawalSettled => "hyperunit_withdrawal_settled",
@@ -777,7 +777,7 @@ impl ProviderOperationHintKind {
             "btc_deposit_observed" => Some(Self::BtcDepositObserved),
             "across_destination_filled" => Some(Self::AcrossDestinationFilled),
             "cctp_receive_observed" => Some(Self::CctpReceiveObserved),
-            "velora_swap_settled" => Some(Self::VeloraSwapSettled),
+            "universal_router_swap_settled" => Some(Self::UniversalRouterSwapSettled),
             "hyperunit_deposit_credited" => Some(Self::HyperUnitDepositCredited),
             "hyperunit_withdrawal_acknowledged" => Some(Self::HyperUnitWithdrawalAcknowledged),
             "hyperunit_withdrawal_settled" => Some(Self::HyperUnitWithdrawalSettled),
@@ -1474,4 +1474,21 @@ pub struct StatusResponse {
     pub version: String,
     pub supported_chains: Vec<ChainId>,
     pub supported_actions: Vec<VaultAction>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn universal_router_swap_settled_hint_kind_uses_new_db_string() {
+        assert_eq!(
+            ProviderOperationHintKind::UniversalRouterSwapSettled.to_db_string(),
+            "universal_router_swap_settled"
+        );
+        assert_eq!(
+            ProviderOperationHintKind::from_db_string("universal_router_swap_settled"),
+            Some(ProviderOperationHintKind::UniversalRouterSwapSettled)
+        );
+    }
 }

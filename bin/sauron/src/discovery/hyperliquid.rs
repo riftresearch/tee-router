@@ -382,7 +382,7 @@ mod tests {
             ProviderOperationType::UnitDeposit | ProviderOperationType::UnitWithdrawal => "unit",
             ProviderOperationType::AcrossBridge => "across",
             ProviderOperationType::CctpBridge | ProviderOperationType::CctpReceive => "cctp",
-            ProviderOperationType::UniversalRouterSwap => "velora",
+            ProviderOperationType::UniversalRouterSwap => "kyberswap",
         }
     }
 

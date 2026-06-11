@@ -260,6 +260,14 @@ pub struct RouterServerArgs {
     #[arg(long, env = "VELORA_PROXY_PROFILE")]
     pub velora_proxy_profile: Option<String>,
 
+    /// KyberSwap Aggregator API base URL
+    #[arg(long, env = "KYBERSWAP_API_URL")]
+    pub kyberswap_api_url: Option<String>,
+
+    /// KyberSwap proxy profile (`direct`, `ipv4-us-west-1`, `ipv6-us-west-1`, `ipv4-eu`).
+    #[arg(long, env = "KYBERSWAP_PROXY_PROFILE")]
+    pub kyberswap_proxy_profile: Option<String>,
+
     /// Partner string sent to Velora for route analytics
     #[arg(long, env = "VELORA_PARTNER")]
     pub velora_partner: Option<String>,
@@ -536,5 +544,26 @@ fn parse_auth(s: &str) -> std::result::Result<Auth, String> {
         let username = split.next().ok_or("Invalid auth string")?;
         let password = split.next().ok_or("Invalid auth string")?;
         Ok(Auth::UserPass(username.to_string(), password.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn router_server_args_include_kyberswap_url_and_proxy_but_no_client_id() {
+        let command = RouterServerArgs::command();
+        let ids: Vec<String> = command
+            .get_arguments()
+            .map(|arg| arg.get_id().as_str().to_string())
+            .collect();
+
+        assert!(ids.iter().any(|id| id == "kyberswap_api_url"));
+        assert!(ids.iter().any(|id| id == "kyberswap_proxy_profile"));
+        assert!(!ids
+            .iter()
+            .any(|id| id.contains("kyberswap") && id.contains("client")));
     }
 }

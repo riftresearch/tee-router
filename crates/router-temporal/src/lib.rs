@@ -175,7 +175,7 @@ pub enum ProviderOperationHintEvidence {
     HyperUnitDepositCredited(HyperUnitDepositCreditedEvidence),
     HyperUnitWithdrawalAcknowledged(HyperUnitWithdrawalAcknowledgedEvidence),
     HyperUnitWithdrawalSettled(HyperUnitWithdrawalSettledEvidence),
-    VeloraSwapSettled(VeloraSwapSettledEvidence),
+    UniversalRouterSwapSettled(UniversalRouterSwapSettledEvidence),
     CctpReceiveObserved(CctpReceiveObservedEvidence),
     HlTradeFilled(HlTradeFilledEvidence),
     HlTradeCanceled(HlTradeCanceledEvidence),
@@ -187,7 +187,7 @@ pub enum ProviderOperationHintEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VeloraSwapSettledEvidence {
+pub struct UniversalRouterSwapSettledEvidence {
     pub tx_hash: String,
     pub log_index: u64,
     pub amount_out: String,
@@ -425,7 +425,7 @@ pub enum ProviderHintKind {
     HyperUnitWithdrawalAcknowledged,
     HyperUnitWithdrawalSettled,
     ProviderObservation,
-    VeloraSwapSettled,
+    UniversalRouterSwapSettled,
     HyperliquidTrade,
     HlTradeFilled,
     HlTradeCanceled,
@@ -762,4 +762,35 @@ fn payloads<T: Serialize + 'static>(value: &T) -> Payloads {
 
 pub fn boxed(source: impl Display) -> BoxError {
     Box::new(std::io::Error::other(source.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn universal_router_swap_settled_evidence_has_unchanged_json_shape() {
+        let evidence = UniversalRouterSwapSettledEvidence {
+            tx_hash: "0xswap".to_string(),
+            log_index: 7,
+            amount_out: "1000000".to_string(),
+            recipient: "0x1111111111111111111111111111111111111111".to_string(),
+            executor: Some("0x2222222222222222222222222222222222222222".to_string()),
+            token_address: Some("0x3333333333333333333333333333333333333333".to_string()),
+            block_number: Some(123),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&evidence).expect("evidence serializes"),
+            serde_json::json!({
+                "tx_hash": "0xswap",
+                "log_index": 7,
+                "amount_out": "1000000",
+                "recipient": "0x1111111111111111111111111111111111111111",
+                "executor": "0x2222222222222222222222222222222222222222",
+                "token_address": "0x3333333333333333333333333333333333333333",
+                "block_number": 123
+            })
+        );
+    }
 }

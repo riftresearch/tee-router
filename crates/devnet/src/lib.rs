@@ -1340,6 +1340,26 @@ impl RiftDevnetBuilder {
                 arbitrum_devnet.anvil.chain_id(),
                 format!("{:#x}", arbitrum_devnet.mock_velora_swap_contract.address()),
             )
+            // KyberSwap is the active universal-router provider, with its own
+            // MockKyberSwapRouter (MetaAggregationRouterV2-shaped) mock contract.
+            .with_kyberswap_swap_contract_address(
+                ethereum_devnet.anvil.chain_id(),
+                format!(
+                    "{:#x}",
+                    ethereum_devnet.mock_kyberswap_swap_contract.address()
+                ),
+            )
+            .with_kyberswap_swap_contract_address(
+                base_devnet.anvil.chain_id(),
+                format!("{:#x}", base_devnet.mock_kyberswap_swap_contract.address()),
+            )
+            .with_kyberswap_swap_contract_address(
+                arbitrum_devnet.anvil.chain_id(),
+                format!(
+                    "{:#x}",
+                    arbitrum_devnet.mock_kyberswap_swap_contract.address()
+                ),
+            )
             .with_unit_evm_rpc_url(
                 hyperunit_client::UnitChain::Ethereum,
                 ethereum_devnet.anvil.endpoint(),

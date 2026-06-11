@@ -750,6 +750,7 @@ CCTP_PROXY_PROFILE=ipv6-us-west-1
 HYPERUNIT_PROXY_PROFILE=ipv4-eu
 HYPERLIQUID_PROXY_PROFILE=ipv6-us-west-1
 VELORA_PROXY_PROFILE=ipv6-us-west-1
+KYBERSWAP_PROXY_PROFILE=ipv6-us-west-1
 RELAY_PROXY_PROFILE=ipv6-us-west-1
 NEAR_INTENTS_PROXY_PROFILE=ipv6-us-west-1
 MAYAN_PROXY_PROFILE=ipv6-us-west-1
@@ -837,7 +838,9 @@ Router API and worker need the same core config:
 - `HYPERUNIT_API_URL`
 - `HYPERLIQUID_API_URL`, `HYPERLIQUID_NETWORK`,
   `HYPERLIQUID_ORDER_TIMEOUT_MS`
-- `VELORA_API_URL`, `VELORA_PARTNER`
+- `KYBERSWAP_API_URL`; KyberSwap has no API key, and `x-client-id` is
+  generated per request. Keep the default process-local throttle below the
+  public 3 rps limit and use `KYBERSWAP_PROXY_PROFILE` for egress selection.
 - quote-only single-hop venue URLs/API credentials:
   `RELAY_API_URL`, `RELAY_API_KEY`, `NEAR_INTENTS_API_URL`,
   `NEAR_INTENTS_API_KEY`, `NEAR_INTENTS_BEARER_TOKEN`, `MAYAN_API_URL`,

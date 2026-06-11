@@ -31,6 +31,7 @@ pub(crate) mod cctp;
 pub(crate) mod chainalysis;
 pub(crate) mod coinbase;
 pub(crate) mod hyperunit;
+pub(crate) mod kyberswap;
 pub(crate) mod velora;
 
 pub use crate::hyperliquid_devnet::contract::MockHyperliquidBridge2;
@@ -49,6 +50,7 @@ use hyperunit::{
 pub use hyperunit::{
     MockUnitGenerateAddressRequest, MockUnitOperationKind, MockUnitOperationRecord,
 };
+use kyberswap::{default_kyberswap_usd_prices, KyberswapMockState};
 use velora::{default_velora_usd_prices, VeloraMockState};
 
 sol! {
@@ -355,6 +357,11 @@ pub struct MockIntegratorConfig {
     /// quote/transaction path requires this so execution always spends input and
     /// creates output on-chain.
     pub velora_swap_contract_addresses: BTreeMap<u64, String>,
+    /// Per-network deployed MockVeloraSwap-compatible contract addresses used by
+    /// the KyberSwap mock route/build path. Defaults to the Velora swap
+    /// contracts when unset so local devnet can exercise both providers through
+    /// the same executable mock contract.
+    pub kyberswap_swap_contract_addresses: BTreeMap<u64, String>,
     /// Number of upcoming Velora transaction builds that should return a
     /// temporary 503 error in the same JSON error envelope shape Velora documents.
     pub velora_transaction_fail_next_n: usize,
@@ -373,6 +380,15 @@ pub struct MockIntegratorConfig {
     /// the `SELL` output (and grosses up the `BUY` input) so curated USDC/USDT
     /// swaps show a realistic non-zero value loss instead of a 1:1 conversion.
     pub velora_quote_fee_bps: u16,
+    /// Flat fee applied to mock KyberSwap exact-in route quotes, in basis
+    /// points. Reduces output so routes carry a realistic value loss.
+    pub kyberswap_quote_fee_bps: u16,
+    /// Number of upcoming KyberSwap route/build calls that should return a
+    /// temporary error in Kyber's JSON error-envelope shape.
+    pub kyberswap_transaction_fail_next_n: usize,
+    /// Number of upcoming KyberSwap route/build calls that should reject the
+    /// submitted routeSummary as stale using Kyber's error-envelope shape.
+    pub kyberswap_transaction_stale_quote_fail_next_n: usize,
     /// Artificial delay after a mock Across deposit is indexed before
     /// `/deposit/status` can leave `pending`.
     pub across_status_latency: Duration,
@@ -414,12 +430,16 @@ impl Default for MockIntegratorConfig {
             cctp_attestation_delay_reason: None,
             address_screening_rules: BTreeMap::new(),
             velora_swap_contract_addresses: BTreeMap::new(),
+            kyberswap_swap_contract_addresses: BTreeMap::new(),
             velora_transaction_fail_next_n: 0,
             velora_transaction_stale_quote_fail_next_n: 0,
             hyperliquid_withdrawal_latency: Duration::ZERO,
             across_quote_fee_bps: 0,
             across_quote_jitter_bps: 0,
             velora_quote_fee_bps: 0,
+            kyberswap_quote_fee_bps: 0,
+            kyberswap_transaction_fail_next_n: 0,
+            kyberswap_transaction_stale_quote_fail_next_n: 0,
             across_status_latency: Duration::ZERO,
             across_refund_probability_bps: 0,
         }
@@ -679,6 +699,17 @@ impl MockIntegratorConfig {
     }
 
     #[must_use]
+    pub fn with_kyberswap_swap_contract_address(
+        mut self,
+        chain_id: u64,
+        address: impl Into<String>,
+    ) -> Self {
+        self.kyberswap_swap_contract_addresses
+            .insert(chain_id, address.into());
+        self
+    }
+
+    #[must_use]
     pub fn with_velora_transaction_fail_next_n(mut self, failures: usize) -> Self {
         self.velora_transaction_fail_next_n = failures;
         self
@@ -705,6 +736,24 @@ impl MockIntegratorConfig {
     #[must_use]
     pub fn with_velora_quote_fee_bps(mut self, fee_bps: u16) -> Self {
         self.velora_quote_fee_bps = fee_bps.min(9_999);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kyberswap_quote_fee_bps(mut self, fee_bps: u16) -> Self {
+        self.kyberswap_quote_fee_bps = fee_bps.min(9_999);
+        self
+    }
+
+    #[must_use]
+    pub fn with_kyberswap_transaction_fail_next_n(mut self, failures: usize) -> Self {
+        self.kyberswap_transaction_fail_next_n = failures;
+        self
+    }
+
+    #[must_use]
+    pub fn with_kyberswap_transaction_stale_quote_fail_next_n(mut self, failures: usize) -> Self {
+        self.kyberswap_transaction_stale_quote_fail_next_n = failures;
         self
     }
 
@@ -751,6 +800,7 @@ pub(crate) struct MockIntegratorState {
     pub(crate) across: Arc<AcrossMockState>,
     pub(crate) cctp: Arc<CctpMockState>,
     pub(crate) velora: Arc<VeloraMockState>,
+    pub(crate) kyberswap: Arc<KyberswapMockState>,
     pub(crate) unit: Arc<UnitMockState>,
     /// The Coinbase spot-price mock currently serves only static prices, so
     /// nothing reads this yet; it is held for uniformity with the other venue
@@ -837,6 +887,10 @@ impl MockIntegratorServer {
             .nest(
                 "/chainalysis",
                 chainalysis::router().with_state(state.chainalysis.clone()),
+            )
+            .nest(
+                "/kyberswap",
+                kyberswap::router().with_state(state.kyberswap.clone()),
             );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
@@ -883,6 +937,10 @@ impl MockIntegratorServer {
     #[must_use]
     pub fn velora_url(&self) -> String {
         format!("{}/velora", self.base_url)
+    }
+    #[must_use]
+    pub fn kyberswap_url(&self) -> String {
+        format!("{}/kyberswap", self.base_url)
     }
     #[must_use]
     pub fn hyperunit_url(&self) -> String {
@@ -1120,6 +1178,35 @@ impl MockIntegratorServer {
             .lock()
             .await = failures;
     }
+
+    /// Install (or overwrite) the mock KyberSwap USD price in micro-dollars per
+    /// whole token. Defaults are ETH=$3,000, BTC=$100,000, USDC=$1, USDT=$1.
+    pub async fn set_kyberswap_usd_price_micro(&self, symbol: &str, usd_micro: u128) {
+        self.state
+            .kyberswap
+            .usd_prices
+            .lock()
+            .await
+            .insert(symbol.to_ascii_uppercase(), usd_micro);
+    }
+
+    pub async fn set_kyberswap_transaction_fail_next_n(&self, failures: usize) {
+        *self
+            .state
+            .kyberswap
+            .transaction_failures_remaining
+            .lock()
+            .await = failures;
+    }
+
+    pub async fn set_kyberswap_transaction_stale_quote_fail_next_n(&self, failures: usize) {
+        *self
+            .state
+            .kyberswap
+            .transaction_stale_quote_failures_remaining
+            .lock()
+            .await = failures;
+    }
 }
 
 impl MockIntegratorState {
@@ -1164,6 +1251,21 @@ impl MockIntegratorState {
             ),
             quote_fee_bps: config.velora_quote_fee_bps.min(9_999),
         });
+        let kyberswap_swap_contract_addresses =
+            if config.kyberswap_swap_contract_addresses.is_empty() {
+                config.velora_swap_contract_addresses.clone()
+            } else {
+                config.kyberswap_swap_contract_addresses.clone()
+            };
+        let kyberswap = Arc::new(KyberswapMockState {
+            usd_prices: Mutex::new(default_kyberswap_usd_prices()),
+            swap_contract_addresses: kyberswap_swap_contract_addresses,
+            transaction_failures_remaining: Mutex::new(config.kyberswap_transaction_fail_next_n),
+            transaction_stale_quote_failures_remaining: Mutex::new(
+                config.kyberswap_transaction_stale_quote_fail_next_n,
+            ),
+            quote_fee_bps: config.kyberswap_quote_fee_bps.min(9_999),
+        });
         let unit = Arc::new(UnitMockState {
             generate_address_requests: Mutex::default(),
             operations: Mutex::default(),
@@ -1183,6 +1285,7 @@ impl MockIntegratorState {
             across,
             cctp,
             velora,
+            kyberswap,
             unit,
             coinbase: Arc::new(CoinbaseMockState),
             chainalysis: Arc::new(ChainalysisMockState {

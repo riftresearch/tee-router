@@ -35,7 +35,7 @@ const USDC_BASE: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 const USDC_ARBITRUM: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
 const USDC_ETHEREUM: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 /// A niche ERC20 not in the static registry, so it must be routed via the
-/// runtime Velora wrap into/out of a primary anchor (USDC/USDT/ETH).
+/// runtime universal-router wrap into/out of a primary anchor (USDC/USDT/ETH).
 const PEPE_ETHEREUM: &str = "0x6982508145454ce325ddbe47a25d4ec3d2311933";
 
 fn asset(chain: &str, asset: AssetId) -> DepositAsset {
@@ -52,7 +52,7 @@ fn evm_token(chain: &str, address: &str) -> DepositAsset {
 /// Local copy of `is_executable_transition_path` from
 /// `bin/router-server/src/services/order_manager.rs`. Kept in sync manually:
 /// production only drops empty paths here (a bridge exit to a registered
-/// destination asset is just as executable as a Velora or Unit exit); the
+/// destination asset is just as executable as a universal-router or Unit exit); the
 /// real filtering happens in the provider/quote stages downstream.
 fn is_executable_transition_path(path: &TransitionPath) -> bool {
     !path.transitions.is_empty()
@@ -114,7 +114,7 @@ fn bfs_routes_same_canonical_across_chains_as_distinct_corridor() {
 
 #[test]
 fn bfs_wraps_arbitrary_erc20_into_anchor_for_pepe_to_btc() {
-    // A niche ERC20 source (PEPE) must begin every route with a Velora wrap
+    // A niche ERC20 source (PEPE) must begin every route with a universal-router wrap
     // (UniversalRouterSwap) into a primary anchor, then route the anchor through
     // the cached graph to BTC.
     let registry = AssetRegistry::default();
@@ -142,13 +142,13 @@ fn bfs_wraps_arbitrary_erc20_into_anchor_for_pepe_to_btc() {
         assert_eq!(
             first.kind,
             MarketOrderTransitionKind::UniversalRouterSwap,
-            "PEPE route must start with a Velora wrap; got {:?}",
+            "PEPE route must start with a universal-router wrap; got {:?}",
             path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>()
         );
         assert_eq!(first.input.asset, source, "wrap leg input must be PEPE");
         let anchor = registry
             .chain_asset(&first.output.asset)
-            .expect("Velora wrap must land on a registry anchor asset");
+            .expect("universal-router wrap must land on a registry anchor asset");
         assert!(
             matches!(
                 anchor.canonical,
@@ -173,7 +173,7 @@ fn bfs_wraps_arbitrary_erc20_into_anchor_for_pepe_to_btc() {
 #[test]
 fn bfs_wraps_arbitrary_erc20_at_tail_for_btc_to_pepe() {
     // The reverse direction: a niche ERC20 destination must end every route with
-    // a Velora wrap out of a primary anchor into PEPE.
+    // a universal-router wrap out of a primary anchor into PEPE.
     let registry = AssetRegistry::default();
     let source = asset("bitcoin", AssetId::Native);
     let destination = evm_token("evm:1", PEPE_ETHEREUM);
@@ -196,7 +196,7 @@ fn bfs_wraps_arbitrary_erc20_at_tail_for_btc_to_pepe() {
         assert_eq!(
             last.kind,
             MarketOrderTransitionKind::UniversalRouterSwap,
-            "BTC -> PEPE route must end with a Velora wrap into PEPE; got {:?}",
+            "BTC -> PEPE route must end with a universal-router wrap into PEPE; got {:?}",
             path.transitions.iter().map(|t| t.kind).collect::<Vec<_>>()
         );
         assert_eq!(
@@ -205,7 +205,7 @@ fn bfs_wraps_arbitrary_erc20_at_tail_for_btc_to_pepe() {
         );
         let anchor = registry
             .chain_asset(&last.input.asset)
-            .expect("Velora wrap input must be a registry anchor asset");
+            .expect("universal-router wrap input must be a registry anchor asset");
         assert!(
             matches!(
                 anchor.canonical,
@@ -294,7 +294,7 @@ fn pipeline_ranks_same_chain_candidates_for_arbitrary_erc20_pair() {
     let registry = AssetRegistry::default();
 
     // Two arbitrary, unknown ERC20 addresses on Base. These are not in the
-    // static registry, so they exercise the Velora runtime anchor path.
+    // static registry, so they exercise the universal-router runtime anchor path.
     let source = evm_token("evm:8453", "0x3333333333333333333333333333333333333333");
     let destination = evm_token("evm:8453", "0x4444444444444444444444444444444444444444");
 
@@ -314,8 +314,8 @@ fn pipeline_ranks_same_chain_candidates_for_arbitrary_erc20_pair() {
     );
 
     // No same-chain preference filter: cross-chain candidates stay in the set
-    // and must win on ranked cost. The direct same-chain Velora route must
-    // still be among the candidates.
+    // and must win on ranked cost. The direct same-chain universal-router route
+    // must still be among the candidates.
     assert!(
         executable.iter().any(|p| p.transitions.iter().all(|t| {
             t.input.asset.chain.as_str() == "evm:8453"

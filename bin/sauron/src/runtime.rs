@@ -1046,7 +1046,7 @@ mod tests {
         let waiting = ProviderOperationWatchEntry {
             operation_id: uuid::Uuid::now_v7(),
             execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
-            provider: "velora".to_string(),
+            provider: "kyberswap".to_string(),
             operation_type: ProviderOperationType::UniversalRouterSwap,
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: Some("provider-ref-1".to_string()),
@@ -1084,7 +1084,7 @@ mod tests {
         let operation = ProviderOperationWatchEntry {
             operation_id: uuid::Uuid::now_v7(),
             execution_step_id: router_temporal::WorkflowStepId::from(uuid::Uuid::now_v7()),
-            provider: "velora".to_string(),
+            provider: "kyberswap".to_string(),
             operation_type: ProviderOperationType::UniversalRouterSwap,
             status: ProviderOperationStatus::WaitingExternal,
             provider_ref: Some("provider-ref-1".to_string()),

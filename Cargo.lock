@@ -6532,6 +6532,7 @@ version = "0.2.35"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
  "snafu",
  "temporalio-common",
  "tonic 0.14.5",
