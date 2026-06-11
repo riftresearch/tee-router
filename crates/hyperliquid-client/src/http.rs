@@ -44,22 +44,22 @@ impl HttpClient {
         {
             Ok(response) => response,
             Err(source) => {
-                record_venue_request("POST", endpoint, "transport_error", started.elapsed());
+                record_venue_request("POST", endpoint, None, started.elapsed());
                 return Err(Error::HttpRequest { source });
             }
         };
 
         let status = response.status();
-        let status_class = status_class(status.as_u16());
-        let body =
-            match read_limited_response_text(response, MAX_HYPERLIQUID_RESPONSE_BODY_BYTES).await {
-                Ok(body) => body,
-                Err(source) => {
-                    record_venue_request("POST", endpoint, status_class, started.elapsed());
-                    return Err(Error::HttpRequest { source });
-                }
-            };
-        record_venue_request("POST", endpoint, status_class, started.elapsed());
+        let body = match read_limited_response_text(response, MAX_HYPERLIQUID_RESPONSE_BODY_BYTES)
+            .await
+        {
+            Ok(body) => body,
+            Err(source) => {
+                record_venue_request("POST", endpoint, Some(status.as_u16()), started.elapsed());
+                return Err(Error::HttpRequest { source });
+            }
+        };
+        record_venue_request("POST", endpoint, Some(status.as_u16()), started.elapsed());
         if body.truncated {
             return Err(Error::ResponseBodyTooLarge {
                 max_bytes: MAX_HYPERLIQUID_RESPONSE_BODY_BYTES,
@@ -92,34 +92,33 @@ impl HttpClient {
 fn record_venue_request(
     method: &'static str,
     endpoint: &'static str,
-    status_class: &'static str,
+    status: Option<u16>,
     duration: Duration,
 ) {
-    observability::upstream::record_upstream_request(
-        observability::upstream::UpstreamKind::TradingVenue,
-        "hyperliquid",
-        method,
-        endpoint,
-        status_class,
-        duration,
-    );
+    use observability::upstream::UpstreamKind::TradingVenue;
+    match status {
+        Some(code) => observability::upstream::record_upstream_http_status(
+            TradingVenue,
+            "hyperliquid",
+            method,
+            endpoint,
+            code,
+            duration,
+        ),
+        None => observability::upstream::record_upstream_transport_error(
+            TradingVenue,
+            "hyperliquid",
+            method,
+            endpoint,
+            duration,
+        ),
+    }
 }
 
 fn hyperliquid_endpoint_label(path: &str) -> &'static str {
     match path {
         "/info" => "/info",
         "/exchange" => "/exchange",
-        _ => "unknown",
-    }
-}
-
-fn status_class(status: u16) -> &'static str {
-    match status {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
         _ => "unknown",
     }
 }

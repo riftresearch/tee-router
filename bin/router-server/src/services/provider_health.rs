@@ -348,7 +348,7 @@ impl ProviderHealthProbe {
                 record_provider_health_probe(
                     &self.provider,
                     self.method.as_str(),
-                    "transport_error",
+                    None,
                     started.elapsed(),
                 );
                 return Err(error);
@@ -358,7 +358,7 @@ impl ProviderHealthProbe {
         record_provider_health_probe(
             &self.provider,
             self.method.as_str(),
-            status_class(status),
+            Some(status.as_u16()),
             started.elapsed(),
         );
         let body =
@@ -389,12 +389,23 @@ fn provider_http_status_reachable(status: StatusCode) -> bool {
     status.as_u16() < 500
 }
 
+/// Inline emitter (the shared `observability::upstream` helpers take
+/// `&'static str` labels; provider/method here are runtime strings). `status` is
+/// `None` for a transport error. Mirrors the shared metric: exact `status_code`
+/// on the counter, `status_class` on both.
 fn record_provider_health_probe(
     provider: &str,
     method: &str,
-    status_class: &'static str,
+    status: Option<u16>,
     duration: Duration,
 ) {
+    let (status_class, status_code) = match status {
+        Some(code) => (
+            observability::upstream::status_class(code),
+            code.to_string(),
+        ),
+        None => ("transport_error", "transport_error".to_string()),
+    };
     metrics::counter!(
         "tee_router_upstream_requests_total",
         "kind" => "trading_venue",
@@ -402,6 +413,7 @@ fn record_provider_health_probe(
         "method" => method.to_string(),
         "endpoint" => "/provider-health",
         "status_class" => status_class,
+        "status_code" => status_code,
     )
     .increment(1);
     metrics::histogram!(
@@ -413,17 +425,6 @@ fn record_provider_health_probe(
         "status_class" => status_class,
     )
     .record(duration.as_secs_f64());
-}
-
-fn status_class(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
-    }
 }
 
 fn truncate_error_body(body: &str) -> String {

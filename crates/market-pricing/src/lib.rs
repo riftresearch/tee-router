@@ -435,13 +435,7 @@ where
     let response = match http.post(url.clone()).json(request_body).send().await {
         Ok(response) => response,
         Err(source) => {
-            record_venue_request(
-                venue,
-                method,
-                endpoint,
-                "transport_error",
-                started.elapsed(),
-            );
+            record_venue_request(venue, method, endpoint, None, started.elapsed());
             return Err(MarketPricingError::Http {
                 source: source.without_url(),
             });
@@ -453,7 +447,7 @@ where
         venue,
         method,
         endpoint,
-        status_class(status),
+        Some(status.as_u16()),
         started.elapsed(),
     );
     let body =
@@ -486,13 +480,7 @@ where
     let response = match http.get(url.clone()).send().await {
         Ok(response) => response,
         Err(source) => {
-            record_venue_request(
-                venue,
-                method,
-                endpoint,
-                "transport_error",
-                started.elapsed(),
-            );
+            record_venue_request(venue, method, endpoint, None, started.elapsed());
             return Err(MarketPricingError::Http {
                 source: source.without_url(),
             });
@@ -504,7 +492,7 @@ where
         venue,
         method,
         endpoint,
-        status_class(status),
+        Some(status.as_u16()),
         started.elapsed(),
     );
     let body =
@@ -527,17 +515,27 @@ fn record_venue_request(
     venue: &'static str,
     method: &'static str,
     endpoint: &'static str,
-    status_class: &'static str,
+    status: Option<u16>,
     duration: Duration,
 ) {
-    observability::upstream::record_upstream_request(
-        observability::upstream::UpstreamKind::TradingVenue,
-        venue,
-        method,
-        endpoint,
-        status_class,
-        duration,
-    );
+    use observability::upstream::UpstreamKind::TradingVenue;
+    match status {
+        Some(code) => observability::upstream::record_upstream_http_status(
+            TradingVenue,
+            venue,
+            method,
+            endpoint,
+            code,
+            duration,
+        ),
+        None => observability::upstream::record_upstream_transport_error(
+            TradingVenue,
+            venue,
+            method,
+            endpoint,
+            duration,
+        ),
+    }
 }
 
 fn record_chain_rpc_request(
@@ -560,17 +558,6 @@ fn record_chain_rpc_request(
         "status" => status,
     )
     .record(duration.as_secs_f64());
-}
-
-fn status_class(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
-    }
 }
 
 async fn read_limited_response_text(

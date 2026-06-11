@@ -97,7 +97,7 @@ impl ChainalysisAddressScreener {
                 record_upstream_request(
                     "GET",
                     "/api/risk/v2/entities/:address",
-                    "transport_error",
+                    None,
                     started.elapsed(),
                 );
                 return Err(Error::Request { source });
@@ -108,7 +108,7 @@ impl ChainalysisAddressScreener {
         record_upstream_request(
             "GET",
             "/api/risk/v2/entities/:address",
-            status_class(status),
+            Some(status.as_u16()),
             started.elapsed(),
         );
         let bytes = read_limited_response_body(resp, CHAINALYSIS_MAX_RESPONSE_BODY_BYTES).await?;
@@ -139,27 +139,26 @@ impl ChainalysisAddressScreener {
 fn record_upstream_request(
     method: &'static str,
     endpoint: &'static str,
-    status_class: &'static str,
+    status: Option<u16>,
     duration: Duration,
 ) {
-    observability::upstream::record_upstream_request(
-        observability::upstream::UpstreamKind::TradingVenue,
-        "chainalysis",
-        method,
-        endpoint,
-        status_class,
-        duration,
-    );
-}
-
-fn status_class(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        100..=199 => "1xx",
-        200..=299 => "2xx",
-        300..=399 => "3xx",
-        400..=499 => "4xx",
-        500..=599 => "5xx",
-        _ => "unknown",
+    use observability::upstream::UpstreamKind::TradingVenue;
+    match status {
+        Some(code) => observability::upstream::record_upstream_http_status(
+            TradingVenue,
+            "chainalysis",
+            method,
+            endpoint,
+            code,
+            duration,
+        ),
+        None => observability::upstream::record_upstream_transport_error(
+            TradingVenue,
+            "chainalysis",
+            method,
+            endpoint,
+            duration,
+        ),
     }
 }
 
